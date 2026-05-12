@@ -453,6 +453,65 @@ def _click_contains_if_visible(driver: webdriver.Remote, text: str, selector: st
     ))
 
 
+def _has_visible_password_input(driver: webdriver.Remote) -> bool:
+    return bool(driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+        };
+        return Array.from(document.querySelectorAll('input[type="password"]')).some(isVisible);
+        """
+    ))
+
+
+def _click_betinasia_sign_in(driver: webdriver.Remote, profile_label: str) -> bool:
+    selectors = [
+        (By.XPATH, "//a[normalize-space()='Sign In']"),
+        (By.XPATH, "//button[normalize-space()='Sign In']"),
+        (By.XPATH, "//*[@role='button' and normalize-space()='Sign In']"),
+        (By.XPATH, "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
+        (By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
+    ]
+    before_handles = set(driver.window_handles)
+    before_url = driver.current_url
+
+    for by, selector in selectors:
+        try:
+            elements = driver.find_elements(by, selector)
+            for element in elements:
+                if not element.is_displayed() or not element.is_enabled():
+                    continue
+                href = element.get_attribute("href")
+                print(f"[{profile_label}] Clicking BetInAsia Sign In...")
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+                try:
+                    element.click()
+                except Exception:
+                    driver.execute_script(
+                        "arguments[0].dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));",
+                        element,
+                    )
+                try:
+                    WebDriverWait(driver, 8).until(
+                        lambda browser: _has_visible_password_input(browser)
+                        or browser.current_url != before_url
+                        or len(browser.window_handles) > len(before_handles)
+                    )
+                except Exception:
+                    if href:
+                        print(f"[{profile_label}] Sign In click did not open form, navigating to href: {href}")
+                        driver.get(href)
+                return True
+        except Exception:
+            continue
+
+    clicked = _click_text_if_visible(driver, "Sign In") or _click_contains_if_visible(driver, "Sign In")
+    if clicked:
+        print(f"[{profile_label}] Clicked BetInAsia Sign In via JavaScript fallback.")
+    return clicked
+
+
 def _wait_document_ready(driver: webdriver.Remote, timeout: int = 30) -> None:
     WebDriverWait(driver, timeout).until(
         lambda browser: browser.execute_script("return document.readyState") in {"interactive", "complete"}
@@ -511,21 +570,34 @@ def _login_betinasia_portal(driver: webdriver.Remote, profile_label: str) -> Non
     _wait_document_ready(driver)
     time.sleep(2)
 
-    if _click_text_if_visible(driver, "Sign In") or _click_contains_if_visible(driver, "Sign In"):
+    if not _has_visible_password_input(driver):
+        _click_betinasia_sign_in(driver, profile_label)
         time.sleep(2)
+
+    for handle in reversed(driver.window_handles):
+        try:
+            driver.switch_to.window(handle)
+            if _has_visible_password_input(driver) or "portal.betinasia.com" in driver.current_url.lower():
+                break
+        except Exception:
+            continue
 
     _wait_document_ready(driver)
     if "portal.betinasia.com" in driver.current_url.lower():
-        print(f"[{profile_label}] BetInAsia portal opened after Sign In.")
-        return
+        if not _has_visible_password_input(driver):
+            print(f"[{profile_label}] BetInAsia portal already open: {driver.current_url}")
+            return
 
-    if "sign" in _visible_text_lower(driver) or driver.find_elements(By.CSS_SELECTOR, "input[type='password']"):
+    if _has_visible_password_input(driver):
         _fill_login_form(driver, BETINASIA_EMAIL, BETINASIA_PASSWORD, profile_label, "BetInAsia")
         WebDriverWait(driver, 30).until(
             lambda browser: "portal.betinasia.com" in browser.current_url.lower()
             or "products" in _visible_text_lower(browser)
         )
         print(f"[{profile_label}] BetInAsia portal login complete: {driver.current_url}")
+        return
+
+    raise RuntimeError("BetInAsia Sign In was clicked, but the login form did not open.")
 
 
 def _open_black_product(driver: webdriver.Remote, profile_label: str) -> None:
