@@ -1,7 +1,7 @@
 """
 Telegram group listener + AdsPower bootstrap.
 Authorizes in Telegram, starts listening to the configured group, then starts or
-connects to AdsPower profiles and logs into Punterplay.
+connects to AdsPower profiles and logs into BetInAsia / Black.
 
 Usage:
     pip install -r requirements.txt
@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
 from login import run_all_profiles
-from punterplay_betting import place_bet_for_all_profiles, refresh_all_stakes
 from signals import parse_betting_signal
 
 load_dotenv()
@@ -53,8 +52,7 @@ async def refresh_stakes(state: RuntimeState) -> None:
     async with state.stake_lock:
         if not state.sessions:
             return
-        loop = asyncio.get_running_loop()
-        state.stakes = await loop.run_in_executor(None, lambda: refresh_all_stakes(state.sessions))
+        state.stakes = {}
 
 
 async def refresh_stakes_daily(state: RuntimeState) -> None:
@@ -101,12 +99,10 @@ async def handle_signal(state: RuntimeState, text: str) -> None:
     await state.ready.wait()
 
     async with state.bet_lock:
-        if not state.stakes:
-            await refresh_stakes(state)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: place_bet_for_all_profiles(state.sessions, signal, state.stakes),
+        print(
+            "BetInAsia/Black bet placement is not wired yet. "
+            "Signal parsed and browser sessions are ready.",
+            flush=True,
         )
 
 

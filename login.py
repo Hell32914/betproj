@@ -1,6 +1,6 @@
 """
-Punterplay auto-login script via AdsPower profiles.
-Starts two AdsPower browser profiles and logs into punterplay.com from both simultaneously.
+BetInAsia / Black auto-login script via AdsPower profiles.
+Starts AdsPower browser profiles, logs into BetInAsia, opens Black, and logs into Black.
 
 Usage:
     pip install -r requirements.txt
@@ -27,12 +27,16 @@ from selenium.webdriver.firefox.options import Options as FirefoxOptions
 
 load_dotenv()
 
-LOGIN_URL = "https://pro.punterplay.com/#/sign-in"
-PUNTERPLAY_URL_PART = "punterplay.com"
+LOGIN_URL = "https://betinasia.com"
+BETINASIA_URL_PART = "betinasia.com"
+PORTAL_URL = "https://portal.betinasia.com/Dashboard/Products"
+BLACK_URL_PART = "black.betinasia.com"
 
 ADSPOWER_API_URL = os.getenv("ADSPOWER_API_URL", "http://local.adspower.net:50325")
-USERNAME = os.getenv("PUNTER_LOGIN")
-PASSWORD = os.getenv("PUNTER_PASSWORD")
+BETINASIA_EMAIL = os.getenv("BETINASIA_EMAIL")
+BETINASIA_PASSWORD = os.getenv("BETINASIA_PASSWORD")
+BLACK_USERNAME = os.getenv("BLACK_USERNAME")
+BLACK_PASSWORD = os.getenv("BLACK_PASSWORD")
 
 
 def fetch_profile_ids(expected: int = 2) -> list[str]:
@@ -256,7 +260,7 @@ def _find_first_visible(driver: webdriver.Remote, selectors: list[tuple[str, str
             except NoSuchWindowException as exc:
                 last_exc = exc
                 print(f"Recovering browser tab after discarded context while searching for {selector}...")
-                if not _switch_to_live_window(browser, "punterplay.com"):
+                if not _switch_to_live_window(browser, BETINASIA_URL_PART):
                     raise
                 return False
             except WebDriverException as exc:
@@ -264,7 +268,7 @@ def _find_first_visible(driver: webdriver.Remote, selectors: list[tuple[str, str
                 message = str(exc).lower()
                 if "discarded" in message or "no such window" in message:
                     print(f"Recovering browser tab after discarded context while searching for {selector}...")
-                    if not _switch_to_live_window(browser, "punterplay.com"):
+                    if not _switch_to_live_window(browser, BETINASIA_URL_PART):
                         raise
                 return False
         return False
@@ -292,13 +296,13 @@ def _switch_to_live_window(driver: webdriver.Remote, url_part: str | None = None
     return False
 
 
-def ensure_punterplay_tab(driver: webdriver.Remote, profile_label: str) -> None:
-    """Switch to an existing Punterplay tab or open the login page once."""
-    if _switch_to_live_window(driver, PUNTERPLAY_URL_PART):
-        print(f"[{profile_label}] Reusing existing Punterplay tab: {driver.current_url}")
+def ensure_betinasia_tab(driver: webdriver.Remote, profile_label: str) -> None:
+    """Switch to an existing BetInAsia tab or open the login page once."""
+    if _switch_to_live_window(driver, BETINASIA_URL_PART):
+        print(f"[{profile_label}] Reusing existing BetInAsia tab: {driver.current_url}")
         return
 
-    print(f"[{profile_label}] No Punterplay tab found. Opening login page in a new tab...")
+    print(f"[{profile_label}] No BetInAsia tab found. Opening login page in a new tab...")
     _open_new_login_tab(driver, profile_label)
 
 
@@ -354,7 +358,7 @@ def _set_input_value(driver: webdriver.Remote, element, value: str) -> None:
 
 
 def _open_new_login_tab(driver: webdriver.Remote, profile_label: str) -> None:
-    """Create a new browser tab and navigate it to the Punterplay sign-in page."""
+    """Create a new browser tab and navigate it to BetInAsia."""
     _switch_to_live_window(driver)
     before_handles = set(driver.window_handles)
 
@@ -380,113 +384,249 @@ def _open_new_login_tab(driver: webdriver.Remote, profile_label: str) -> None:
             driver.switch_to.window(new_handles[-1])
 
     print(f"[{profile_label}] Opening new tab: {driver.current_window_handle}")
-    if "punterplay.com" not in driver.current_url:
+    if BETINASIA_URL_PART not in driver.current_url:
         driver.get(LOGIN_URL)
 
-    WebDriverWait(driver, 20).until(lambda browser: "punterplay.com" in browser.current_url)
-    if not _switch_to_live_window(driver, "punterplay.com"):
-        raise RuntimeError("Could not switch to a live Punterplay tab after opening it.")
+    WebDriverWait(driver, 20).until(lambda browser: BETINASIA_URL_PART in browser.current_url)
+    if not _switch_to_live_window(driver, BETINASIA_URL_PART):
+        raise RuntimeError("Could not switch to a live BetInAsia tab after opening it.")
 
 
 def open_login_tab(driver: webdriver.Remote, profile_label: str) -> None:
-    """Open Punterplay sign-in page in a new tab."""
+    """Open BetInAsia in a browser tab."""
     print(f"[{profile_label}] Current URL before navigation: {driver.current_url}")
     print(f"[{profile_label}] Open windows: {driver.window_handles}")
 
-    ensure_punterplay_tab(driver, profile_label)
+    ensure_betinasia_tab(driver, profile_label)
     print(f"[{profile_label}] Navigated to: {driver.current_url}")
 
 
-def login(driver: webdriver.Remote, profile_label: str) -> None:
-    """Perform login in an already opened Punterplay tab."""
+def _visible_text_lower(driver: webdriver.Remote) -> str:
+    return (_visible_page_text(driver) or "").lower()
 
-    # SPA needs time to bootstrap after navigation
-    time.sleep(4)
 
-    if not _switch_to_live_window(driver, "punterplay.com"):
-        raise RuntimeError("Punterplay tab is no longer available after navigation.")
+def _visible_page_text(driver: webdriver.Remote) -> str:
+    return driver.execute_script("return document.body ? document.body.innerText : '';") or ""
 
-    WebDriverWait(driver, 20).until(
+
+def _click_text_if_visible(driver: webdriver.Remote, text: str, selector: str = "button,a,[role=button]") -> bool:
+    return bool(driver.execute_script(
+        """
+        const expected = arguments[0].trim().toLowerCase();
+        const selector = arguments[1];
+        const isVisible = (element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+        };
+        const target = Array.from(document.querySelectorAll(selector))
+            .filter(isVisible)
+            .find((element) => (element.innerText || element.textContent || '').trim().toLowerCase() === expected);
+        if (!target) return false;
+        target.scrollIntoView({ block: 'center', inline: 'center' });
+        target.click();
+        return true;
+        """,
+        text,
+        selector,
+    ))
+
+
+def _click_contains_if_visible(driver: webdriver.Remote, text: str, selector: str = "button,a,[role=button]") -> bool:
+    return bool(driver.execute_script(
+        """
+        const expected = arguments[0].trim().toLowerCase();
+        const selector = arguments[1];
+        const isVisible = (element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+        };
+        const target = Array.from(document.querySelectorAll(selector))
+            .filter(isVisible)
+            .find((element) => (element.innerText || element.textContent || '').trim().toLowerCase().includes(expected));
+        if (!target) return false;
+        target.scrollIntoView({ block: 'center', inline: 'center' });
+        target.click();
+        return true;
+        """,
+        text,
+        selector,
+    ))
+
+
+def _wait_document_ready(driver: webdriver.Remote, timeout: int = 30) -> None:
+    WebDriverWait(driver, timeout).until(
         lambda browser: browser.execute_script("return document.readyState") in {"interactive", "complete"}
     )
 
-    if "#/sign-in" not in driver.current_url.lower():
-        print(f"[{profile_label}] Already signed in or redirected to: {driver.current_url}")
-        return
 
+def _fill_login_form(driver: webdriver.Remote, username: str, password: str, profile_label: str, login_name: str) -> None:
     username_input = _find_first_visible(driver, [
-        (By.CSS_SELECTOR, "input[name='login']"),
-        (By.CSS_SELECTOR, "input[name='username']"),
         (By.CSS_SELECTOR, "input[name='email']"),
+        (By.CSS_SELECTOR, "input[name='username']"),
+        (By.CSS_SELECTOR, "input[name='login']"),
         (By.CSS_SELECTOR, "input[autocomplete='username']"),
         (By.CSS_SELECTOR, "input[autocomplete='email']"),
         (By.CSS_SELECTOR, "input[type='email']"),
         (By.CSS_SELECTOR, "input[type='text']"),
-        (By.XPATH, "//input[contains(translate(@placeholder, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
-        (By.XPATH, "//input[contains(translate(@placeholder, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'username')]"),
         (By.XPATH, "//input[contains(translate(@placeholder, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'email')]"),
-    ])
-
+        (By.XPATH, "//input[contains(translate(@placeholder, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'username')]"),
+    ], timeout=20)
     password_input = _find_first_visible(driver, [
         (By.CSS_SELECTOR, "input[type='password']"),
         (By.CSS_SELECTOR, "input[name='password']"),
         (By.CSS_SELECTOR, "input[autocomplete='current-password']"),
-    ])
+    ], timeout=20)
 
-    print(f"[{profile_label}] Found username field: {username_input.get_attribute('outerHTML')[:120]}")
-    print(f"[{profile_label}] Filling credentials...")
-    _set_input_value(driver, username_input, USERNAME)
-    time.sleep(0.5)
-
-    _set_input_value(driver, password_input, PASSWORD)
-    time.sleep(0.5)
-
-    username_value = username_input.get_attribute("value") or ""
-    password_value = password_input.get_attribute("value") or ""
-    print(
-        f"[{profile_label}] Field values after fill: "
-        f"username_len={len(username_value)}, password_len={len(password_value)}"
-    )
+    print(f"[{profile_label}] Filling {login_name} credentials...")
+    _set_input_value(driver, username_input, username)
+    time.sleep(0.3)
+    _set_input_value(driver, password_input, password)
+    time.sleep(0.3)
 
     login_btn = _find_first_clickable(driver, [
         (By.CSS_SELECTOR, "button[type='submit']"),
-        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]") ,
-        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]") ,
-        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')]") ,
-        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'войти')]") ,
-    ])
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
+    ], timeout=20)
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", login_btn)
     WebDriverWait(driver, 10).until(lambda browser: login_btn.is_enabled())
-    print(f"[{profile_label}] Clicking login button: {login_btn.get_attribute('outerHTML')[:160]}")
     before_submit_url = driver.current_url
+    print(f"[{profile_label}] Clicking {login_name} login button...")
     login_btn.click()
 
-    # Wait for URL change or dashboard element as sign of successful login
     try:
-        WebDriverWait(driver, 15).until(EC.url_changes(before_submit_url))
-        print(f"[{profile_label}] Login successful — URL changed to: {driver.current_url}")
+        WebDriverWait(driver, 20).until(EC.url_changes(before_submit_url))
     except Exception:
-        print(f"[{profile_label}] URL did not change after click. Pressing Enter in password field...")
         password_input.send_keys(Keys.ENTER)
+
+
+def _login_betinasia_portal(driver: webdriver.Remote, profile_label: str) -> None:
+    if "portal.betinasia.com" in driver.current_url.lower():
+        print(f"[{profile_label}] BetInAsia portal already open: {driver.current_url}")
+        return
+
+    if BETINASIA_URL_PART not in driver.current_url:
+        driver.get(LOGIN_URL)
+    _wait_document_ready(driver)
+    time.sleep(2)
+
+    if _click_text_if_visible(driver, "Sign In") or _click_contains_if_visible(driver, "Sign In"):
+        time.sleep(2)
+
+    _wait_document_ready(driver)
+    if "portal.betinasia.com" in driver.current_url.lower():
+        print(f"[{profile_label}] BetInAsia portal opened after Sign In.")
+        return
+
+    if "sign" in _visible_text_lower(driver) or driver.find_elements(By.CSS_SELECTOR, "input[type='password']"):
+        _fill_login_form(driver, BETINASIA_EMAIL, BETINASIA_PASSWORD, profile_label, "BetInAsia")
+        WebDriverWait(driver, 30).until(
+            lambda browser: "portal.betinasia.com" in browser.current_url.lower()
+            or "products" in _visible_text_lower(browser)
+        )
+        print(f"[{profile_label}] BetInAsia portal login complete: {driver.current_url}")
+
+
+def _open_black_product(driver: webdriver.Remote, profile_label: str) -> None:
+    if _switch_to_live_window(driver, BLACK_URL_PART):
+        print(f"[{profile_label}] Reusing Black tab: {driver.current_url}")
+        return
+
+    if "portal.betinasia.com" not in driver.current_url.lower():
+        driver.get(PORTAL_URL)
+        _wait_document_ready(driver)
+        time.sleep(2)
+
+    before_handles = set(driver.window_handles)
+    clicked = bool(driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+        };
+        const cards = Array.from(document.querySelectorAll('div, section, article'))
+            .filter((element) => isVisible(element) && (element.innerText || '').toLowerCase().includes('black'))
+            .sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return (ar.width * ar.height) - (br.width * br.height);
+            });
+        for (const card of cards) {
+            const button = Array.from(card.querySelectorAll('button,a,[role=button]'))
+                .find((element) => isVisible(element)
+                    && (element.innerText || element.textContent || '').toLowerCase().includes('go to product'));
+            if (button) {
+                button.scrollIntoView({ block: 'center', inline: 'center' });
+                button.click();
+                return true;
+            }
+        }
+        return false;
+        """
+    ))
+    if not clicked:
+        raise RuntimeError("Could not find 'Go to product' button in the Black product card.")
+
+    WebDriverWait(driver, 30).until(
+        lambda browser: any(BLACK_URL_PART in _url_for_handle(browser, handle) for handle in browser.window_handles)
+        or BLACK_URL_PART in browser.current_url.lower()
+    )
+    if not _switch_to_live_window(driver, BLACK_URL_PART):
+        new_handles = [handle for handle in driver.window_handles if handle not in before_handles]
+        if new_handles:
+            driver.switch_to.window(new_handles[-1])
+    _wait_document_ready(driver)
+    time.sleep(2)
+    print(f"[{profile_label}] Black product opened: {driver.current_url}")
+
+
+def _url_for_handle(driver: webdriver.Remote, handle: str) -> str:
+    current = driver.current_window_handle
+    try:
+        driver.switch_to.window(handle)
+        return driver.current_url.lower()
+    except Exception:
+        return ""
+    finally:
         try:
-            WebDriverWait(driver, 15).until(EC.url_changes(before_submit_url))
-            print(f"[{profile_label}] Login successful — URL changed to: {driver.current_url}")
-            return
+            driver.switch_to.window(current)
         except Exception:
             pass
 
-        # Some SPAs keep the same base URL; check for absence of login form instead
-        try:
-            WebDriverWait(driver, 5).until(
-                EC.invisibility_of_element_located((By.CSS_SELECTOR, "input[type='password']"))
-            )
-            print(f"[{profile_label}] Login successful — login form disappeared.")
-        except Exception:
-            print(f"[{profile_label}] WARNING: Could not confirm login success. Current URL: {driver.current_url}")
+
+def _login_black(driver: webdriver.Remote, profile_label: str) -> None:
+    if not _switch_to_live_window(driver, BLACK_URL_PART):
+        raise RuntimeError("Black tab is not available for second login.")
+    _wait_document_ready(driver)
+    time.sleep(2)
+
+    if not driver.find_elements(By.CSS_SELECTOR, "input[type='password']"):
+        print(f"[{profile_label}] Black already appears to be logged in: {driver.current_url}")
+        return
+
+    _fill_login_form(driver, BLACK_USERNAME, BLACK_PASSWORD, profile_label, "Black")
+    WebDriverWait(driver, 30).until(
+        lambda browser: not browser.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        or "dashboard" in _visible_text_lower(browser)
+        or "sports" in _visible_text_lower(browser)
+    )
+    print(f"[{profile_label}] Black login complete: {driver.current_url}")
+
+
+def login(driver: webdriver.Remote, profile_label: str) -> None:
+    """Perform BetInAsia portal login, open Black, then perform Black login."""
+    time.sleep(2)
+    if not _switch_to_live_window(driver, BETINASIA_URL_PART):
+        driver.get(LOGIN_URL)
+
+    _login_betinasia_portal(driver, profile_label)
+    _open_black_product(driver, profile_label)
+    _login_black(driver, profile_label)
 
 
 def run_profile(profile_id: str, profile_label: str) -> dict:
-    """Full lifecycle: start profile, login, keep open."""
+    """Full lifecycle: start profile, log into BetInAsia/Black, keep open."""
     driver = None
     was_already_running = False
     try:
@@ -527,18 +667,22 @@ def run_profile(profile_id: str, profile_label: str) -> dict:
 
 
 def validate_required_env() -> None:
-    """Validate environment required for Punterplay login."""
+    """Validate environment required for BetInAsia and Black login."""
     missing = []
-    if not USERNAME:
-        missing.append("PUNTER_LOGIN")
-    if not PASSWORD:
-        missing.append("PUNTER_PASSWORD")
+    if not BETINASIA_EMAIL:
+        missing.append("BETINASIA_EMAIL")
+    if not BETINASIA_PASSWORD:
+        missing.append("BETINASIA_PASSWORD")
+    if not BLACK_USERNAME:
+        missing.append("BLACK_USERNAME")
+    if not BLACK_PASSWORD:
+        missing.append("BLACK_PASSWORD")
     if missing:
         raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
 
 def run_all_profiles(expected_profiles: int = 2, wait_for_enter: bool = False) -> list[dict]:
-    """Start or reuse AdsPower profiles, open Punterplay, and log in."""
+    """Start or reuse AdsPower profiles, open BetInAsia/Black, and log in."""
     validate_required_env()
 
     profile_ids = fetch_profile_ids(expected=expected_profiles)
