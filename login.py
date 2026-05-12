@@ -31,6 +31,7 @@ LOGIN_URL = "https://betinasia.com"
 BETINASIA_URL_PART = "betinasia.com"
 PORTAL_URL = "https://portal.betinasia.com/Dashboard/Products"
 BLACK_URL_PART = "black.betinasia.com"
+BLACK_URL = "https://black.betinasia.com"
 
 ADSPOWER_API_URL = os.getenv("ADSPOWER_API_URL", "http://local.adspower.net:50325")
 BETINASIA_EMAIL = os.getenv("BETINASIA_EMAIL")
@@ -519,7 +520,7 @@ def _wait_document_ready(driver: webdriver.Remote, timeout: int = 30) -> None:
 
 
 def _click_current_login_submit(driver: webdriver.Remote, password_input, profile_label: str, login_name: str) -> bool:
-    clicked = bool(driver.execute_script(
+    click_result = driver.execute_script(
         """
         const passwordInput = arguments[0];
         const isVisible = (element) => {
@@ -571,7 +572,8 @@ def _click_current_login_submit(driver: webdriver.Remote, password_input, profil
         return true;
         """,
         password_input,
-    ))
+    )
+    clicked = bool(click_result)
     if clicked:
         print(f"[{profile_label}] Clicked {login_name} submit button in current form.")
     return clicked
@@ -665,8 +667,8 @@ def _login_betinasia_portal(driver: webdriver.Remote, profile_label: str) -> Non
 
 
 def _open_black_product(driver: webdriver.Remote, profile_label: str) -> None:
-    if _switch_to_live_window(driver, BLACK_URL_PART):
-        print(f"[{profile_label}] Reusing Black tab: {driver.current_url}")
+    if BLACK_URL_PART in driver.current_url.lower():
+        print(f"[{profile_label}] Black tab is already current: {driver.current_url}")
         return
 
     if "portal.betinasia.com" not in driver.current_url.lower():
@@ -674,8 +676,7 @@ def _open_black_product(driver: webdriver.Remote, profile_label: str) -> None:
         _wait_document_ready(driver)
         time.sleep(2)
 
-    before_handles = set(driver.window_handles)
-    clicked = bool(driver.execute_script(
+    click_result = driver.execute_script(
         """
         const isVisible = (element) => {
             const rect = element.getBoundingClientRect();
@@ -694,46 +695,36 @@ def _open_black_product(driver: webdriver.Remote, profile_label: str) -> None:
                     && (element.innerText || element.textContent || '').toLowerCase().includes('go to product'));
             if (button) {
                 button.scrollIntoView({ block: 'center', inline: 'center' });
-                button.click();
-                return true;
+                const href = button.getAttribute('href') || button.closest('a')?.getAttribute('href') || '';
+                button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                return { ok: true, href };
             }
         }
-        return false;
+        return { ok: false };
         """
-    ))
-    if not clicked:
-        raise RuntimeError("Could not find 'Go to product' button in the Black product card.")
-
-    WebDriverWait(driver, 30).until(
-        lambda browser: any(BLACK_URL_PART in _url_for_handle(browser, handle) for handle in browser.window_handles)
-        or BLACK_URL_PART in browser.current_url.lower()
     )
-    if not _switch_to_live_window(driver, BLACK_URL_PART):
-        new_handles = [handle for handle in driver.window_handles if handle not in before_handles]
-        if new_handles:
-            driver.switch_to.window(new_handles[-1])
+    if not click_result or not click_result.get("ok"):
+        raise RuntimeError("Could not find 'Go to product' button in the Black product card.")
+    print(f"[{profile_label}] Clicked Black Go to product button.")
+
+    try:
+        WebDriverWait(driver, 10).until(
+            lambda browser: BLACK_URL_PART in browser.current_url.lower()
+        )
+    except Exception:
+        print(f"[{profile_label}] Product click did not navigate current tab. Opening Black directly in current tab...")
+        driver.get(BLACK_URL)
+
     _wait_document_ready(driver)
     time.sleep(2)
     print(f"[{profile_label}] Black product opened: {driver.current_url}")
 
 
-def _url_for_handle(driver: webdriver.Remote, handle: str) -> str:
-    current = driver.current_window_handle
-    try:
-        driver.switch_to.window(handle)
-        return driver.current_url.lower()
-    except Exception:
-        return ""
-    finally:
-        try:
-            driver.switch_to.window(current)
-        except Exception:
-            pass
-
-
 def _login_black(driver: webdriver.Remote, profile_label: str) -> None:
-    if not _switch_to_live_window(driver, BLACK_URL_PART):
-        raise RuntimeError("Black tab is not available for second login.")
+    if BLACK_URL_PART not in driver.current_url.lower():
+        driver.get(BLACK_URL)
     _wait_document_ready(driver)
     time.sleep(2)
 
