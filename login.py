@@ -15,7 +15,6 @@ import subprocess
 import requests
 from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.webdriver import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -30,6 +29,7 @@ load_dotenv()
 LOGIN_URL = "https://betinasia.com"
 BETINASIA_URL_PART = "betinasia.com"
 PORTAL_URL = "https://portal.betinasia.com/Dashboard/Products"
+PORTAL_LOGIN_URL = "https://portal.betinasia.com/Account/Login"
 BLACK_URL_PART = "black.betinasia.com"
 BLACK_URL = "https://black.betinasia.com"
 
@@ -260,17 +260,13 @@ def _find_first_visible(driver: webdriver.Remote, selectors: list[tuple[str, str
                         return element
             except NoSuchWindowException as exc:
                 last_exc = exc
-                print(f"Recovering browser tab after discarded context while searching for {selector}...")
-                if not _switch_to_live_window(browser, BETINASIA_URL_PART):
-                    raise
+                print(f"Browser context was discarded while searching for {selector}; retrying current tab...")
                 return False
             except WebDriverException as exc:
                 last_exc = exc
                 message = str(exc).lower()
                 if "discarded" in message or "no such window" in message:
-                    print(f"Recovering browser tab after discarded context while searching for {selector}...")
-                    if not _switch_to_live_window(browser, BETINASIA_URL_PART):
-                        raise
+                    print(f"Browser context was discarded while searching for {selector}; retrying current tab...")
                 return False
         return False
 
@@ -286,25 +282,11 @@ def _find_first_visible(driver: webdriver.Remote, selectors: list[tuple[str, str
         raise RuntimeError(f"Could not find visible element from selectors: {selectors}") from last_exc
 
 
-def _switch_to_live_window(driver: webdriver.Remote, url_part: str | None = None) -> bool:
-    for handle in reversed(driver.window_handles):
-        try:
-            driver.switch_to.window(handle)
-            if not url_part or url_part in driver.current_url:
-                return True
-        except (NoSuchWindowException, WebDriverException):
-            continue
-    return False
-
-
 def ensure_betinasia_tab(driver: webdriver.Remote, profile_label: str) -> None:
-    """Switch to an existing BetInAsia tab or open the login page once."""
-    if _switch_to_live_window(driver, BETINASIA_URL_PART):
-        print(f"[{profile_label}] Reusing existing BetInAsia tab: {driver.current_url}")
-        return
-
-    print(f"[{profile_label}] No BetInAsia tab found. Opening login page in a new tab...")
-    _open_new_login_tab(driver, profile_label)
+    """Navigate the current tab to BetInAsia without switching browser tabs."""
+    print(f"[{profile_label}] Opening BetInAsia in current tab...")
+    driver.get(LOGIN_URL)
+    WebDriverWait(driver, 20).until(lambda browser: BETINASIA_URL_PART in browser.current_url)
 
 
 def _find_first_clickable(driver: webdriver.Remote, selectors: list[tuple[str, str]], timeout: int = 30):
@@ -358,45 +340,9 @@ def _set_input_value(driver: webdriver.Remote, element, value: str) -> None:
     )
 
 
-def _open_new_login_tab(driver: webdriver.Remote, profile_label: str) -> None:
-    """Create a new browser tab and navigate it to BetInAsia."""
-    _switch_to_live_window(driver)
-    before_handles = set(driver.window_handles)
-
-    try:
-        ActionChains(driver).key_down(Keys.CONTROL).send_keys("t").key_up(Keys.CONTROL).perform()
-        WebDriverWait(driver, 10).until(
-            lambda browser: len(browser.window_handles) > len(before_handles)
-        )
-        new_handles = [handle for handle in driver.window_handles if handle not in before_handles]
-        driver.switch_to.window(new_handles[-1])
-        driver.get(LOGIN_URL)
-    except Exception:
-        _switch_to_live_window(driver)
-        try:
-            driver.switch_to.new_window("tab")
-            driver.get(LOGIN_URL)
-        except Exception:
-            driver.execute_script("window.open(arguments[0], '_blank');", LOGIN_URL)
-            WebDriverWait(driver, 10).until(
-                lambda browser: len(browser.window_handles) > len(before_handles)
-            )
-            new_handles = [handle for handle in driver.window_handles if handle not in before_handles]
-            driver.switch_to.window(new_handles[-1])
-
-    print(f"[{profile_label}] Opening new tab: {driver.current_window_handle}")
-    if BETINASIA_URL_PART not in driver.current_url:
-        driver.get(LOGIN_URL)
-
-    WebDriverWait(driver, 20).until(lambda browser: BETINASIA_URL_PART in browser.current_url)
-    if not _switch_to_live_window(driver, BETINASIA_URL_PART):
-        raise RuntimeError("Could not switch to a live BetInAsia tab after opening it.")
-
-
 def open_login_tab(driver: webdriver.Remote, profile_label: str) -> None:
-    """Open BetInAsia in a browser tab."""
+    """Open BetInAsia in the current browser tab."""
     print(f"[{profile_label}] Current URL before navigation: {driver.current_url}")
-    print(f"[{profile_label}] Open windows: {driver.window_handles}")
 
     ensure_betinasia_tab(driver, profile_label)
     print(f"[{profile_label}] Navigated to: {driver.current_url}")
@@ -474,7 +420,6 @@ def _click_betinasia_sign_in(driver: webdriver.Remote, profile_label: str) -> bo
         (By.XPATH, "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
         (By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
     ]
-    before_handles = set(driver.window_handles)
     before_url = driver.current_url
 
     for by, selector in selectors:
@@ -497,12 +442,14 @@ def _click_betinasia_sign_in(driver: webdriver.Remote, profile_label: str) -> bo
                     WebDriverWait(driver, 8).until(
                         lambda browser: _has_visible_password_input(browser)
                         or browser.current_url != before_url
-                        or len(browser.window_handles) > len(before_handles)
                     )
                 except Exception:
                     if href:
                         print(f"[{profile_label}] Sign In click did not open form, navigating to href: {href}")
                         driver.get(href)
+                    else:
+                        print(f"[{profile_label}] Sign In click did not open form, navigating to portal login directly.")
+                        driver.get(PORTAL_LOGIN_URL)
                 return True
         except Exception:
             continue
@@ -637,16 +584,9 @@ def _login_betinasia_portal(driver: webdriver.Remote, profile_label: str) -> Non
     time.sleep(2)
 
     if not _has_visible_password_input(driver):
-        _click_betinasia_sign_in(driver, profile_label)
+        if not _click_betinasia_sign_in(driver, profile_label):
+            driver.get(PORTAL_LOGIN_URL)
         time.sleep(2)
-
-    for handle in reversed(driver.window_handles):
-        try:
-            driver.switch_to.window(handle)
-            if _has_visible_password_input(driver) or "portal.betinasia.com" in driver.current_url.lower():
-                break
-        except Exception:
-            continue
 
     _wait_document_ready(driver)
     if "portal.betinasia.com" in driver.current_url.lower():
@@ -744,7 +684,7 @@ def _login_black(driver: webdriver.Remote, profile_label: str) -> None:
 def login(driver: webdriver.Remote, profile_label: str) -> None:
     """Perform BetInAsia portal login, open Black, then perform Black login."""
     time.sleep(2)
-    if not _switch_to_live_window(driver, BETINASIA_URL_PART):
+    if BETINASIA_URL_PART not in driver.current_url.lower():
         driver.get(LOGIN_URL)
 
     _login_betinasia_portal(driver, profile_label)
