@@ -518,6 +518,65 @@ def _wait_document_ready(driver: webdriver.Remote, timeout: int = 30) -> None:
     )
 
 
+def _click_current_login_submit(driver: webdriver.Remote, password_input, profile_label: str, login_name: str) -> bool:
+    clicked = bool(driver.execute_script(
+        """
+        const passwordInput = arguments[0];
+        const isVisible = (element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        let root = passwordInput.closest('form');
+        if (!root) {
+            const containers = [];
+            let parent = passwordInput.parentElement;
+            for (let depth = 0; parent && depth < 8; depth += 1, parent = parent.parentElement) {
+                containers.push(parent);
+            }
+            root = containers.find((element) => {
+                const text = textOf(element);
+                return isVisible(element)
+                    && element.querySelectorAll('input').length >= 2
+                    && (text.includes('sign in') || text.includes('log in') || text.includes('login'));
+            }) || containers[containers.length - 1] || document.body;
+        }
+
+        const candidates = Array.from(root.querySelectorAll('button,input[type="submit"],[role="button"],a'))
+            .filter(isVisible)
+            .filter((element) => {
+                const text = textOf(element);
+                const value = (element.value || '').trim().toLowerCase();
+                return element.type === 'submit'
+                    || text === 'sign in'
+                    || text.includes('sign in')
+                    || text.includes('log in')
+                    || text.includes('login')
+                    || value.includes('sign in')
+                    || value.includes('login');
+            })
+            .sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return Math.abs(ar.y - passwordInput.getBoundingClientRect().y)
+                    - Math.abs(br.y - passwordInput.getBoundingClientRect().y);
+            });
+        const button = candidates[0];
+        if (!button) return false;
+        button.scrollIntoView({ block: 'center', inline: 'center' });
+        button.focus();
+        button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+        button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        return true;
+        """,
+        password_input,
+    ))
+    if clicked:
+        print(f"[{profile_label}] Clicked {login_name} submit button in current form.")
+    return clicked
+
+
 def _fill_login_form(driver: webdriver.Remote, username: str, password: str, profile_label: str, login_name: str) -> None:
     username_input = _find_first_visible(driver, [
         (By.CSS_SELECTOR, "input[name='email']"),
@@ -542,21 +601,26 @@ def _fill_login_form(driver: webdriver.Remote, username: str, password: str, pro
     _set_input_value(driver, password_input, password)
     time.sleep(0.3)
 
-    login_btn = _find_first_clickable(driver, [
-        (By.CSS_SELECTOR, "button[type='submit']"),
-        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
-        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')]"),
-        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
-    ], timeout=20)
-    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", login_btn)
-    WebDriverWait(driver, 10).until(lambda browser: login_btn.is_enabled())
     before_submit_url = driver.current_url
-    print(f"[{profile_label}] Clicking {login_name} login button...")
-    login_btn.click()
+    if not _click_current_login_submit(driver, password_input, profile_label, login_name):
+        login_btn = _find_first_clickable(driver, [
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')]"),
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
+        ], timeout=20)
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", login_btn)
+        WebDriverWait(driver, 10).until(lambda browser: login_btn.is_enabled())
+        print(f"[{profile_label}] Clicking {login_name} login button...")
+        login_btn.click()
 
     try:
-        WebDriverWait(driver, 20).until(EC.url_changes(before_submit_url))
+        WebDriverWait(driver, 12).until(
+            lambda browser: browser.current_url != before_submit_url
+            or not _has_visible_password_input(browser)
+        )
     except Exception:
+        print(f"[{profile_label}] Submit click did not change page; pressing Enter in password field...")
         password_input.send_keys(Keys.ENTER)
 
 
