@@ -430,8 +430,10 @@ def _open_black_account_menu(driver: webdriver.Remote, profile_label: str) -> No
     if "settings" in _visible_text_lower(driver):
         return
 
-    opened = bool(driver.execute_script(
-        """
+    opened = False
+    for _ in range(5):
+        opened = bool(driver.execute_script(
+            """
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -446,6 +448,21 @@ def _open_black_account_menu(driver: webdriver.Remote, profile_label: str) -> No
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim();
         const pageHasSettings = () => (document.body?.innerText || '').toLowerCase().includes('settings');
+        const euro = String.fromCharCode(8364);
+        const fire = (target) => {
+            const clickable = target?.closest?.('button,a,[role="button"]') || target;
+            if (!clickable) return false;
+            clickable.scrollIntoView?.({ block: 'center', inline: 'center' });
+            for (const name of ['mouseover', 'mouseenter', 'mousemove', 'pointerover', 'pointerenter']) {
+                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+            }
+            if (pageHasSettings()) return true;
+            for (const name of ['mousedown', 'mouseup', 'click']) {
+                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+            }
+            try { clickable.click?.(); } catch (error) {}
+            return pageHasSettings();
+        };
         const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],div,span,svg'))
             .filter(isVisible)
             .filter((element) => {
@@ -456,7 +473,7 @@ def _open_black_account_menu(driver: webdriver.Remote, profile_label: str) -> No
                     .toLowerCase();
                 return rect.y < 140
                     && rect.x > window.innerWidth * 0.55
-                    && (text.includes('\\u20ac')
+                    && (text.includes(euro)
                         || marker.includes('account')
                         || marker.includes('profile')
                         || marker.includes('user')
@@ -469,20 +486,25 @@ def _open_black_account_menu(driver: webdriver.Remote, profile_label: str) -> No
                 return br.x - ar.x || (ar.width * ar.height) - (br.width * br.height);
             });
         for (const target of candidates.slice(0, 12)) {
-            const clickable = target.closest('button,a,[role="button"]') || target;
-            clickable.scrollIntoView({ block: 'center', inline: 'center' });
-            for (const name of ['mouseover', 'mouseenter', 'mousemove', 'pointerover', 'pointerenter']) {
-                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+            if (fire(target)) return true;
+        }
+
+        const yValues = [88, 96, 104, 56];
+        const xValues = [28, 52, 84, 120, 160, 205, 245].map((offset) => window.innerWidth - offset);
+        for (const y of yValues) {
+            for (const x of xValues) {
+                let target = document.elementFromPoint(x, y);
+                for (let depth = 0; target && depth < 4; depth += 1, target = target.parentElement) {
+                    if (fire(target)) return true;
+                }
             }
-            if (pageHasSettings()) return true;
-            for (const name of ['mousedown', 'mouseup', 'click']) {
-                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
-            }
-            if (pageHasSettings()) return true;
         }
         return pageHasSettings();
-        """
-    ))
+            """
+        ))
+        if opened:
+            break
+        time.sleep(0.7)
     if not opened:
         raise RuntimeError("Could not open Black account menu from the profile icon/balance area.")
     WebDriverWait(driver, 10).until(lambda browser: "settings" in _visible_text_lower(browser))
