@@ -925,16 +925,35 @@ def _ensure_black_betslip_safe_to_use(driver: webdriver.Remote, profile_label: s
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-        const panel = Array.from(document.querySelectorAll('aside,section,div'))
+        const looksLikeOccupiedBetslip = (text) => {
+            return text.includes('stake')
+                || text.includes('price')
+                || text.includes('place')
+                || text.includes('timeout')
+                || text.includes('less than min order')
+                || /\\b\\d+(?:[.,]\\d+)?\\b/.test(text.replace('13:29', ''));
+        };
+        const looksLikeEmptyBetslip = (text) => {
+            return text.includes('betslip is empty')
+                || text.includes('to add a bet to your betslip')
+                || text === 'betslip'
+                || text === 'betslip classic exchange arb calc'
+                || text === 'betslip recent orders live orders';
+        };
+        const candidates = Array.from(document.querySelectorAll('aside,section,div'))
             .filter(isVisible)
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
             .filter((item) => item.rect.x > window.innerWidth * 0.68)
-            .filter((item) => item.text.includes('betslip'))
-            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0]?.element;
+            .filter((item) => item.rect.width > 180 && item.rect.height > 80)
+            .filter((item) => item.text.includes('betslip') || looksLikeOccupiedBetslip(item.text) || looksLikeEmptyBetslip(item.text))
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+        const panel = candidates[0]?.element;
         if (!panel) return { ok: true, reason: 'panel-missing' };
 
         const panelText = textOf(panel);
-        if (panelText.includes('betslip is empty')) return { ok: true, reason: 'empty' };
+        if (looksLikeEmptyBetslip(panelText) && !looksLikeOccupiedBetslip(panelText)) {
+            return { ok: true, reason: 'empty' };
+        }
 
         const closeButtons = Array.from(panel.querySelectorAll('button,[role="button"],div,span'))
             .filter(isVisible)
@@ -966,7 +985,7 @@ def _ensure_black_betslip_safe_to_use(driver: webdriver.Remote, profile_label: s
             }
             try { target.click?.(); } catch (error) {}
             const refreshed = textOf(panel);
-            if (refreshed.includes('betslip is empty')) return { ok: true, reason: 'cleared' };
+            if (looksLikeEmptyBetslip(refreshed) && !looksLikeOccupiedBetslip(refreshed)) return { ok: true, reason: 'cleared' };
         }
 
         return { ok: false, reason: 'betslip-not-empty', text: panelText.slice(0, 300) };
