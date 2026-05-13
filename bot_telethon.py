@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
-from login import refresh_black_default_stake, run_all_profiles
+from login import place_black_bet, refresh_black_default_stake, run_all_profiles
 from signals import parse_betting_signal
 
 load_dotenv()
@@ -106,11 +106,13 @@ async def handle_signal(state: RuntimeState, text: str) -> None:
     await state.ready.wait()
 
     async with state.bet_lock:
-        print(
-            "BetInAsia/Black bet placement is not wired yet. "
-            "Signal parsed and browser sessions are ready.",
-            flush=True,
-        )
+        primary_session = next((session for session in state.sessions if session.get("login_enabled")), state.sessions[0])
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, lambda: place_black_bet(primary_session, signal))
+            print("Black bet placement completed.", flush=True)
+        except Exception as exc:
+            print(f"Black bet placement failed: {exc}", flush=True)
 
 
 async def main():

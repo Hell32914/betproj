@@ -487,6 +487,304 @@ def update_black_default_stake(driver: webdriver.Remote, profile_label: str) -> 
     return {"balance": str(balance), "stake": stake, "percent": str(STAKE_PERCENT)}
 
 
+def _decimal_variants(value: Decimal) -> list[str]:
+    normalized = format(value.normalize(), "f")
+    fixed = format(value.quantize(Decimal("0.01")), "f")
+    variants = {normalized, fixed, normalized.replace(".", ","), fixed.replace(".", ",")}
+    return sorted(variants, key=len)
+
+
+def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
+    opened = bool(driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0
+                && rect.x < window.innerWidth
+                && rect.y < window.innerHeight;
+        };
+        const before = (document.body?.innerText || '').toLowerCase();
+        const clickElement = (element) => {
+            element.scrollIntoView?.({ block: 'center', inline: 'center' });
+            for (const name of ['mousedown', 'mouseup', 'click']) {
+                element.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+            }
+        };
+        const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],svg,div,span'))
+            .filter(isVisible)
+            .filter((element) => {
+                const rect = element.getBoundingClientRect();
+                const marker = [element.getAttribute('aria-label') || '', element.className?.toString() || '', element.innerText || '']
+                    .join(' ')
+                    .toLowerCase();
+                return rect.y < 140
+                    && rect.x > window.innerWidth * 0.35
+                    && rect.x < window.innerWidth * 0.75
+                    && (marker.includes('search') || marker.includes('magnif') || marker.includes('icon'));
+            })
+            .sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return Math.abs(ar.x - window.innerWidth * 0.58) - Math.abs(br.x - window.innerWidth * 0.58);
+            });
+        for (const candidate of candidates.slice(0, 10)) {
+            clickElement(candidate.closest('button,a,[role="button"]') || candidate);
+            const after = (document.body?.innerText || '').toLowerCase();
+            if (after.includes('live events') || after.includes('all sports') || after !== before && document.querySelector('input')) {
+                return true;
+            }
+        }
+        const xValues = [0.585, 0.575, 0.595].map((ratio) => window.innerWidth * ratio);
+        const yValues = [92, 84, 100];
+        for (const y of yValues) {
+            for (const x of xValues) {
+                const target = document.elementFromPoint(x, y);
+                if (!target) continue;
+                clickElement(target.closest('button,a,[role="button"]') || target);
+                const after = (document.body?.innerText || '').toLowerCase();
+                if (after.includes('live events') || after.includes('all sports')) return true;
+            }
+        }
+        return false;
+        """
+    ))
+    if not opened:
+        raise RuntimeError("Could not open Black search.")
+    WebDriverWait(driver, 10).until(lambda browser: "live events" in _visible_text_lower(browser) or "all sports" in _visible_text_lower(browser))
+    print(f"[{profile_label}] Opened Black search.")
+
+
+def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str) -> None:
+    search_input = WebDriverWait(driver, 10).until(lambda browser: browser.execute_script(
+        """
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const inputs = Array.from(document.querySelectorAll('input'))
+            .filter(isVisible)
+            .filter((input) => !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()))
+            .sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y);
+        return inputs[0] || null;
+        """
+    ))
+    _set_input_value(driver, search_input, query)
+    WebDriverWait(driver, 15).until(lambda browser: query.lower() in _visible_text_lower(browser))
+    print(f"[{profile_label}] Searched Black live events for: {query}")
+
+
+def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_label: str) -> None:
+    clicked = bool(driver.execute_script(
+        """
+        const team = arguments[0].trim().toLowerCase();
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const clickElement = (element) => {
+            element.scrollIntoView({ block: 'center', inline: 'center' });
+            for (const name of ['mousedown', 'mouseup', 'click']) {
+                element.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+            }
+        };
+        const rows = Array.from(document.querySelectorAll('div,button,a,[role="button"]'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim().toLowerCase() }))
+            .filter((item) => item.text.includes(team) && item.text.includes('live'))
+            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+        for (const row of rows) {
+            clickElement(row.element.closest('button,a,[role="button"]') || row.element);
+            return true;
+        }
+        return false;
+        """,
+        team_name,
+    ))
+    if not clicked:
+        raise RuntimeError(f"Could not find live Black match for team: {team_name}")
+    WebDriverWait(driver, 20).until(
+        lambda browser: "/sportsbook/" in browser.current_url.lower() and team_name.lower() in _visible_text_lower(browser)
+    )
+    print(f"[{profile_label}] Opened Black live match for: {team_name}")
+
+
+def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, line: Decimal, profile_label: str) -> None:
+    line_variants = _decimal_variants(line)
+    clicked = bool(driver.execute_script(
+        """
+        const selection = arguments[0].trim().toLowerCase();
+        const lineVariants = arguments[1].map((value) => value.toLowerCase());
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const clickElement = (element) => {
+            element.scrollIntoView({ block: 'center', inline: 'center' });
+            for (const name of ['mousedown', 'mouseup', 'click']) {
+                element.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+            }
+        };
+        const headers = Array.from(document.querySelectorAll('div,section,button'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.text === 'asian total goals' || item.text.includes('asian total goals'))
+            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+        for (const header of headers) {
+            let root = header.element.parentElement;
+            for (let depth = 0; root && depth < 6; depth += 1, root = root.parentElement) {
+                const elements = Array.from(root.querySelectorAll('button,div,[role="button"]')).filter(isVisible);
+                const lineElements = elements
+                    .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                    .filter((item) => lineVariants.includes(item.text) || lineVariants.some((line) => item.text.startsWith(line + ' ')));
+                for (const lineElement of lineElements) {
+                    const rowCandidates = [];
+                    let row = lineElement.element.parentElement;
+                    for (let rowDepth = 0; row && rowDepth < 5; rowDepth += 1, row = row.parentElement) {
+                        const rowText = textOf(row);
+                        if (rowText.includes(selection) && lineVariants.some((line) => rowText.includes(line))) {
+                            rowCandidates.push(row);
+                        }
+                    }
+                    for (const rowCandidate of rowCandidates) {
+                        const buttons = Array.from(rowCandidate.querySelectorAll('button,div,[role="button"]'))
+                            .filter(isVisible)
+                            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                            .filter((item) => item.text === selection || item.text.startsWith(selection + ' ') || item.text.includes(selection));
+                        buttons.sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+                        const target = buttons[0]?.element;
+                        if (target) {
+                            clickElement(target.closest('button,[role="button"]') || target);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+        """,
+        selection,
+        line_variants,
+    ))
+    if not clicked:
+        raise RuntimeError(f"Could not select Asian Total Goals {selection} {line}.")
+    WebDriverWait(driver, 10).until(lambda browser: "betslip" in _visible_text_lower(browser) and "price" in _visible_text_lower(browser))
+    print(f"[{profile_label}] Selected Asian Total Goals {selection} {line}.")
+
+
+def _set_black_betslip_price_and_place(driver: webdriver.Remote, price: Decimal, profile_label: str) -> None:
+    price_text = format(price.normalize(), "f")
+    result = driver.execute_script(
+        """
+        const price = arguments[0];
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const setInput = (input, value) => {
+            input.focus({ preventScroll: true });
+            const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
+            if (setter) setter.call(input, value);
+            else input.value = value;
+            input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: value }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+            input.blur();
+        };
+        const labels = Array.from(document.querySelectorAll('label,div,span,p'))
+            .filter(isVisible)
+            .filter((element) => textOf(element) === 'price');
+        for (const label of labels) {
+            const labelRect = label.getBoundingClientRect();
+            const input = Array.from(document.querySelectorAll('input'))
+                .filter(isVisible)
+                .filter((element) => !element.disabled && !element.readOnly)
+                .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+                .filter((item) => item.rect.y >= labelRect.y - 12 && item.rect.y < labelRect.y + 80)
+                .filter((item) => item.rect.x >= labelRect.x - 30 && item.rect.x < labelRect.x + 120)
+                .sort((a, b) => Math.abs(a.rect.x - labelRect.x) - Math.abs(b.rect.x - labelRect.x))[0]?.element;
+            if (input) {
+                setInput(input, price);
+                break;
+            }
+        }
+        const placeButton = Array.from(document.querySelectorAll('button,[role="button"]'))
+            .filter(isVisible)
+            .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+            .filter((item) => item.text === 'place' || item.text.includes('place'))
+            .sort((a, b) => b.rect.x - a.rect.x)[0]?.element;
+        if (!placeButton) return { ok: false, reason: 'place button not found', text: document.body?.innerText || '' };
+        if (placeButton.disabled || placeButton.getAttribute('aria-disabled') === 'true') {
+            return { ok: false, reason: 'place button disabled', text: document.body?.innerText || '' };
+        }
+        for (const name of ['mousedown', 'mouseup', 'click']) {
+            placeButton.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+        }
+        return { ok: true };
+        """,
+        price_text,
+    )
+    if not result or not result.get("ok"):
+        page_text = (result or {}).get("text", "")
+        short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:500]
+        raise RuntimeError(f"Could not click Black Place. Reason: {(result or {}).get('reason')}. Page: {short_text}")
+    print(f"[{profile_label}] Entered price {price_text} and clicked Place.")
+
+
+def place_black_bet(session: dict, signal) -> None:
+    profile_label = session.get("profile_label", "Profile-1")
+    team_name = getattr(signal, "home_team", None)
+    if not team_name:
+        raise RuntimeError("Signal does not contain a first team name for Black search.")
+
+    driver = None
+    try:
+        driver = connect_to_browser(session["browser_info"], profile_label)
+        if BLACK_URL_PART not in driver.current_url.lower():
+            driver.get(BLACK_URL)
+            _wait_document_ready(driver)
+            time.sleep(2)
+        _open_black_search(driver, profile_label)
+        _fill_black_search(driver, team_name, profile_label)
+        _open_black_live_match(driver, team_name, profile_label)
+        _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label)
+        _set_black_betslip_price_and_place(driver, signal.odds, profile_label)
+    finally:
+        close_driver_bridge(driver)
+
+
 def _read_black_balance(driver: webdriver.Remote, profile_label: str) -> Decimal:
     balance_text = driver.execute_script(
         """
