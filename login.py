@@ -790,13 +790,13 @@ def _login_black(driver: webdriver.Remote, profile_label: str) -> None:
     _wait_document_ready(driver)
     time.sleep(2)
 
-    if not driver.find_elements(By.CSS_SELECTOR, "input[type='password']"):
+    if not _has_visible_password_input(driver):
         print(f"[{profile_label}] Black already appears to be logged in: {driver.current_url}")
         return
 
     _fill_login_form(driver, BLACK_USERNAME, BLACK_PASSWORD, profile_label, "Black")
     WebDriverWait(driver, 30).until(
-        lambda browser: not browser.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        lambda browser: not _has_visible_password_input(browser)
         or "dashboard" in _visible_text_lower(browser)
         or "sports" in _visible_text_lower(browser)
     )
