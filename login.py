@@ -17,6 +17,7 @@ import requests
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from dotenv import load_dotenv
 from selenium import webdriver
+from selenium.webdriver import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -500,6 +501,89 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         text = _visible_text_lower(browser)
         return "live events" in text or "all sports" in text
 
+    def find_orders_search_candidate(browser: webdriver.Remote):
+        return browser.execute_script(
+            """
+            const textOf = (element) => (element.innerText || element.textContent || '').trim();
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0
+                    && rect.x < window.innerWidth
+                    && rect.y < window.innerHeight;
+            };
+
+            const navTexts = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element).toLowerCase() }))
+                .filter((item) => item.rect.y < 95 && item.text === 'orders')
+                .sort((a, b) => {
+                    const aArea = a.rect.width * a.rect.height;
+                    const bArea = b.rect.width * b.rect.height;
+                    return aArea - bArea;
+                });
+
+            for (const item of navTexts) {
+                const ordersNode = item.element.closest('li,button,a,[role="button"]') || item.element;
+                const listSibling = ordersNode.nextElementSibling;
+                if (listSibling && isVisible(listSibling)) {
+                    return listSibling.querySelector('svg,path') || listSibling;
+                }
+
+                const centerY = item.rect.y + item.rect.height / 2;
+                const containers = [];
+                let parent = item.element.parentElement;
+                for (let depth = 0; parent && depth < 6; depth += 1, parent = parent.parentElement) {
+                    const rect = parent.getBoundingClientRect();
+                    if (rect.y < 110 && rect.height < 120 && rect.width < window.innerWidth * 0.9) {
+                        containers.push(parent);
+                    }
+                }
+
+                const candidates = containers.flatMap((container) => Array.from(container.children))
+                    .filter((element) => element !== item.element && isVisible(element))
+                    .map((element) => {
+                        const rect = element.getBoundingClientRect();
+                        const marker = [
+                            element.getAttribute('aria-label') || '',
+                            element.getAttribute('data-testid') || '',
+                            element.className?.toString() || '',
+                            textOf(element),
+                            element.querySelector('svg,path') ? 'has-svg' : '',
+                        ].join(' ').toLowerCase();
+                        return { element, rect, marker };
+                    })
+                    .filter((candidate) => candidate.rect.x > item.rect.right + 5)
+                    .filter((candidate) => candidate.rect.x < item.rect.right + 140)
+                    .filter((candidate) => Math.abs((candidate.rect.y + candidate.rect.height / 2) - centerY) < 24)
+                    .filter((candidate) => candidate.rect.width * candidate.rect.height > 50)
+                    .sort((a, b) => {
+                        const aSearch = /search|magnif|lens|has-svg/.test(a.marker) ? 0 : 1;
+                        const bSearch = /search|magnif|lens|has-svg/.test(b.marker) ? 0 : 1;
+                        const aDistance = Math.abs(a.rect.x - (item.rect.right + 52));
+                        const bDistance = Math.abs(b.rect.x - (item.rect.right + 52));
+                        return aSearch - bSearch || aDistance - bDistance;
+                    });
+                const first = candidates[0]?.element;
+                if (first) {
+                    return first.querySelector('svg,path') || first;
+                }
+
+                const directSibling = item.element.parentElement?.nextElementSibling;
+                if (directSibling && isVisible(directSibling)) {
+                    return directSibling.querySelector('svg,path') || directSibling;
+                }
+            }
+
+            return null;
+            """
+        )
+
     if search_dialog_open(driver):
         print(f"[{profile_label}] Black search is already open.")
         return
@@ -658,6 +742,46 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         };
         """
     )
+    if result is not True and isinstance(result, dict) and result.get("reason") == "orders-neighbour-click-failed":
+        candidate = find_orders_search_candidate(driver)
+        if candidate is not None:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", candidate)
+            except WebDriverException:
+                pass
+
+            fallback_attempts = [
+                ("native", lambda: candidate.click()),
+                ("actions", lambda: ActionChains(driver).move_to_element(candidate).pause(0.1).click(candidate).perform()),
+                (
+                    "center-point",
+                    lambda: driver.execute_script(
+                        """
+                        const element = arguments[0];
+                        const rect = element.getBoundingClientRect();
+                        const x = rect.x + rect.width / 2;
+                        const y = rect.y + rect.height / 2;
+                        const target = document.elementFromPoint(x, y) || element;
+                        for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                            const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+                            target.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
+                        }
+                        target.click?.();
+                        """,
+                        candidate,
+                    ),
+                ),
+            ]
+
+            for attempt_name, attempt in fallback_attempts:
+                try:
+                    attempt()
+                    if WebDriverWait(driver, 2).until(lambda browser: search_dialog_open(browser)):
+                        print(f"[{profile_label}] Opened Black search via {attempt_name} fallback.")
+                        return
+                except Exception:
+                    continue
+
     if result is not True:
         raise RuntimeError(f"Could not open Black search. Details: {result!r}")
     WebDriverWait(driver, 10).until(search_dialog_open)
