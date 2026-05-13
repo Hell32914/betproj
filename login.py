@@ -785,6 +785,7 @@ def place_black_bet(session: dict, signal) -> None:
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
             pass
+        print(f"[{profile_label}] Searching Black by first team only: {team_name}")
         _open_black_search(driver, profile_label)
         _fill_black_search(driver, team_name, profile_label)
         _open_black_live_match(driver, team_name, profile_label)
@@ -795,8 +796,10 @@ def place_black_bet(session: dict, signal) -> None:
 
 
 def _read_black_balance(driver: webdriver.Remote, profile_label: str) -> Decimal:
-    balance_text = driver.execute_script(
-        """
+    balance_text = ""
+    for _ in range(15):
+        balance_text = driver.execute_script(
+            """
         const euro = String.fromCharCode(8364);
         const moneyPattern = new RegExp(euro + '\\s*[0-9]+(?:[.,][0-9]+)?');
         const isVisible = (element) => {
@@ -821,8 +824,11 @@ def _read_black_balance(driver: webdriver.Remote, profile_label: str) -> Decimal
             if (match) return match[0];
         }
         return '';
-        """
-    )
+            """
+        ) or ""
+        if balance_text:
+            break
+        time.sleep(1)
     if not balance_text:
         text = _visible_page_text(driver)
         money_values = re.findall(r"\u20ac\s*[0-9]+(?:[.,][0-9]+)?", text)
@@ -1273,11 +1279,15 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
         print(f"[{profile_label}] Reconnecting after opening tab...")
         driver = connect_to_browser(browser_info, profile_label)
         login(driver, profile_label)
-        stake_result = update_black_default_stake(driver, profile_label)
-        print(
-            f"[{profile_label}] Default stake refreshed on startup: "
-            f"balance EUR {stake_result['balance']}, stake EUR {stake_result['stake']} ({stake_result['percent']}%)."
-        )
+        stake_result = None
+        try:
+            stake_result = update_black_default_stake(driver, profile_label)
+            print(
+                f"[{profile_label}] Default stake refreshed on startup: "
+                f"balance EUR {stake_result['balance']}, stake EUR {stake_result['stake']} ({stake_result['percent']}%)."
+            )
+        except Exception as exc:
+            print(f"[{profile_label}] Startup default stake refresh failed, continuing listener: {exc}")
         close_driver_bridge(driver)
 
         print(f"[{profile_label}] Done. Browser will remain open. Press Ctrl+C to exit.")
