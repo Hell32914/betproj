@@ -863,6 +863,119 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
     print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
 
 
+def _black_search_dialog_open(driver: webdriver.Remote) -> bool:
+    text = _visible_text_lower(driver)
+    return "live events" in text or "all sports" in text
+
+
+def _black_match_context_matches(
+    driver: webdriver.Remote,
+    home_team: str,
+    away_team: str | None,
+) -> bool:
+    return bool(driver.execute_script(
+        """
+        const homeTeam = arguments[0].trim().toLowerCase();
+        const awayTeam = (arguments[1] || '').trim().toLowerCase();
+        const bodyText = (document.body?.innerText || '').toLowerCase();
+        if (bodyText.includes('live events') || bodyText.includes('all sports')) return false;
+
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+
+        const sections = Array.from(document.querySelectorAll('main,section,div'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.x < window.innerWidth * 0.82)
+            .filter((item) => item.rect.y < window.innerHeight * 0.45)
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+
+        for (const section of sections.slice(0, 12)) {
+            if (!section.text.includes(homeTeam)) continue;
+            if (awayTeam && !section.text.includes(awayTeam)) continue;
+            return true;
+        }
+        return false;
+        """,
+        home_team,
+        away_team or "",
+    ))
+
+
+def _ensure_black_betslip_safe_to_use(driver: webdriver.Remote, profile_label: str) -> None:
+    state = driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const panel = Array.from(document.querySelectorAll('aside,section,div'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.x > window.innerWidth * 0.68)
+            .filter((item) => item.text.includes('betslip'))
+            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0]?.element;
+        if (!panel) return { ok: true, reason: 'panel-missing' };
+
+        const panelText = textOf(panel);
+        if (panelText.includes('betslip is empty')) return { ok: true, reason: 'empty' };
+
+        const closeButtons = Array.from(panel.querySelectorAll('button,[role="button"],div,span'))
+            .filter(isVisible)
+            .map((element) => ({
+                element,
+                rect: element.getBoundingClientRect(),
+                text: textOf(element),
+                marker: [
+                    element.getAttribute('aria-label') || '',
+                    element.getAttribute('title') || '',
+                    element.className?.toString() || '',
+                    textOf(element),
+                ].join(' ').toLowerCase(),
+            }))
+            .filter((item) => item.rect.x > window.innerWidth * 0.86)
+            .filter((item) => item.rect.y < window.innerHeight * 0.5)
+            .sort((a, b) => {
+                const aClose = /(close|remove|delete|clear|cancel|×|x)/.test(a.marker) ? 0 : 1;
+                const bClose = /(close|remove|delete|clear|cancel|×|x)/.test(b.marker) ? 0 : 1;
+                return aClose - bClose || a.rect.y - b.rect.y;
+            });
+
+        for (const candidate of closeButtons.slice(0, 5)) {
+            const target = candidate.element.closest('button,[role="button"]') || candidate.element;
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+                target.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
+            }
+            try { target.click?.(); } catch (error) {}
+            const refreshed = textOf(panel);
+            if (refreshed.includes('betslip is empty')) return { ok: true, reason: 'cleared' };
+        }
+
+        return { ok: false, reason: 'betslip-not-empty', text: panelText.slice(0, 300) };
+        """
+    )
+    if not state or not state.get("ok"):
+        raise RuntimeError(f"[{profile_label}] Refusing to continue with non-empty Black betslip: {state!r}")
+
+
 def _open_black_live_match(
     driver: webdriver.Remote,
     team_name: str,
@@ -870,12 +983,7 @@ def _open_black_live_match(
     profile_label: str,
 ) -> None:
     def match_opened(browser: webdriver.Remote) -> bool:
-        text = _visible_text_lower(browser)
-        return (
-            "asian total goals" in text
-            or "price" in text
-            or (team_name.lower() in text and "live events" not in text and "all sports" not in text)
-        )
+        return _black_match_context_matches(browser, team_name, opponent_name)
 
     candidate = WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
         """
@@ -1251,10 +1359,17 @@ def place_black_bet(session: dict, signal) -> None:
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
             pass
+        _ensure_black_betslip_safe_to_use(driver, profile_label)
         print(f"[{profile_label}] Searching Black by first team only: {team_name}")
         _open_black_search(driver, profile_label)
         _fill_black_search(driver, team_name, profile_label)
         _open_black_live_match(driver, team_name, opponent_name, profile_label)
+        if _black_search_dialog_open(driver):
+            raise RuntimeError(f"[{profile_label}] Black search dialog is still open after match click; aborting before bet selection.")
+        if not _black_match_context_matches(driver, team_name, opponent_name):
+            raise RuntimeError(
+                f"[{profile_label}] Required Black match context not reached for {team_name} vs {opponent_name or '?'}; aborting before bet selection."
+            )
         prefer_left = "loss" in getattr(signal, "raw_text", "").lower()
         _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
