@@ -504,12 +504,13 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         print(f"[{profile_label}] Black search is already open.")
         return
 
-    opened = bool(driver.execute_script(
+    result = driver.execute_script(
         """
         const dialogAlreadyOpen = () => {
             const text = (document.body?.innerText || '').toLowerCase();
             return text.includes('live events') || text.includes('all sports');
         };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim();
         if (dialogAlreadyOpen()) return true;
 
         const isVisible = (element) => {
@@ -538,9 +539,22 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
             return dialogAlreadyOpen();
         };
 
+        const summarize = (element) => {
+            const rect = element.getBoundingClientRect();
+            return {
+                text: textOf(element).slice(0, 80),
+                tag: element.tagName.toLowerCase(),
+                className: (element.className || '').toString().slice(0, 120),
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+                w: Math.round(rect.width),
+                h: Math.round(rect.height),
+            };
+        };
+
         const navTexts = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
             .filter(isVisible)
-            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim().toLowerCase() }))
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element).toLowerCase() }))
             .filter((item) => item.rect.y < 95 && item.text === 'orders')
             .sort((a, b) => {
                 const aArea = a.rect.width * a.rect.height;
@@ -550,42 +564,62 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
 
         for (const item of navTexts) {
             const centerY = item.rect.y + item.rect.height / 2;
-            const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],svg,path,div,span'))
-                .filter(isVisible)
+            const containers = [];
+            let parent = item.element.parentElement;
+            for (let depth = 0; parent && depth < 6; depth += 1, parent = parent.parentElement) {
+                const rect = parent.getBoundingClientRect();
+                if (rect.y < 110 && rect.height < 120 && rect.width < window.innerWidth * 0.9) {
+                    containers.push(parent);
+                }
+            }
+            const candidates = containers.flatMap((container) => Array.from(container.children))
+                .filter((element) => element !== item.element && isVisible(element))
                 .map((element) => {
                     const rect = element.getBoundingClientRect();
                     const marker = [
                         element.getAttribute('aria-label') || '',
                         element.getAttribute('data-testid') || '',
                         element.className?.toString() || '',
-                        element.outerHTML || '',
+                        textOf(element),
+                        element.querySelector('svg,path') ? 'has-svg' : '',
                     ].join(' ').toLowerCase();
                     return { element, rect, marker };
                 })
-                .filter((candidate) => candidate.rect.x > item.rect.right)
-                .filter((candidate) => candidate.rect.x < item.rect.right + 130)
-                .filter((candidate) => Math.abs((candidate.rect.y + candidate.rect.height / 2) - centerY) < 28)
-                .filter((candidate) => {
-                    const area = candidate.rect.width * candidate.rect.height;
-                    return area > 20 && area < 3600;
-                })
+                .filter((candidate) => candidate.rect.x > item.rect.right + 5)
+                .filter((candidate) => candidate.rect.x < item.rect.right + 140)
+                .filter((candidate) => Math.abs((candidate.rect.y + candidate.rect.height / 2) - centerY) < 24)
+                .filter((candidate) => candidate.rect.width * candidate.rect.height > 50)
                 .sort((a, b) => {
-                    const aSearch = /search|magnif|circle|lens/.test(a.marker) ? 0 : 1;
-                    const bSearch = /search|magnif|circle|lens/.test(b.marker) ? 0 : 1;
-                    const aDistance = Math.abs(a.rect.x - (item.rect.right + 55)) + Math.abs((a.rect.y + a.rect.height / 2) - centerY);
-                    const bDistance = Math.abs(b.rect.x - (item.rect.right + 55)) + Math.abs((b.rect.y + b.rect.height / 2) - centerY);
+                    const aSearch = /search|magnif|lens|has-svg/.test(a.marker) ? 0 : 1;
+                    const bSearch = /search|magnif|lens|has-svg/.test(b.marker) ? 0 : 1;
+                    const aDistance = Math.abs(a.rect.x - (item.rect.right + 52));
+                    const bDistance = Math.abs(b.rect.x - (item.rect.right + 52));
                     return aSearch - bSearch || aDistance - bDistance;
                 });
             for (const candidate of candidates.slice(0, 12)) {
                 if (clickElement(candidate.element)) return true;
             }
+            return {
+                ok: false,
+                reason: 'orders-neighbour-click-failed',
+                orders: summarize(item.element),
+                candidates: candidates.slice(0, 8).map((candidate) => ({ ...summarize(candidate.element), marker: candidate.marker.slice(0, 120) })),
+            };
         }
 
-        return false;
+        return {
+            ok: false,
+            reason: 'orders-not-found',
+            topNav: Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
+                .filter(isVisible)
+                .map((element) => summarize(element))
+                .filter((item) => item.y < 95)
+                .slice(0, 20),
+        };
         """
-    ))
-    if not opened:
-        raise RuntimeError("Could not open Black search.")
+    )
+    if result is not True:
+        raise RuntimeError(f"Could not open Black search. Details: {result!r}")
     WebDriverWait(driver, 10).until(search_dialog_open)
     print(f"[{profile_label}] Opened Black search.")
 
