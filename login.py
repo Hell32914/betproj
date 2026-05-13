@@ -503,6 +503,7 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
             return text.includes('live events') || text.includes('all sports');
         };
         if (dialogAlreadyOpen()) return true;
+
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -515,46 +516,43 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
                 && rect.x < window.innerWidth
                 && rect.y < window.innerHeight;
         };
-        const before = (document.body?.innerText || '').toLowerCase();
-        const clickElement = (element) => {
-            element.scrollIntoView?.({ block: 'center', inline: 'center' });
+
+        const clickAt = (x, y) => {
+            const target = document.elementFromPoint(x, y);
+            if (!target) return false;
+            const clickable = target.closest('button,a,[role="button"]') || target;
             for (const name of ['mousedown', 'mouseup', 'click']) {
-                element.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
             }
+            return dialogAlreadyOpen();
         };
-        const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],svg,div,span'))
+
+        const navTexts = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
             .filter(isVisible)
-            .filter((element) => {
-                const rect = element.getBoundingClientRect();
-                const marker = [element.getAttribute('aria-label') || '', element.className?.toString() || '', element.innerText || '']
-                    .join(' ')
-                    .toLowerCase();
-                return rect.y < 95
-                    && rect.x > window.innerWidth * 0.35
-                    && rect.x < window.innerWidth * 0.75
-                    && (marker.includes('search') || marker.includes('magnif'));
-            })
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim().toLowerCase() }))
+            .filter((item) => item.rect.y < 70 && item.text === 'orders')
             .sort((a, b) => {
-                const ar = a.getBoundingClientRect();
-                const br = b.getBoundingClientRect();
-                return Math.abs(ar.x - window.innerWidth * 0.58) - Math.abs(br.x - window.innerWidth * 0.58);
+                const aArea = a.rect.width * a.rect.height;
+                const bArea = b.rect.width * b.rect.height;
+                return aArea - bArea;
             });
-        for (const candidate of candidates.slice(0, 10)) {
-            clickElement(candidate.closest('button,a,[role="button"]') || candidate);
-            const after = (document.body?.innerText || '').toLowerCase();
-            if (after.includes('live events') || after.includes('all sports')) {
-                return true;
+
+        for (const item of navTexts) {
+            const centerY = item.rect.y + item.rect.height / 2;
+            const xValues = [item.rect.right + 35, item.rect.right + 45, item.rect.right + 55, item.rect.right + 25];
+            const yValues = [centerY, centerY - 4, centerY + 4];
+            for (const y of yValues) {
+                for (const x of xValues) {
+                    if (clickAt(x, y)) return true;
+                }
             }
         }
-        const xValues = [0.555, 0.565, 0.545, 0.575].map((ratio) => window.innerWidth * ratio);
-        const yValues = [50, 44, 56, 62];
+
+        const xValues = [0.575, 0.585, 0.565].map((ratio) => window.innerWidth * ratio);
+        const yValues = [18, 24, 30, 36];
         for (const y of yValues) {
             for (const x of xValues) {
-                const target = document.elementFromPoint(x, y);
-                if (!target) continue;
-                clickElement(target.closest('button,a,[role="button"]') || target);
-                const after = (document.body?.innerText || '').toLowerCase();
-                if (after.includes('live events') || after.includes('all sports')) return true;
+                if (clickAt(x, y)) return true;
             }
         }
         return false;
