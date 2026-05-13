@@ -427,39 +427,74 @@ def _calculate_stake_from_balance(balance: Decimal) -> Decimal:
 
 
 def _open_black_account_menu(driver: webdriver.Remote, profile_label: str) -> None:
+    if "settings" in _visible_text_lower(driver):
+        return
+
     opened = bool(driver.execute_script(
         """
         const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
-            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0
+                && rect.x < window.innerWidth
+                && rect.y < window.innerHeight;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim();
-        const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
+        const pageHasSettings = () => (document.body?.innerText || '').toLowerCase().includes('settings');
+        const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],div,span,svg'))
             .filter(isVisible)
             .filter((element) => {
                 const rect = element.getBoundingClientRect();
                 const text = textOf(element);
-                return rect.y < 140 && rect.x > window.innerWidth * 0.55 && text.includes('\\u20ac') && /[0-9]/.test(text);
+                const marker = [text, element.getAttribute('aria-label') || '', element.className?.toString() || '']
+                    .join(' ')
+                    .toLowerCase();
+                return rect.y < 140
+                    && rect.x > window.innerWidth * 0.55
+                    && (text.includes('\\u20ac')
+                        || marker.includes('account')
+                        || marker.includes('profile')
+                        || marker.includes('user')
+                        || marker.includes('balance')
+                        || marker.includes('alexiq'));
             })
             .sort((a, b) => {
                 const ar = a.getBoundingClientRect();
                 const br = b.getBoundingClientRect();
-                return (ar.width * ar.height) - (br.width * br.height);
+                return br.x - ar.x || (ar.width * ar.height) - (br.width * br.height);
             });
-        const target = candidates[0];
-        if (!target) return false;
-        const clickable = target.closest('button,a,[role="button"]') || target;
-        clickable.scrollIntoView({ block: 'center', inline: 'center' });
-        for (const name of ['mouseover', 'mouseenter', 'mousemove', 'mousedown', 'mouseup', 'click']) {
-            clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+        for (const target of candidates.slice(0, 12)) {
+            const clickable = target.closest('button,a,[role="button"]') || target;
+            clickable.scrollIntoView({ block: 'center', inline: 'center' });
+            for (const name of ['mouseover', 'mouseenter', 'mousemove', 'pointerover', 'pointerenter']) {
+                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+            }
+            if (pageHasSettings()) return true;
+            for (const name of ['mousedown', 'mouseup', 'click']) {
+                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+            }
+            if (pageHasSettings()) return true;
         }
-        return true;
+        return pageHasSettings();
         """
     ))
     if not opened:
         raise RuntimeError("Could not open Black account menu from the profile icon/balance area.")
     WebDriverWait(driver, 10).until(lambda browser: "settings" in _visible_text_lower(browser))
     print(f"[{profile_label}] Opened Black account menu.")
+
+
+def update_black_default_stake(driver: webdriver.Remote, profile_label: str) -> dict:
+    balance = _read_black_balance(driver, profile_label)
+    stake_amount = _calculate_stake_from_balance(balance)
+    stake = _format_stake_amount(stake_amount)
+    _set_black_default_stake(driver, stake, profile_label)
+    return {"balance": str(balance), "stake": stake, "percent": str(STAKE_PERCENT)}
 
 
 def _read_black_balance(driver: webdriver.Remote, profile_label: str) -> Decimal:
@@ -547,11 +582,7 @@ def refresh_black_default_stake(session: dict) -> dict:
         if not _black_appears_logged_in(driver) and _has_visible_password_input(driver):
             _fill_login_form(driver, BLACK_USERNAME, BLACK_PASSWORD, profile_label, "Black")
             WebDriverWait(driver, 30).until(lambda browser: not _has_visible_password_input(browser))
-        balance = _read_black_balance(driver, profile_label)
-        stake_amount = _calculate_stake_from_balance(balance)
-        stake = _format_stake_amount(stake_amount)
-        _set_black_default_stake(driver, stake, profile_label)
-        return {"balance": str(balance), "stake": stake, "percent": str(STAKE_PERCENT)}
+        return update_black_default_stake(driver, profile_label)
     finally:
         close_driver_bridge(driver)
 
@@ -864,6 +895,11 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
         print(f"[{profile_label}] Reconnecting after opening tab...")
         driver = connect_to_browser(browser_info, profile_label)
         login(driver, profile_label)
+        stake_result = update_black_default_stake(driver, profile_label)
+        print(
+            f"[{profile_label}] Default stake refreshed on startup: "
+            f"balance EUR {stake_result['balance']}, stake EUR {stake_result['stake']} ({stake_result['percent']}%)."
+        )
         close_driver_bridge(driver)
 
         print(f"[{profile_label}] Done. Browser will remain open. Press Ctrl+C to exit.")
@@ -873,6 +909,7 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
             "browser_info": browser_info,
             "was_already_running": was_already_running,
             "login_enabled": True,
+            "stake": stake_result,
         }
 
     except Exception as exc:
@@ -911,14 +948,6 @@ def run_all_profiles(expected_profiles: int = 2, wait_for_enter: bool = False) -
     for idx, profile_id in enumerate(profile_ids, start=1):
         label = f"Profile-{idx}"
         sessions.append(run_profile(profile_id, label, login_enabled=(idx == 1)))
-
-    primary_session = next((session for session in sessions if session.get("login_enabled")), sessions[0])
-    result = refresh_black_default_stake(primary_session)
-    primary_session["stake"] = result
-    print(
-        f"Default stake refreshed on startup for {primary_session['profile_label']}: "
-        f"balance EUR {result['balance']}, stake EUR {result['stake']} ({result['percent']}%)."
-    )
 
     print("\nAdsPower profiles are ready. BetInAsia/Black login was performed only on Profile-1.")
 
