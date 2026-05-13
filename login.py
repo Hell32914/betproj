@@ -665,8 +665,14 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
 
 
 def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str) -> None:
+    normalized_query = query.strip()
     search_input = WebDriverWait(driver, 10).until(lambda browser: browser.execute_script(
         """
+        const dialogOpen = () => {
+            const text = (document.body?.innerText || '').toLowerCase();
+            return text.includes('live events') || text.includes('all sports');
+        };
+        if (!dialogOpen()) return null;
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -677,16 +683,38 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                 && rect.bottom > 0
                 && rect.right > 0;
         };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
         const inputs = Array.from(document.querySelectorAll('input'))
             .filter(isVisible)
             .filter((input) => !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()))
-            .sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y);
-        return inputs[0] || null;
+            .map((input) => {
+                const rect = input.getBoundingClientRect();
+                const marker = [
+                    input.getAttribute('placeholder') || '',
+                    input.getAttribute('aria-label') || '',
+                    input.name || '',
+                    input.className?.toString() || '',
+                    textOf(input.parentElement || input),
+                ].join(' ').toLowerCase();
+                return { input, rect, marker };
+            })
+            .filter((item) => item.rect.y < 320)
+            .sort((a, b) => {
+                const aSearch = /search|league|game/.test(a.marker) ? 0 : 1;
+                const bSearch = /search|league|game/.test(b.marker) ? 0 : 1;
+                return aSearch - bSearch || a.rect.y - b.rect.y;
+            });
+        return inputs[0]?.input || null;
         """
     ))
-    _set_input_value(driver, search_input, query)
-    WebDriverWait(driver, 15).until(lambda browser: query.lower() in _visible_text_lower(browser))
-    print(f"[{profile_label}] Searched Black live events for: {query}")
+    _set_input_value(driver, search_input, normalized_query)
+    search_input.send_keys(Keys.ENTER)
+
+    WebDriverWait(driver, 15).until(
+        lambda browser: normalized_query.lower() in _visible_text_lower(browser)
+        or "no results found" in _visible_text_lower(browser)
+    )
+    print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
 
 
 def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_label: str) -> None:
