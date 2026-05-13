@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -496,6 +497,39 @@ def _decimal_variants(value: Decimal) -> list[str]:
 
 
 def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
+    def search_dialog_open(browser: webdriver.Remote) -> bool:
+        text = _visible_text_lower(browser)
+        return "live events" in text or "all sports" in text
+
+    if search_dialog_open(driver):
+        print(f"[{profile_label}] Black search is already open.")
+        return
+
+    orders_elements = driver.find_elements(
+        By.XPATH,
+        "//*[normalize-space()='Orders' and not(self::script) and not(self::style)]",
+    )
+    for orders_element in orders_elements:
+        try:
+            if not orders_element.is_displayed():
+                continue
+            rect = orders_element.rect
+            if rect.get("y", 999) > 90:
+                continue
+            for x_offset in (72, 66, 80, 58, 88):
+                for y_offset in (0, -2, 2):
+                    ActionChains(driver).move_to_element_with_offset(
+                        orders_element,
+                        rect["width"] / 2 + x_offset,
+                        rect["height"] / 2 + y_offset,
+                    ).click().perform()
+                    time.sleep(0.4)
+                    if search_dialog_open(driver):
+                        print(f"[{profile_label}] Opened Black search.")
+                        return
+        except Exception:
+            continue
+
     opened = bool(driver.execute_script(
         """
         const dialogAlreadyOpen = () => {
@@ -560,7 +594,7 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
     ))
     if not opened:
         raise RuntimeError("Could not open Black search.")
-    WebDriverWait(driver, 10).until(lambda browser: "live events" in _visible_text_lower(browser) or "all sports" in _visible_text_lower(browser))
+    WebDriverWait(driver, 10).until(search_dialog_open)
     print(f"[{profile_label}] Opened Black search.")
 
 
