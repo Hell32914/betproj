@@ -34,6 +34,7 @@ PORTAL_URL = "https://portal.betinasia.com/Dashboard/Products"
 PORTAL_LOGIN_URL = "https://portal.betinasia.com/Account/Login"
 BLACK_URL_PART = "black.betinasia.com"
 BLACK_URL = "https://black.betinasia.com"
+BLACK_SPORTSBOOK_URL = "https://black.betinasia.com/sportsbook"
 
 ADSPOWER_API_URL = os.getenv("ADSPOWER_API_URL", "http://local.adspower.net:50325")
 BETINASIA_EMAIL = os.getenv("BETINASIA_EMAIL")
@@ -497,6 +498,11 @@ def _decimal_variants(value: Decimal) -> list[str]:
 def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
     opened = bool(driver.execute_script(
         """
+        const dialogAlreadyOpen = () => {
+            const text = (document.body?.innerText || '').toLowerCase();
+            return text.includes('live events') || text.includes('all sports');
+        };
+        if (dialogAlreadyOpen()) return true;
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -523,10 +529,10 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
                 const marker = [element.getAttribute('aria-label') || '', element.className?.toString() || '', element.innerText || '']
                     .join(' ')
                     .toLowerCase();
-                return rect.y < 140
+                return rect.y < 95
                     && rect.x > window.innerWidth * 0.35
                     && rect.x < window.innerWidth * 0.75
-                    && (marker.includes('search') || marker.includes('magnif') || marker.includes('icon'));
+                    && (marker.includes('search') || marker.includes('magnif'));
             })
             .sort((a, b) => {
                 const ar = a.getBoundingClientRect();
@@ -536,12 +542,12 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         for (const candidate of candidates.slice(0, 10)) {
             clickElement(candidate.closest('button,a,[role="button"]') || candidate);
             const after = (document.body?.innerText || '').toLowerCase();
-            if (after.includes('live events') || after.includes('all sports') || after !== before && document.querySelector('input')) {
+            if (after.includes('live events') || after.includes('all sports')) {
                 return true;
             }
         }
-        const xValues = [0.585, 0.575, 0.595].map((ratio) => window.innerWidth * ratio);
-        const yValues = [92, 84, 100];
+        const xValues = [0.555, 0.565, 0.545, 0.575].map((ratio) => window.innerWidth * ratio);
+        const yValues = [50, 44, 56, 62];
         for (const y of yValues) {
             for (const x of xValues) {
                 const target = document.elementFromPoint(x, y);
@@ -772,10 +778,13 @@ def place_black_bet(session: dict, signal) -> None:
     driver = None
     try:
         driver = connect_to_browser(session["browser_info"], profile_label)
-        if BLACK_URL_PART not in driver.current_url.lower():
-            driver.get(BLACK_URL)
-            _wait_document_ready(driver)
-            time.sleep(2)
+        driver.get(BLACK_SPORTSBOOK_URL)
+        _wait_document_ready(driver)
+        time.sleep(2)
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
         _open_black_search(driver, profile_label)
         _fill_black_search(driver, team_name, profile_label)
         _open_black_live_match(driver, team_name, profile_label)
