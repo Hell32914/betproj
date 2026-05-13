@@ -535,26 +535,31 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         };
 
         const clickElement = (element) => {
-            const clickable = element.closest('button,a,[role="button"]') || element;
+            const clickable = element.closest('button,a,[role="button"],li') || element;
             clickable.scrollIntoView?.({ block: 'center', inline: 'center' });
 
-            const targets = [
-                clickable,
-                clickable.querySelector?.('svg'),
-                clickable.querySelector?.('path'),
-                clickable.firstElementChild,
-            ].filter(Boolean);
+            const rect = clickable.getBoundingClientRect();
+            const x = rect.x + rect.width / 2;
+            const y = rect.y + rect.height / 2;
+
+            const targets = [];
+            const pushTarget = (target) => {
+                if (target && !targets.includes(target)) targets.push(target);
+            };
+
+            pushTarget(clickable);
+            pushTarget(document.elementFromPoint(x, y));
+            pushTarget(clickable.querySelector?.('svg'));
+            pushTarget(clickable.querySelector?.('path'));
+            pushTarget(clickable.firstElementChild);
+
+            let parent = document.elementFromPoint(x, y);
+            for (let depth = 0; parent && depth < 5; depth += 1, parent = parent.parentElement) {
+                pushTarget(parent);
+            }
 
             for (const target of targets) {
-                const rect = target.getBoundingClientRect();
-                const x = rect.x + rect.width / 2;
-                const y = rect.y + rect.height / 2;
                 if (fireClick(target, x, y)) return true;
-
-                const pointTarget = document.elementFromPoint(x, y);
-                if (pointTarget && pointTarget !== target && fireClick(pointTarget, x, y)) {
-                    return true;
-                }
             }
 
             return dialogAlreadyOpen();
@@ -585,6 +590,11 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
 
         for (const item of navTexts) {
             const centerY = item.rect.y + item.rect.height / 2;
+            const ordersNode = item.element.closest('li,button,a,[role="button"]') || item.element;
+            const listSibling = ordersNode.nextElementSibling;
+            if (listSibling && isVisible(listSibling) && clickElement(listSibling)) {
+                return true;
+            }
             const containers = [];
             let parent = item.element.parentElement;
             for (let depth = 0; parent && depth < 6; depth += 1, parent = parent.parentElement) {
@@ -630,7 +640,9 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
                 ok: false,
                 reason: 'orders-neighbour-click-failed',
                 orders: summarize(item.element),
+                ordersNode: summarize(ordersNode),
                 candidates: candidates.slice(0, 8).map((candidate) => ({ ...summarize(candidate.element), marker: candidate.marker.slice(0, 120) })),
+                listSibling: listSibling ? summarize(listSibling) : null,
                 directSibling: directSibling ? summarize(directSibling) : null,
             };
         }
