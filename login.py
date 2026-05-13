@@ -488,18 +488,40 @@ def update_black_default_stake(driver: webdriver.Remote, profile_label: str) -> 
 
 
 def _read_black_balance(driver: webdriver.Remote, profile_label: str) -> Decimal:
-    _open_black_account_menu(driver, profile_label)
-    text = _visible_page_text(driver)
-    balance_match = re.search(r"Balance\s*\n?\s*(\u20ac\s*[0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
-    if not balance_match:
-        balance_match = re.search(r"Funds\s*\n?\s*(\u20ac\s*[0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
-    if not balance_match:
+    balance_text = driver.execute_script(
+        """
+        const euro = String.fromCharCode(8364);
+        const moneyPattern = new RegExp(euro + '\\s*[0-9]+(?:[.,][0-9]+)?');
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0
+                && rect.x < window.innerWidth
+                && rect.y < window.innerHeight;
+        };
+        const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim() }))
+            .filter((item) => item.rect.y < 120 && item.rect.x > window.innerWidth * 0.55 && moneyPattern.test(item.text))
+            .sort((a, b) => b.rect.x - a.rect.x || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+        for (const item of candidates) {
+            const match = item.text.match(moneyPattern);
+            if (match) return match[0];
+        }
+        return '';
+        """
+    )
+    if not balance_text:
+        text = _visible_page_text(driver)
         money_values = re.findall(r"\u20ac\s*[0-9]+(?:[.,][0-9]+)?", text)
         if not money_values:
-            raise RuntimeError("Could not read Black balance from the account menu.")
+            raise RuntimeError("Could not read Black balance from the top profile balance.")
         balance_text = money_values[0]
-    else:
-        balance_text = balance_match.group(1)
     balance = _money_to_decimal(balance_text)
     print(f"[{profile_label}] Black balance: EUR {balance}")
     return balance
@@ -530,26 +552,33 @@ def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label
             .filter(isVisible)
             .filter((element) => textOf(element) === 'default stake' || textOf(element).includes('default stake'));
         for (const label of labels) {
-            let root = label.parentElement;
-            for (let depth = 0; root && depth < 6; depth += 1, root = root.parentElement) {
-                const input = Array.from(root.querySelectorAll('input'))
-                    .find((element) => isVisible(element) && !element.disabled && !element.readOnly);
-                if (!input) continue;
-                input.scrollIntoView({ block: 'center', inline: 'center' });
-                input.focus();
-                const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
-                if (setter) {
-                    setter.call(input, stake);
-                } else {
-                    input.value = stake;
-                }
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                input.blur();
-                input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-                input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
-                return input.value === stake;
+            const labelRect = label.getBoundingClientRect();
+            const inputs = Array.from(document.querySelectorAll('input'))
+                .filter((element) => isVisible(element) && !element.disabled && !element.readOnly)
+                .filter((element) => !['checkbox', 'radio', 'hidden'].includes((element.type || '').toLowerCase()))
+                .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+                .filter((item) => item.rect.y >= labelRect.y - 8 && item.rect.y < labelRect.y + 90)
+                .sort((a, b) => {
+                    const aDistance = Math.abs(a.rect.y - labelRect.y) + Math.abs(a.rect.x - labelRect.x) / 10;
+                    const bDistance = Math.abs(b.rect.y - labelRect.y) + Math.abs(b.rect.x - labelRect.x) / 10;
+                    return aDistance - bDistance;
+                });
+            const input = inputs[0]?.element;
+            if (!input) continue;
+            input.scrollIntoView({ block: 'center', inline: 'center' });
+            input.focus();
+            const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
+            if (setter) {
+                setter.call(input, stake);
+            } else {
+                input.value = stake;
             }
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+            input.blur();
+            return input.value === stake;
         }
         return false;
         """,
