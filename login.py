@@ -864,9 +864,18 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
 
 
 def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_label: str) -> None:
-    result = driver.execute_script(
+    def match_opened(browser: webdriver.Remote) -> bool:
+        text = _visible_text_lower(browser)
+        return (
+            "asian total goals" in text
+            or "price" in text
+            or (team_name.lower() in text and "live events" not in text and "all sports" not in text)
+        )
+
+    candidate = WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
         """
         const team = arguments[0].trim().toLowerCase();
+        const words = team.split(/\\s+/).filter((word) => word.length >= 3);
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -877,54 +886,104 @@ def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_lab
                 && rect.bottom > 0
                 && rect.right > 0;
         };
-        const words = team.split(/\\s+/).filter((word) => word.length >= 3);
-        const clickElement = (element) => {
-            const clickable = element.closest('button,a,[role="button"],li') || element;
-            clickable.scrollIntoView({ block: 'center', inline: 'center' });
-            for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
-                clickable.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
-            }
-            try { clickable.click?.(); } catch (error) {}
-        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
         const scoreFor = (text) => {
             let score = 0;
             if (text.includes(team)) score += 100;
             const matchedWords = words.filter((word) => text.includes(word)).length;
             score += matchedWords * 20;
-            if (text.includes('live') || text.includes('in-play') || text.includes('in play')) score += 40;
-            if (/\\b\\d+\\s*[:-]\\s*\\d+\\b/.test(text)) score += 15;
-            if (/\\b\\d{1,2}'\\b/.test(text)) score += 15;
-            if (text.includes('over') || text.includes('under')) score -= 20;
+            if (text.includes('live') || text.includes('in-play') || text.includes('in play')) score += 30;
+            if (/\\b\\d+\\s*[:-]\\s*\\d+\\b/.test(text)) score += 20;
+            if (/\\b\\d{1,2}'\\b/.test(text)) score += 20;
+            if (text.includes('result')) score -= 15;
+            if (text.includes('over') || text.includes('under')) score -= 30;
             return score;
         };
-        const rows = Array.from(document.querySelectorAll('li,div,button,a,[role="button"]'))
+
+        const roots = Array.from(document.querySelectorAll('li,button,a,[role="button"],div'))
             .filter(isVisible)
-            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim().toLowerCase() }))
-            .map((item) => ({ ...item, score: scoreFor(item.text) }))
-            .filter((item) => item.score >= 60)
-            .sort((a, b) => b.score - a.score || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
-        for (const row of rows) {
-            clickElement(row.element);
-            return { ok: true, text: row.text.slice(0, 200), score: row.score };
+            .map((element) => {
+                const row = element.closest('li,button,a,[role="button"]') || element;
+                const rect = row.getBoundingClientRect();
+                const text = textOf(row);
+                return { row, rect, text, score: scoreFor(text) };
+            })
+            .filter((item) => item.rect.y > 180)
+            .filter((item) => item.rect.width > 150 && item.rect.height >= 24)
+            .filter((item) => item.score >= 80)
+            .sort((a, b) => b.score - a.score || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+
+        const uniqueRows = [];
+        for (const item of roots) {
+            if (!uniqueRows.some((current) => current.row === item.row)) {
+                uniqueRows.push(item);
+            }
         }
-        return {
-            ok: false,
-            reason: 'match-row-not-found',
-            team,
-            candidates: rows.slice(0, 8).map((row) => ({ text: row.text.slice(0, 200), score: row.score })),
+
+        return uniqueRows[0]?.row || null;
+        """,
+        team_name,
+    ))
+
+    click_attempts = [
+        ("native", lambda: candidate.click()),
+        ("actions", lambda: ActionChains(driver).move_to_element(candidate).pause(0.1).click(candidate).perform()),
+        (
+            "js-center",
+            lambda: driver.execute_script(
+                """
+                const element = arguments[0];
+                const target = element.closest('button,a,[role="button"],li') || element;
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+                const rect = target.getBoundingClientRect();
+                const x = rect.x + rect.width / 2;
+                const y = rect.y + rect.height / 2;
+                const node = document.elementFromPoint(x, y) || target;
+                for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+                    node.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
+                }
+                try { target.click?.(); } catch (error) {}
+                """,
+                candidate,
+            ),
+        ),
+        ("enter", lambda: candidate.send_keys(Keys.ENTER)),
+    ]
+
+    for attempt_name, attempt in click_attempts:
+        try:
+            attempt()
+            if WebDriverWait(driver, 5).until(lambda browser: match_opened(browser)):
+                print(f"[{profile_label}] Opened Black live match for: {team_name} via {attempt_name}.")
+                return
+        except Exception:
+            continue
+
+    details = driver.execute_script(
+        """
+        const team = arguments[0].trim().toLowerCase();
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
         };
+        return Array.from(document.querySelectorAll('li,button,a,[role="button"],div'))
+            .filter(isVisible)
+            .map((element) => ({ text: textOf(element), rect: element.getBoundingClientRect() }))
+            .filter((item) => item.rect.y > 180 && item.text.includes(team))
+            .slice(0, 8)
+            .map((item) => item.text.slice(0, 220));
         """,
         team_name,
     )
-    if not result or not result.get("ok"):
-        raise RuntimeError(f"Could not find live Black match for team: {team_name}. Details: {result!r}")
-    WebDriverWait(driver, 20).until(
-        lambda browser: "asian total goals" in _visible_text_lower(browser)
-        or "price" in _visible_text_lower(browser)
-        or (team_name.lower() in _visible_text_lower(browser) and "live events" not in _visible_text_lower(browser))
-    )
-    print(f"[{profile_label}] Opened Black live match for: {team_name}")
+    raise RuntimeError(f"Could not open Black live match for team: {team_name}. Candidates: {details!r}")
 
 
 def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, line: Decimal, profile_label: str) -> None:
