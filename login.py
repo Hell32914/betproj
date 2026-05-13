@@ -431,72 +431,40 @@ def _open_black_account_menu(driver: webdriver.Remote, profile_label: str) -> No
         return
 
     opened = False
-    for _ in range(5):
+    for _ in range(8):
         opened = bool(driver.execute_script(
             """
-        const isVisible = (element) => {
-            const style = window.getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            return style.display !== 'none'
-                && style.visibility !== 'hidden'
-                && rect.width > 0
-                && rect.height > 0
-                && rect.bottom > 0
-                && rect.right > 0
-                && rect.x < window.innerWidth
-                && rect.y < window.innerHeight;
-        };
-        const textOf = (element) => (element.innerText || element.textContent || '').trim();
         const pageHasSettings = () => (document.body?.innerText || '').toLowerCase().includes('settings');
-        const euro = String.fromCharCode(8364);
-        const fire = (target) => {
-            const clickable = target?.closest?.('button,a,[role="button"]') || target;
-            if (!clickable) return false;
-            clickable.scrollIntoView?.({ block: 'center', inline: 'center' });
-            for (const name of ['mouseover', 'mouseenter', 'mousemove', 'pointerover', 'pointerenter']) {
-                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
-            }
-            if (pageHasSettings()) return true;
-            for (const name of ['mousedown', 'mouseup', 'click']) {
-                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
-            }
-            try { clickable.click?.(); } catch (error) {}
-            return pageHasSettings();
-        };
-        const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],div,span,svg'))
-            .filter(isVisible)
-            .filter((element) => {
-                const rect = element.getBoundingClientRect();
-                const text = textOf(element);
-                const marker = [text, element.getAttribute('aria-label') || '', element.className?.toString() || '']
-                    .join(' ')
-                    .toLowerCase();
-                return rect.y < 140
-                    && rect.x > window.innerWidth * 0.55
-                    && (text.includes(euro)
-                        || marker.includes('account')
-                        || marker.includes('profile')
-                        || marker.includes('user')
-                        || marker.includes('balance')
-                        || marker.includes('alexiq'));
-            })
-            .sort((a, b) => {
-                const ar = a.getBoundingClientRect();
-                const br = b.getBoundingClientRect();
-                return br.x - ar.x || (ar.width * ar.height) - (br.width * br.height);
-            });
-        for (const target of candidates.slice(0, 12)) {
-            if (fire(target)) return true;
-        }
+        if (pageHasSettings()) return true;
 
-        const yValues = [88, 96, 104, 56];
-        const xValues = [28, 52, 84, 120, 160, 205, 245].map((offset) => window.innerWidth - offset);
+        const dispatchHover = (target, x, y) => {
+            if (!target) return false;
+            const events = [
+                new PointerEvent('pointerover', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerId: 1, pointerType: 'mouse', isPrimary: true }),
+                new PointerEvent('pointerenter', { bubbles: false, cancelable: true, view: window, clientX: x, clientY: y, pointerId: 1, pointerType: 'mouse', isPrimary: true }),
+                new PointerEvent('pointermove', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerId: 1, pointerType: 'mouse', isPrimary: true }),
+                new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }),
+                new MouseEvent('mouseenter', { bubbles: false, cancelable: true, view: window, clientX: x, clientY: y }),
+                new MouseEvent('mousemove', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }),
+            ];
+            for (const event of events) target.dispatchEvent(event);
+            if (pageHasSettings()) return true;
+            return false;
+        };
+
+        const hoverPoint = (x, y) => {
+            let target = document.elementFromPoint(x, y);
+            for (let depth = 0; target && depth < 6; depth += 1, target = target.parentElement) {
+                if (dispatchHover(target, x, y)) return true;
+            }
+            return false;
+        };
+
+        const xValues = [34, 38, 30, 45, 54].map((offset) => window.innerWidth - offset);
+        const yValues = [35, 39, 31, 45, 26];
         for (const y of yValues) {
             for (const x of xValues) {
-                let target = document.elementFromPoint(x, y);
-                for (let depth = 0; target && depth < 4; depth += 1, target = target.parentElement) {
-                    if (fire(target)) return true;
-                }
+                if (hoverPoint(x, y)) return true;
             }
         }
         return pageHasSettings();
