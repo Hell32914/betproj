@@ -81,7 +81,6 @@ async def start_adspower_after_listener_ready(state: RuntimeState) -> None:
         lambda: run_all_profiles(expected_profiles=ADSPOWER_PROFILE_COUNT, wait_for_enter=False),
     )
     state.ready.set()
-    await refresh_stakes(state)
     print("AdsPower profiles are ready. Telegram listener is still running.", flush=True)
 
 

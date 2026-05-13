@@ -882,7 +882,7 @@ def validate_required_env() -> None:
 
 
 def run_all_profiles(expected_profiles: int = 2, wait_for_enter: bool = False) -> list[dict]:
-    """Start or reuse AdsPower profiles; only the first profile logs into BetInAsia/Black."""
+    """Start or reuse AdsPower profiles, then set the first profile's Black default stake."""
     validate_required_env()
 
     profile_ids = fetch_profile_ids(expected=expected_profiles)
@@ -891,6 +891,14 @@ def run_all_profiles(expected_profiles: int = 2, wait_for_enter: bool = False) -
     for idx, profile_id in enumerate(profile_ids, start=1):
         label = f"Profile-{idx}"
         sessions.append(run_profile(profile_id, label, login_enabled=(idx == 1)))
+
+    primary_session = next((session for session in sessions if session.get("login_enabled")), sessions[0])
+    result = refresh_black_default_stake(primary_session)
+    primary_session["stake"] = result
+    print(
+        f"Default stake refreshed on startup for {primary_session['profile_label']}: "
+        f"balance EUR {result['balance']}, stake EUR {result['stake']} ({result['percent']}%)."
+    )
 
     print("\nAdsPower profiles are ready. BetInAsia/Black login was performed only on Profile-1.")
 
