@@ -986,12 +986,13 @@ def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_lab
     raise RuntimeError(f"Could not open Black live match for team: {team_name}. Candidates: {details!r}")
 
 
-def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, line: Decimal, profile_label: str) -> None:
+def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, line: Decimal, profile_label: str, prefer_left: bool = False) -> None:
     line_variants = _decimal_variants(line)
     result = driver.execute_script(
         """
         const selection = arguments[0].trim().toLowerCase();
         const lineVariants = arguments[1].map((value) => value.toLowerCase());
+        const preferLeft = Boolean(arguments[2]);
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -1003,7 +1004,8 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-        const hasLine = (text) => lineVariants.some((line) => text.includes(line));
+            const hasLine = (text) => lineVariants.some((line) => text.includes(line));
+            const oddsPattern = /^\\d+(?:[.,]\\d+)+$/;
         const clickElement = (element) => {
             const clickable = element.closest('button,[role="button"]') || element;
             clickable.scrollIntoView({ block: 'center', inline: 'center' });
@@ -1013,45 +1015,61 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
             }
             try { clickable.click?.(); } catch (error) {}
         };
-        const headers = Array.from(document.querySelectorAll('div,section,button'))
+        const pickRelativeToLabel = (rowElement) => {
+            const items = Array.from(rowElement.querySelectorAll('button,div,[role="button"],span'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }));
+
+            const label = items
+                .filter((item) => item.text === selection || item.text.startsWith(selection + ' '))
+                .sort((a, b) => a.rect.x - b.rect.x)[0];
+
+            const oddsButtons = items
+                .filter((item) => oddsPattern.test(item.text))
+                .sort((a, b) => a.rect.x - b.rect.x);
+
+            if (label && oddsButtons.length) {
+                const preferred = preferLeft
+                    ? oddsButtons
+                        .filter((item) => item.rect.right <= label.rect.left + 6)
+                        .sort((a, b) => Math.abs(a.rect.right - label.rect.left) - Math.abs(b.rect.right - label.rect.left))[0]
+                    : oddsButtons
+                        .filter((item) => item.rect.left >= label.rect.right - 6)
+                        .sort((a, b) => Math.abs(a.rect.left - label.rect.right) - Math.abs(b.rect.left - label.rect.right))[0];
+                if (preferred) return preferred.element;
+            }
+
+            if (oddsButtons.length >= 2) {
+                return selection === 'under' ? oddsButtons[oddsButtons.length - 1].element : oddsButtons[0].element;
+            }
+            return oddsButtons[0]?.element || null;
+        };
+
+        const rows = Array.from(document.querySelectorAll('div,button,[role="button"],li,section'))
             .filter(isVisible)
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-            .filter((item) => item.text === 'asian total goals' || item.text.includes('asian total goals'))
-            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
-        for (const header of headers) {
-            let root = header.element.parentElement;
-            for (let depth = 0; root && depth < 6; depth += 1, root = root.parentElement) {
-                const rows = Array.from(root.querySelectorAll('button,div,[role="button"],li'))
-                    .filter(isVisible)
-                    .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-                    .filter((item) => item.rect.width > 180 && item.rect.height >= 28)
-                    .filter((item) => hasLine(item.text) && item.text.includes(selection))
-                    .map((item) => {
-                        let score = 0;
-                        if (lineVariants.some((line) => item.text.includes(line + ' ' + selection))) score += 80;
-                        if (item.text.includes('asian total goals')) score += 30;
-                        if (/\\b\\d+(?:[.,]\\d+)?\\b/.test(item.text)) score += 20;
-                        score += Math.min(item.text.length, 160) / 10;
-                        return { ...item, score };
-                    })
-                    .sort((a, b) => b.score - a.score || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+            .filter((item) => item.rect.y > 220)
+            .filter((item) => item.rect.width > 300 && item.rect.height >= 28)
+            .filter((item) => hasLine(item.text) && item.text.includes(selection))
+            .map((item) => {
+                let score = 0;
+                if (lineVariants.some((line) => item.text.includes(line + ' ' + selection))) score += 100;
+                if (item.text.includes('asian total goals')) score += 40;
+                if (item.text.includes('over') && item.text.includes('under')) score += 30;
+                if (oddsPattern.test(item.text.replace(selection, '').trim())) score += 15;
+                score += Math.min(item.rect.width, 800) / 20;
+                return { ...item, score };
+            })
+            .sort((a, b) => b.score - a.score || b.rect.width - a.rect.width);
 
-                for (const row of rows) {
-                    const buttons = Array.from(row.element.querySelectorAll('button,div,[role="button"]'))
-                        .filter(isVisible)
-                        .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-                        .filter((item) => item.text.includes(selection) || /\\b\\d+(?:[.,]\\d+)?\\b/.test(item.text))
-                        .sort((a, b) => {
-                            const aHasSelection = a.text.includes(selection) ? 0 : 1;
-                            const bHasSelection = b.text.includes(selection) ? 0 : 1;
-                            return aHasSelection - bHasSelection || b.rect.x - a.rect.x;
-                        });
-                    const target = buttons[0]?.element || row.element;
-                    if (target) {
-                        clickElement(target);
-                        return { ok: true, rowText: row.text.slice(0, 220) };
-                    }
-                }
+        const seen = new Set();
+        for (const row of rows) {
+            if (seen.has(row.element)) continue;
+            seen.add(row.element);
+            const target = pickRelativeToLabel(row.element);
+            if (target) {
+                clickElement(target);
+                return { ok: true, rowText: row.text.slice(0, 220), preferLeft };
             }
         }
 
@@ -1059,12 +1077,14 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
             ok: false,
             reason: 'asian-total-goals-row-not-found',
             selection,
+            preferLeft,
             lineVariants,
-            markets: headers.slice(0, 3).map((item) => item.text),
+            candidates: rows.slice(0, 6).map((item) => item.text.slice(0, 220)),
         };
         """,
         selection,
         line_variants,
+        prefer_left,
     )
     if not result or not result.get("ok"):
         raise RuntimeError(f"Could not select Asian Total Goals {selection} {line}. Details: {result!r}")
@@ -1159,7 +1179,8 @@ def place_black_bet(session: dict, signal) -> None:
         _open_black_search(driver, profile_label)
         _fill_black_search(driver, team_name, profile_label)
         _open_black_live_match(driver, team_name, profile_label)
-        _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label)
+        prefer_left = "loss" in getattr(signal, "raw_text", "").lower()
+        _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
         _set_black_betslip_price_and_place(driver, signal.odds, profile_label)
     finally:
         close_driver_bridge(driver)
