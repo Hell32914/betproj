@@ -863,7 +863,12 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
     print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
 
 
-def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_label: str) -> None:
+def _open_black_live_match(
+    driver: webdriver.Remote,
+    team_name: str,
+    opponent_name: str | None,
+    profile_label: str,
+) -> None:
     def match_opened(browser: webdriver.Remote) -> bool:
         text = _visible_text_lower(browser)
         return (
@@ -875,7 +880,9 @@ def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_lab
     candidate = WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
         """
         const team = arguments[0].trim().toLowerCase();
+        const opponent = (arguments[1] || '').trim().toLowerCase();
         const words = team.split(/\\s+/).filter((word) => word.length >= 3);
+        const opponentWords = opponent.split(/\\s+/).filter((word) => word.length >= 3);
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -890,8 +897,11 @@ def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_lab
         const scoreFor = (text) => {
             let score = 0;
             if (text.includes(team)) score += 100;
+            if (opponent && text.includes(opponent)) score += 140;
             const matchedWords = words.filter((word) => text.includes(word)).length;
+            const matchedOpponentWords = opponentWords.filter((word) => text.includes(word)).length;
             score += matchedWords * 20;
+            score += matchedOpponentWords * 25;
             if (text.includes('live') || text.includes('in-play') || text.includes('in play')) score += 30;
             if (/\\b\\d+\\s*[:-]\\s*\\d+\\b/.test(text)) score += 20;
             if (/\\b\\d{1,2}'\\b/.test(text)) score += 20;
@@ -910,6 +920,7 @@ def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_lab
             })
             .filter((item) => item.rect.y > 180)
             .filter((item) => item.rect.width > 150 && item.rect.height >= 24)
+            .filter((item) => !opponent || opponentWords.length === 0 || opponentWords.some((word) => item.text.includes(word)) || item.text.includes(opponent))
             .filter((item) => item.score >= 80)
             .sort((a, b) => b.score - a.score || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
 
@@ -923,6 +934,7 @@ def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_lab
         return uniqueRows[0]?.row || null;
         """,
         team_name,
+        opponent_name or "",
     ))
 
     click_attempts = [
@@ -963,6 +975,7 @@ def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_lab
     details = driver.execute_script(
         """
         const team = arguments[0].trim().toLowerCase();
+        const opponent = (arguments[1] || '').trim().toLowerCase();
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
@@ -978,12 +991,74 @@ def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_lab
             .filter(isVisible)
             .map((element) => ({ text: textOf(element), rect: element.getBoundingClientRect() }))
             .filter((item) => item.rect.y > 180 && item.text.includes(team))
+            .filter((item) => !opponent || item.text.includes(opponent))
             .slice(0, 8)
             .map((item) => item.text.slice(0, 220));
         """,
         team_name,
+        opponent_name or "",
     )
     raise RuntimeError(f"Could not open Black live match for team: {team_name}. Candidates: {details!r}")
+
+
+def _verify_black_betslip_target(
+    driver: webdriver.Remote,
+    selection: str,
+    line: Decimal,
+    home_team: str | None,
+    away_team: str | None,
+    profile_label: str,
+) -> None:
+    line_variants = _decimal_variants(line)
+    selection_lower = selection.strip().lower()
+    verified = WebDriverWait(driver, 8).until(lambda browser: browser.execute_script(
+        """
+        const selection = arguments[0].trim().toLowerCase();
+        const lineVariants = arguments[1].map((value) => value.toLowerCase());
+        const homeTeam = (arguments[2] || '').trim().toLowerCase();
+        const awayTeam = (arguments[3] || '').trim().toLowerCase();
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+
+        const panels = Array.from(document.querySelectorAll('aside,section,div'))
+            .filter(isVisible)
+            .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+            .filter((item) => item.rect.x > window.innerWidth * 0.68)
+            .filter((item) => item.text.includes('betslip'))
+            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+
+        for (const panel of panels) {
+            const text = panel.text;
+            const hasLine = lineVariants.some((line) => text.includes(line));
+            const hasSelection = text.includes(selection);
+            const hasHome = !homeTeam || text.includes(homeTeam);
+            const hasAway = !awayTeam || text.includes(awayTeam);
+            if (hasLine && hasSelection && hasHome && hasAway) {
+                return { ok: true, text: text.slice(0, 300) };
+            }
+        }
+        return null;
+        """,
+        selection_lower,
+        line_variants,
+        home_team or "",
+        away_team or "",
+    ))
+    if not verified:
+        page_text = _visible_page_text(driver)
+        short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
+        raise RuntimeError(
+            f"[{profile_label}] Black betslip verification failed for {selection} {line}. Page: {short_text}"
+        )
 
 
 def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, line: Decimal, profile_label: str, prefer_left: bool = False) -> None:
@@ -1162,6 +1237,7 @@ def _set_black_betslip_price_and_place(driver: webdriver.Remote, price: Decimal,
 def place_black_bet(session: dict, signal) -> None:
     profile_label = session.get("profile_label", "Profile-1")
     team_name = getattr(signal, "home_team", None)
+    opponent_name = getattr(signal, "away_team", None)
     if not team_name:
         raise RuntimeError("Signal does not contain a first team name for Black search.")
 
@@ -1178,9 +1254,10 @@ def place_black_bet(session: dict, signal) -> None:
         print(f"[{profile_label}] Searching Black by first team only: {team_name}")
         _open_black_search(driver, profile_label)
         _fill_black_search(driver, team_name, profile_label)
-        _open_black_live_match(driver, team_name, profile_label)
+        _open_black_live_match(driver, team_name, opponent_name, profile_label)
         prefer_left = "loss" in getattr(signal, "raw_text", "").lower()
         _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
+        _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
         _set_black_betslip_price_and_place(driver, signal.odds, profile_label)
     finally:
         close_driver_bridge(driver)

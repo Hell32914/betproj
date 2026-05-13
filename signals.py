@@ -32,6 +32,20 @@ class BettingSignal:
         parts = re.split(r"\s+vs\s+", self.teams, maxsplit=1, flags=re.IGNORECASE)
         return parts[0].strip() if parts and parts[0].strip() else None
 
+    @property
+    def away_team(self) -> str | None:
+        if not self.teams:
+            return None
+        parts = re.split(r"\s+vs\s+", self.teams, maxsplit=1, flags=re.IGNORECASE)
+        return parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+
+    @property
+    def away_team(self) -> str | None:
+        if not self.teams:
+            return None
+        parts = re.split(r"\s+vs\s+", self.teams, maxsplit=1, flags=re.IGNORECASE)
+        return parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+
 
 ODDS_RE = re.compile(
     r"Odds:\s*(?P<odds>\d+(?:[.,]\d+)?)\s+"
