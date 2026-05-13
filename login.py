@@ -526,16 +526,37 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
                 && rect.y < window.innerHeight;
         };
 
+        const fireClick = (element, x, y) => {
+            for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                element.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+            }
+            try { element.click?.(); } catch (error) {}
+            return dialogAlreadyOpen();
+        };
+
         const clickElement = (element) => {
-            const rect = element.getBoundingClientRect();
-            const x = rect.x + rect.width / 2;
-            const y = rect.y + rect.height / 2;
             const clickable = element.closest('button,a,[role="button"]') || element;
             clickable.scrollIntoView?.({ block: 'center', inline: 'center' });
-            for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+
+            const targets = [
+                clickable,
+                clickable.querySelector?.('svg'),
+                clickable.querySelector?.('path'),
+                clickable.firstElementChild,
+            ].filter(Boolean);
+
+            for (const target of targets) {
+                const rect = target.getBoundingClientRect();
+                const x = rect.x + rect.width / 2;
+                const y = rect.y + rect.height / 2;
+                if (fireClick(target, x, y)) return true;
+
+                const pointTarget = document.elementFromPoint(x, y);
+                if (pointTarget && pointTarget !== target && fireClick(pointTarget, x, y)) {
+                    return true;
+                }
             }
-            try { clickable.click?.(); } catch (error) {}
+
             return dialogAlreadyOpen();
         };
 
@@ -599,11 +620,18 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
             for (const candidate of candidates.slice(0, 12)) {
                 if (clickElement(candidate.element)) return true;
             }
+
+            const directSibling = item.element.parentElement?.nextElementSibling;
+            if (directSibling && isVisible(directSibling) && clickElement(directSibling)) {
+                return true;
+            }
+
             return {
                 ok: false,
                 reason: 'orders-neighbour-click-failed',
                 orders: summarize(item.element),
                 candidates: candidates.slice(0, 8).map((candidate) => ({ ...summarize(candidate.element), marker: candidate.marker.slice(0, 120) })),
+                directSibling: directSibling ? summarize(directSibling) : null,
             };
         }
 
