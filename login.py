@@ -8,11 +8,13 @@ Usage:
 """
 
 import os
+import re
 import sys
 import time
 import socket
 import subprocess
 import requests
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
@@ -38,6 +40,8 @@ BETINASIA_EMAIL = os.getenv("BETINASIA_EMAIL")
 BETINASIA_PASSWORD = os.getenv("BETINASIA_PASSWORD")
 BLACK_USERNAME = os.getenv("BLACK_USERNAME")
 BLACK_PASSWORD = os.getenv("BLACK_PASSWORD")
+STAKE_PERCENT = Decimal(os.getenv("STAKE_PERCENT", "5"))
+EURO_SYMBOL = "\u20ac"
 
 
 def fetch_profile_ids(expected: int = 2) -> list[str]:
@@ -400,6 +404,158 @@ def _click_contains_if_visible(driver: webdriver.Remote, text: str, selector: st
     ))
 
 
+def _money_to_decimal(value: str) -> Decimal:
+    normalized = value.replace(EURO_SYMBOL, "").replace(" ", "").replace(",", ".")
+    normalized = re.sub(r"[^0-9.-]", "", normalized)
+    if not normalized:
+        raise ValueError(f"Could not parse money value from: {value!r}")
+    try:
+        return Decimal(normalized)
+    except InvalidOperation as exc:
+        raise ValueError(f"Could not parse money value from: {value!r}") from exc
+
+
+def _format_stake_amount(amount: Decimal) -> str:
+    rounded = amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if amount > 0 and rounded == Decimal("0.00"):
+        rounded = Decimal("0.01")
+    return format(rounded, "f")
+
+
+def _calculate_stake_from_balance(balance: Decimal) -> Decimal:
+    return balance * STAKE_PERCENT / Decimal("100")
+
+
+def _open_black_account_menu(driver: webdriver.Remote, profile_label: str) -> None:
+    opened = bool(driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim();
+        const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
+            .filter(isVisible)
+            .filter((element) => {
+                const rect = element.getBoundingClientRect();
+                const text = textOf(element);
+                return rect.y < 140 && rect.x > window.innerWidth * 0.55 && text.includes('\\u20ac') && /[0-9]/.test(text);
+            })
+            .sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return (ar.width * ar.height) - (br.width * br.height);
+            });
+        const target = candidates[0];
+        if (!target) return false;
+        const clickable = target.closest('button,a,[role="button"]') || target;
+        clickable.scrollIntoView({ block: 'center', inline: 'center' });
+        for (const name of ['mouseover', 'mouseenter', 'mousemove', 'mousedown', 'mouseup', 'click']) {
+            clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+        }
+        return true;
+        """
+    ))
+    if not opened:
+        raise RuntimeError("Could not open Black account menu from the profile icon/balance area.")
+    WebDriverWait(driver, 10).until(lambda browser: "settings" in _visible_text_lower(browser))
+    print(f"[{profile_label}] Opened Black account menu.")
+
+
+def _read_black_balance(driver: webdriver.Remote, profile_label: str) -> Decimal:
+    _open_black_account_menu(driver, profile_label)
+    text = _visible_page_text(driver)
+    balance_match = re.search(r"Balance\s*\n?\s*(\u20ac\s*[0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
+    if not balance_match:
+        balance_match = re.search(r"Funds\s*\n?\s*(\u20ac\s*[0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
+    if not balance_match:
+        money_values = re.findall(r"\u20ac\s*[0-9]+(?:[.,][0-9]+)?", text)
+        if not money_values:
+            raise RuntimeError("Could not read Black balance from the account menu.")
+        balance_text = money_values[0]
+    else:
+        balance_text = balance_match.group(1)
+    balance = _money_to_decimal(balance_text)
+    print(f"[{profile_label}] Black balance: EUR {balance}")
+    return balance
+
+
+def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label: str) -> None:
+    if "settings" not in _visible_text_lower(driver):
+        _open_black_account_menu(driver, profile_label)
+    if not _click_text_if_visible(driver, "Settings", selector="button,a,[role=button],div,li"):
+        if not _click_contains_if_visible(driver, "Settings", selector="button,a,[role=button],div,li"):
+            raise RuntimeError("Could not click Black Settings in the account menu.")
+    WebDriverWait(driver, 15).until(lambda browser: "input defaults" in _visible_text_lower(browser))
+
+    if not _click_text_if_visible(driver, "Input Defaults", selector="button,a,[role=button],[role=tab],div,li"):
+        if not _click_contains_if_visible(driver, "Input Defaults", selector="button,a,[role=button],[role=tab],div,li"):
+            raise RuntimeError("Could not click Input Defaults in Black settings.")
+    WebDriverWait(driver, 15).until(lambda browser: "default stake" in _visible_text_lower(browser))
+
+    updated = bool(driver.execute_script(
+        """
+        const stake = arguments[0];
+        const isVisible = (element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const labels = Array.from(document.querySelectorAll('label,div,section,p,span'))
+            .filter(isVisible)
+            .filter((element) => textOf(element) === 'default stake' || textOf(element).includes('default stake'));
+        for (const label of labels) {
+            let root = label.parentElement;
+            for (let depth = 0; root && depth < 6; depth += 1, root = root.parentElement) {
+                const input = Array.from(root.querySelectorAll('input'))
+                    .find((element) => isVisible(element) && !element.disabled && !element.readOnly);
+                if (!input) continue;
+                input.scrollIntoView({ block: 'center', inline: 'center' });
+                input.focus();
+                const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
+                if (setter) {
+                    setter.call(input, stake);
+                } else {
+                    input.value = stake;
+                }
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.blur();
+                input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+                input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+                return input.value === stake;
+            }
+        }
+        return false;
+        """,
+        stake,
+    ))
+    if not updated:
+        raise RuntimeError("Could not update Black Default Stake input.")
+    time.sleep(1)
+    print(f"[{profile_label}] Black Default Stake set to EUR {stake}.")
+
+
+def refresh_black_default_stake(session: dict) -> dict:
+    profile_label = session.get("profile_label", "Profile-1")
+    driver = None
+    try:
+        driver = connect_to_browser(session["browser_info"], profile_label)
+        driver.get(BLACK_URL)
+        _wait_document_ready(driver)
+        time.sleep(2)
+        if _has_visible_password_input(driver):
+            _fill_login_form(driver, BLACK_USERNAME, BLACK_PASSWORD, profile_label, "Black")
+            WebDriverWait(driver, 30).until(lambda browser: not _has_visible_password_input(browser))
+        balance = _read_black_balance(driver, profile_label)
+        stake_amount = _calculate_stake_from_balance(balance)
+        stake = _format_stake_amount(stake_amount)
+        _set_black_default_stake(driver, stake, profile_label)
+        return {"balance": str(balance), "stake": stake, "percent": str(STAKE_PERCENT)}
+    finally:
+        close_driver_bridge(driver)
+
+
 def _has_visible_password_input(driver: webdriver.Remote) -> bool:
     return bool(driver.execute_script(
         """
@@ -658,13 +814,23 @@ def login(driver: webdriver.Remote, profile_label: str) -> None:
     _login_black(driver, profile_label)
 
 
-def run_profile(profile_id: str, profile_label: str) -> dict:
+def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True) -> dict:
     """Full lifecycle: start profile, log into BetInAsia/Black, keep open."""
     driver = None
     was_already_running = False
     try:
         print(f"[{profile_label}] Preparing AdsPower profile: {profile_id}")
         browser_info, was_already_running = start_adspower_profile(profile_id)
+
+        if not login_enabled:
+            print(f"[{profile_label}] Skipping BetInAsia/Black login; only the first profile may use the account.")
+            return {
+                "profile_id": profile_id,
+                "profile_label": profile_label,
+                "browser_info": browser_info,
+                "was_already_running": was_already_running,
+                "login_enabled": False,
+            }
 
         # Wait for the browser to fully initialize before connecting
         time.sleep(4)
@@ -686,6 +852,7 @@ def run_profile(profile_id: str, profile_label: str) -> dict:
             "profile_label": profile_label,
             "browser_info": browser_info,
             "was_already_running": was_already_running,
+            "login_enabled": True,
         }
 
     except Exception as exc:
@@ -715,7 +882,7 @@ def validate_required_env() -> None:
 
 
 def run_all_profiles(expected_profiles: int = 2, wait_for_enter: bool = False) -> list[dict]:
-    """Start or reuse AdsPower profiles, open BetInAsia/Black, and log in."""
+    """Start or reuse AdsPower profiles; only the first profile logs into BetInAsia/Black."""
     validate_required_env()
 
     profile_ids = fetch_profile_ids(expected=expected_profiles)
@@ -723,9 +890,9 @@ def run_all_profiles(expected_profiles: int = 2, wait_for_enter: bool = False) -
     sessions = []
     for idx, profile_id in enumerate(profile_ids, start=1):
         label = f"Profile-{idx}"
-        sessions.append(run_profile(profile_id, label))
+        sessions.append(run_profile(profile_id, label, login_enabled=(idx == 1)))
 
-    print("\nAll profiles have completed login. Browsers remain open.")
+    print("\nAdsPower profiles are ready. BetInAsia/Black login was performed only on Profile-1.")
 
     if wait_for_enter:
         print("Press Enter to exit (browsers will stay running)...")

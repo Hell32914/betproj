@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
-from login import run_all_profiles
+from login import refresh_black_default_stake, run_all_profiles
 from signals import parse_betting_signal
 
 load_dotenv()
@@ -52,7 +52,15 @@ async def refresh_stakes(state: RuntimeState) -> None:
     async with state.stake_lock:
         if not state.sessions:
             return
-        state.stakes = {}
+        primary_session = next((session for session in state.sessions if session.get("login_enabled")), state.sessions[0])
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: refresh_black_default_stake(primary_session))
+        state.stakes = {primary_session["profile_label"]: result}
+        print(
+            f"Default stake refreshed for {primary_session['profile_label']}: "
+            f"balance EUR {result['balance']}, stake EUR {result['stake']} ({result['percent']}%).",
+            flush=True,
+        )
 
 
 async def refresh_stakes_daily(state: RuntimeState) -> None:
