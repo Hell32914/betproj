@@ -540,8 +540,9 @@ def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label
             raise RuntimeError("Could not click Input Defaults in Black settings.")
     WebDriverWait(driver, 15).until(lambda browser: "default stake" in _visible_text_lower(browser))
 
-    input_ref = driver.execute_script(
+    result = driver.execute_script(
         """
+        const stake = arguments[0];
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -555,42 +556,47 @@ def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label
                 && rect.y < window.innerHeight;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-        const labels = Array.from(document.querySelectorAll('label,div,section,p,span'))
-            .filter(isVisible)
-            .filter((element) => textOf(element) === 'default stake' || textOf(element).includes('default stake'));
+
+        const seen = new Set();
+        const labels = [];
+        const addLabel = (element) => {
+            if (!element || seen.has(element) || !isVisible(element)) return;
+            const rect = element.getBoundingClientRect();
+            const text = textOf(element);
+            if (rect.y < 140 || rect.height > 90 || rect.width > 520) return;
+            if (text === 'default stake' || text.includes('default stake')) {
+                seen.add(element);
+                labels.push(element);
+            }
+        };
+
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) {
+            const node = walker.currentNode;
+            if ((node.nodeValue || '').trim().toLowerCase() === 'default stake') {
+                addLabel(node.parentElement);
+            }
+        }
+        Array.from(document.querySelectorAll('label,p,span,div')).forEach(addLabel);
+
+        labels.sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y);
         for (const label of labels) {
             const labelRect = label.getBoundingClientRect();
             const inputs = Array.from(document.querySelectorAll('input'))
                 .filter((element) => isVisible(element) && !element.disabled && !element.readOnly)
                 .filter((element) => !['checkbox', 'radio', 'hidden'].includes((element.type || '').toLowerCase()))
                 .map((element) => ({ element, rect: element.getBoundingClientRect() }))
-                .filter((item) => item.rect.y >= labelRect.y - 8 && item.rect.y < labelRect.y + 90)
+                .filter((item) => item.rect.y >= labelRect.bottom - 6 && item.rect.y < labelRect.bottom + 90)
+                .filter((item) => item.rect.x >= labelRect.x - 40 && item.rect.x < labelRect.x + 320)
                 .sort((a, b) => {
-                    const aDistance = Math.abs(a.rect.y - labelRect.y) + Math.abs(a.rect.x - labelRect.x) / 10;
-                    const bDistance = Math.abs(b.rect.y - labelRect.y) + Math.abs(b.rect.x - labelRect.x) / 10;
+                    const aDistance = Math.abs(a.rect.y - labelRect.bottom) + Math.abs(a.rect.x - labelRect.x) / 10;
+                    const bDistance = Math.abs(b.rect.y - labelRect.bottom) + Math.abs(b.rect.x - labelRect.x) / 10;
                     return aDistance - bDistance;
                 });
             const input = inputs[0]?.element;
             if (!input) continue;
             input.scrollIntoView({ block: 'center', inline: 'center' });
-            return input;
-        }
-        return null;
-        """
-    )
-    if not input_ref:
-        raise RuntimeError("Could not update Black Default Stake input.")
-
-    _set_input_value(driver, input_ref, stake)
-    input_ref.send_keys(Keys.ENTER)
-    time.sleep(0.5)
-
-    current_value = input_ref.get_attribute("value") or ""
-    if _money_to_decimal(current_value) != Decimal(stake):
-        driver.execute_script(
-            """
-            const input = arguments[0];
-            const stake = arguments[1];
+            input.focus({ preventScroll: true });
             const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
             if (setter) {
                 setter.call(input, stake);
@@ -599,18 +605,39 @@ def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label
             }
             input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: stake }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
-            """,
-            input_ref,
-            stake,
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+            input.blur();
+            return { ok: input.value === stake, value: input.value, label: textOf(label) };
+        }
+        return { ok: false, value: '', label: '', labels: labels.map((label) => textOf(label)).slice(0, 5) };
+        """,
+        stake,
+    )
+    current_value = str((result or {}).get("value", ""))
+    try:
+        parsed_value = _money_to_decimal(current_value)
+    except ValueError:
+        parsed_value = None
+    if not result or parsed_value != Decimal(stake):
+        raise RuntimeError(
+            f"Could not update Black Default Stake input. Result: {result!r}, expected {stake!r}."
         )
-        time.sleep(0.5)
-        current_value = input_ref.get_attribute("value") or ""
-        if _money_to_decimal(current_value) != Decimal(stake):
-            raise RuntimeError(
-                f"Could not update Black Default Stake input. Current value is {current_value!r}, expected {stake!r}."
-            )
 
-    input_ref.send_keys(Keys.ESCAPE)
+    driver.execute_script(
+        """
+        const events = [
+            new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }),
+            new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', bubbles: true }),
+        ];
+        for (const event of events) document.dispatchEvent(event);
+        for (const event of events) document.body?.dispatchEvent(event);
+        """
+    )
+    try:
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    except Exception:
+        pass
     time.sleep(1)
     print(f"[{profile_label}] Black Default Stake set to EUR {stake}.")
 
