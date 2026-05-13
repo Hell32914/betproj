@@ -1352,14 +1352,15 @@ def place_black_bet(session: dict, signal) -> None:
     driver = None
     try:
         driver = connect_to_browser(session["browser_info"], profile_label)
-        driver.get(BLACK_SPORTSBOOK_URL)
-        _wait_document_ready(driver)
-        time.sleep(2)
+        current_url = (driver.current_url or "").lower()
+        if BLACK_URL_PART not in current_url:
+            driver.get(BLACK_SPORTSBOOK_URL)
+            _wait_document_ready(driver)
+            time.sleep(2)
         try:
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
             pass
-        _ensure_black_betslip_safe_to_use(driver, profile_label)
         print(f"[{profile_label}] Searching Black by first team only: {team_name}")
         _open_black_search(driver, profile_label)
         _fill_black_search(driver, team_name, profile_label)
@@ -1370,6 +1371,7 @@ def place_black_bet(session: dict, signal) -> None:
             raise RuntimeError(
                 f"[{profile_label}] Required Black match context not reached for {team_name} vs {opponent_name or '?'}; aborting before bet selection."
             )
+        _ensure_black_betslip_safe_to_use(driver, profile_label)
         prefer_left = "loss" in getattr(signal, "raw_text", "").lower()
         _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
