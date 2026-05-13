@@ -988,7 +988,7 @@ def _open_black_live_match(driver: webdriver.Remote, team_name: str, profile_lab
 
 def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, line: Decimal, profile_label: str) -> None:
     line_variants = _decimal_variants(line)
-    clicked = bool(driver.execute_script(
+    result = driver.execute_script(
         """
         const selection = arguments[0].trim().toLowerCase();
         const lineVariants = arguments[1].map((value) => value.toLowerCase());
@@ -1003,11 +1003,15 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const hasLine = (text) => lineVariants.some((line) => text.includes(line));
         const clickElement = (element) => {
-            element.scrollIntoView({ block: 'center', inline: 'center' });
-            for (const name of ['mousedown', 'mouseup', 'click']) {
-                element.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+            const clickable = element.closest('button,[role="button"]') || element;
+            clickable.scrollIntoView({ block: 'center', inline: 'center' });
+            for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+                clickable.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
             }
+            try { clickable.click?.(); } catch (error) {}
         };
         const headers = Array.from(document.querySelectorAll('div,section,button'))
             .filter(isVisible)
@@ -1017,41 +1021,53 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
         for (const header of headers) {
             let root = header.element.parentElement;
             for (let depth = 0; root && depth < 6; depth += 1, root = root.parentElement) {
-                const elements = Array.from(root.querySelectorAll('button,div,[role="button"]')).filter(isVisible);
-                const lineElements = elements
+                const rows = Array.from(root.querySelectorAll('button,div,[role="button"],li'))
+                    .filter(isVisible)
                     .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-                    .filter((item) => lineVariants.includes(item.text) || lineVariants.some((line) => item.text.startsWith(line + ' ')));
-                for (const lineElement of lineElements) {
-                    const rowCandidates = [];
-                    let row = lineElement.element.parentElement;
-                    for (let rowDepth = 0; row && rowDepth < 5; rowDepth += 1, row = row.parentElement) {
-                        const rowText = textOf(row);
-                        if (rowText.includes(selection) && lineVariants.some((line) => rowText.includes(line))) {
-                            rowCandidates.push(row);
-                        }
-                    }
-                    for (const rowCandidate of rowCandidates) {
-                        const buttons = Array.from(rowCandidate.querySelectorAll('button,div,[role="button"]'))
-                            .filter(isVisible)
-                            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-                            .filter((item) => item.text === selection || item.text.startsWith(selection + ' ') || item.text.includes(selection));
-                        buttons.sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
-                        const target = buttons[0]?.element;
-                        if (target) {
-                            clickElement(target.closest('button,[role="button"]') || target);
-                            return true;
-                        }
+                    .filter((item) => item.rect.width > 180 && item.rect.height >= 28)
+                    .filter((item) => hasLine(item.text) && item.text.includes(selection))
+                    .map((item) => {
+                        let score = 0;
+                        if (lineVariants.some((line) => item.text.includes(line + ' ' + selection))) score += 80;
+                        if (item.text.includes('asian total goals')) score += 30;
+                        if (/\\b\\d+(?:[.,]\\d+)?\\b/.test(item.text)) score += 20;
+                        score += Math.min(item.text.length, 160) / 10;
+                        return { ...item, score };
+                    })
+                    .sort((a, b) => b.score - a.score || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+
+                for (const row of rows) {
+                    const buttons = Array.from(row.element.querySelectorAll('button,div,[role="button"]'))
+                        .filter(isVisible)
+                        .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                        .filter((item) => item.text.includes(selection) || /\\b\\d+(?:[.,]\\d+)?\\b/.test(item.text))
+                        .sort((a, b) => {
+                            const aHasSelection = a.text.includes(selection) ? 0 : 1;
+                            const bHasSelection = b.text.includes(selection) ? 0 : 1;
+                            return aHasSelection - bHasSelection || b.rect.x - a.rect.x;
+                        });
+                    const target = buttons[0]?.element || row.element;
+                    if (target) {
+                        clickElement(target);
+                        return { ok: true, rowText: row.text.slice(0, 220) };
                     }
                 }
             }
         }
-        return false;
+
+        return {
+            ok: false,
+            reason: 'asian-total-goals-row-not-found',
+            selection,
+            lineVariants,
+            markets: headers.slice(0, 3).map((item) => item.text),
+        };
         """,
         selection,
         line_variants,
-    ))
-    if not clicked:
-        raise RuntimeError(f"Could not select Asian Total Goals {selection} {line}.")
+    )
+    if not result or not result.get("ok"):
+        raise RuntimeError(f"Could not select Asian Total Goals {selection} {line}. Details: {result!r}")
     WebDriverWait(driver, 10).until(lambda browser: "betslip" in _visible_text_lower(browser) and "price" in _visible_text_lower(browser))
     print(f"[{profile_label}] Selected Asian Total Goals {selection} {line}.")
 
