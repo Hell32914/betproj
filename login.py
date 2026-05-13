@@ -540,12 +540,19 @@ def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label
             raise RuntimeError("Could not click Input Defaults in Black settings.")
     WebDriverWait(driver, 15).until(lambda browser: "default stake" in _visible_text_lower(browser))
 
-    updated = bool(driver.execute_script(
+    input_ref = driver.execute_script(
         """
-        const stake = arguments[0];
         const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
-            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0
+                && rect.x < window.innerWidth
+                && rect.y < window.innerHeight;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
         const labels = Array.from(document.querySelectorAll('label,div,section,p,span'))
@@ -566,26 +573,44 @@ def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label
             const input = inputs[0]?.element;
             if (!input) continue;
             input.scrollIntoView({ block: 'center', inline: 'center' });
-            input.focus();
+            return input;
+        }
+        return null;
+        """
+    )
+    if not input_ref:
+        raise RuntimeError("Could not update Black Default Stake input.")
+
+    _set_input_value(driver, input_ref, stake)
+    input_ref.send_keys(Keys.ENTER)
+    time.sleep(0.5)
+
+    current_value = input_ref.get_attribute("value") or ""
+    if _money_to_decimal(current_value) != Decimal(stake):
+        driver.execute_script(
+            """
+            const input = arguments[0];
+            const stake = arguments[1];
             const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
             if (setter) {
                 setter.call(input, stake);
             } else {
                 input.value = stake;
             }
-            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: stake }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
-            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
-            input.blur();
-            return input.value === stake;
-        }
-        return false;
-        """,
-        stake,
-    ))
-    if not updated:
-        raise RuntimeError("Could not update Black Default Stake input.")
+            """,
+            input_ref,
+            stake,
+        )
+        time.sleep(0.5)
+        current_value = input_ref.get_attribute("value") or ""
+        if _money_to_decimal(current_value) != Decimal(stake):
+            raise RuntimeError(
+                f"Could not update Black Default Stake input. Current value is {current_value!r}, expected {stake!r}."
+            )
+
+    input_ref.send_keys(Keys.ESCAPE)
     time.sleep(1)
     print(f"[{profile_label}] Black Default Stake set to EUR {stake}.")
 
@@ -933,12 +958,7 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
 
     except Exception as exc:
         print(f"[{profile_label}] ERROR: {exc}", file=sys.stderr)
-        if driver and not was_already_running:
-            driver.quit()
-        else:
-            close_driver_bridge(driver)
-        if not was_already_running:
-            stop_adspower_profile(profile_id)
+        close_driver_bridge(driver)
         raise
 
 
