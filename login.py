@@ -1205,8 +1205,8 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-            const hasLine = (text) => lineVariants.some((line) => text.includes(line));
-            const oddsPattern = /^\\d+(?:[.,]\\d+)+$/;
+        const hasLine = (text) => lineVariants.some((line) => text.includes(line));
+        const oddsPattern = /^\\d+(?:[.,]\\d+)+$/;
         const clickElement = (element) => {
             const clickable = element.closest('button,[role="button"]') || element;
             clickable.scrollIntoView({ block: 'center', inline: 'center' });
@@ -1246,31 +1246,39 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
             return oddsButtons[0]?.element || null;
         };
 
-        const rows = Array.from(document.querySelectorAll('div,button,[role="button"],li,section'))
+        const marketSections = Array.from(document.querySelectorAll('section,div'))
             .filter(isVisible)
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-            .filter((item) => item.rect.y > 220)
-            .filter((item) => item.rect.width > 300 && item.rect.height >= 28)
-            .filter((item) => hasLine(item.text) && item.text.includes(selection))
-            .map((item) => {
-                let score = 0;
-                if (lineVariants.some((line) => item.text.includes(line + ' ' + selection))) score += 100;
-                if (item.text.includes('asian total goals')) score += 40;
-                if (item.text.includes('over') && item.text.includes('under')) score += 30;
-                if (oddsPattern.test(item.text.replace(selection, '').trim())) score += 15;
-                score += Math.min(item.rect.width, 800) / 20;
-                return { ...item, score };
-            })
-            .sort((a, b) => b.score - a.score || b.rect.width - a.rect.width);
+            .filter((item) => item.rect.y > 140)
+            .filter((item) => item.rect.width > 350 && item.rect.height > 100)
+            .filter((item) => item.text.includes('asian total goals'))
+            .sort((a, b) => (a.rect.y - b.rect.y) || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
 
-        const seen = new Set();
-        for (const row of rows) {
-            if (seen.has(row.element)) continue;
-            seen.add(row.element);
-            const target = pickRelativeToLabel(row.element);
-            if (target) {
-                clickElement(target);
-                return { ok: true, rowText: row.text.slice(0, 220), preferLeft };
+        for (const section of marketSections.slice(0, 5)) {
+            const rows = Array.from(section.element.querySelectorAll('div,button,[role="button"],li'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                .filter((item) => item.rect.width > 280 && item.rect.height >= 24)
+                .filter((item) => hasLine(item.text) && item.text.includes(selection))
+                .map((item) => {
+                    let score = 0;
+                    if (lineVariants.some((line) => item.text.includes(line + ' ' + selection))) score += 100;
+                    if (item.text.includes('over') && item.text.includes('under')) score += 30;
+                    if (oddsPattern.test(item.text.replace(selection, '').trim())) score += 15;
+                    score += Math.min(item.rect.width, 800) / 20;
+                    return { ...item, score };
+                })
+                .sort((a, b) => b.score - a.score || b.rect.width - a.rect.width);
+
+            const seen = new Set();
+            for (const row of rows) {
+                if (seen.has(row.element)) continue;
+                seen.add(row.element);
+                const target = pickRelativeToLabel(row.element);
+                if (target) {
+                    clickElement(target);
+                    return { ok: true, rowText: row.text.slice(0, 220), sectionText: section.text.slice(0, 220), preferLeft };
+                }
             }
         }
 
@@ -1280,7 +1288,7 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
             selection,
             preferLeft,
             lineVariants,
-            candidates: rows.slice(0, 6).map((item) => item.text.slice(0, 220)),
+            sections: marketSections.slice(0, 4).map((item) => item.text.slice(0, 220)),
         };
         """,
         selection,
@@ -1389,6 +1397,9 @@ def place_black_bet(session: dict, signal) -> None:
             raise RuntimeError(
                 f"[{profile_label}] Required Black match context not reached for {team_name} vs {opponent_name or '?'}; aborting before bet selection."
             )
+        _wait_document_ready(driver)
+        time.sleep(2)
+        WebDriverWait(driver, 10).until(lambda browser: "asian total goals" in _visible_text_lower(browser))
         _ensure_black_betslip_safe_to_use(driver, profile_label)
         prefer_left = "loss" in getattr(signal, "raw_text", "").lower()
         _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
