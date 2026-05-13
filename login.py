@@ -930,8 +930,7 @@ def _ensure_black_betslip_safe_to_use(driver: webdriver.Remote, profile_label: s
                 || text.includes('price')
                 || text.includes('place')
                 || text.includes('timeout')
-                || text.includes('less than min order')
-                || /\\b\\d+(?:[.,]\\d+)?\\b/.test(text.replace('13:29', ''));
+                || text.includes('less than min order');
         };
         const looksLikeEmptyBetslip = (text) => {
             return text.includes('betslip is empty')
