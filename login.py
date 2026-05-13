@@ -19,7 +19,6 @@ from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -505,31 +504,6 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         print(f"[{profile_label}] Black search is already open.")
         return
 
-    orders_elements = driver.find_elements(
-        By.XPATH,
-        "//*[normalize-space()='Orders' and not(self::script) and not(self::style)]",
-    )
-    for orders_element in orders_elements:
-        try:
-            if not orders_element.is_displayed():
-                continue
-            rect = orders_element.rect
-            if rect.get("y", 999) > 90:
-                continue
-            for x_offset in (72, 66, 80, 58, 88):
-                for y_offset in (0, -2, 2):
-                    ActionChains(driver).move_to_element_with_offset(
-                        orders_element,
-                        rect["width"] / 2 + x_offset,
-                        rect["height"] / 2 + y_offset,
-                    ).click().perform()
-                    time.sleep(0.4)
-                    if search_dialog_open(driver):
-                        print(f"[{profile_label}] Opened Black search.")
-                        return
-        except Exception:
-            continue
-
     opened = bool(driver.execute_script(
         """
         const dialogAlreadyOpen = () => {
@@ -551,20 +525,23 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
                 && rect.y < window.innerHeight;
         };
 
-        const clickAt = (x, y) => {
-            const target = document.elementFromPoint(x, y);
-            if (!target) return false;
-            const clickable = target.closest('button,a,[role="button"]') || target;
-            for (const name of ['mousedown', 'mouseup', 'click']) {
+        const clickElement = (element) => {
+            const rect = element.getBoundingClientRect();
+            const x = rect.x + rect.width / 2;
+            const y = rect.y + rect.height / 2;
+            const clickable = element.closest('button,a,[role="button"]') || element;
+            clickable.scrollIntoView?.({ block: 'center', inline: 'center' });
+            for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
                 clickable.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
             }
+            try { clickable.click?.(); } catch (error) {}
             return dialogAlreadyOpen();
         };
 
         const navTexts = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
             .filter(isVisible)
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim().toLowerCase() }))
-            .filter((item) => item.rect.y < 70 && item.text === 'orders')
+            .filter((item) => item.rect.y < 95 && item.text === 'orders')
             .sort((a, b) => {
                 const aArea = a.rect.width * a.rect.height;
                 const bArea = b.rect.width * b.rect.height;
@@ -573,22 +550,37 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
 
         for (const item of navTexts) {
             const centerY = item.rect.y + item.rect.height / 2;
-            const xValues = [item.rect.right + 35, item.rect.right + 45, item.rect.right + 55, item.rect.right + 25];
-            const yValues = [centerY, centerY - 4, centerY + 4];
-            for (const y of yValues) {
-                for (const x of xValues) {
-                    if (clickAt(x, y)) return true;
-                }
+            const candidates = Array.from(document.querySelectorAll('button,a,[role="button"],svg,path,div,span'))
+                .filter(isVisible)
+                .map((element) => {
+                    const rect = element.getBoundingClientRect();
+                    const marker = [
+                        element.getAttribute('aria-label') || '',
+                        element.getAttribute('data-testid') || '',
+                        element.className?.toString() || '',
+                        element.outerHTML || '',
+                    ].join(' ').toLowerCase();
+                    return { element, rect, marker };
+                })
+                .filter((candidate) => candidate.rect.x > item.rect.right)
+                .filter((candidate) => candidate.rect.x < item.rect.right + 130)
+                .filter((candidate) => Math.abs((candidate.rect.y + candidate.rect.height / 2) - centerY) < 28)
+                .filter((candidate) => {
+                    const area = candidate.rect.width * candidate.rect.height;
+                    return area > 20 && area < 3600;
+                })
+                .sort((a, b) => {
+                    const aSearch = /search|magnif|circle|lens/.test(a.marker) ? 0 : 1;
+                    const bSearch = /search|magnif|circle|lens/.test(b.marker) ? 0 : 1;
+                    const aDistance = Math.abs(a.rect.x - (item.rect.right + 55)) + Math.abs((a.rect.y + a.rect.height / 2) - centerY);
+                    const bDistance = Math.abs(b.rect.x - (item.rect.right + 55)) + Math.abs((b.rect.y + b.rect.height / 2) - centerY);
+                    return aSearch - bSearch || aDistance - bDistance;
+                });
+            for (const candidate of candidates.slice(0, 12)) {
+                if (clickElement(candidate.element)) return true;
             }
         }
 
-        const xValues = [0.575, 0.585, 0.565].map((ratio) => window.innerWidth * ratio);
-        const yValues = [18, 24, 30, 36];
-        for (const y of yValues) {
-            for (const x of xValues) {
-                if (clickAt(x, y)) return true;
-            }
-        }
         return false;
         """
     ))
