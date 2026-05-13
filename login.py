@@ -544,7 +544,7 @@ def refresh_black_default_stake(session: dict) -> dict:
         driver.get(BLACK_URL)
         _wait_document_ready(driver)
         time.sleep(2)
-        if _has_visible_password_input(driver):
+        if not _black_appears_logged_in(driver) and _has_visible_password_input(driver):
             _fill_login_form(driver, BLACK_USERNAME, BLACK_PASSWORD, profile_label, "Black")
             WebDriverWait(driver, 30).until(lambda browser: not _has_visible_password_input(browser))
         balance = _read_black_balance(driver, profile_label)
@@ -560,12 +560,32 @@ def _has_visible_password_input(driver: webdriver.Remote) -> bool:
     return bool(driver.execute_script(
         """
         const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
-            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && Number(style.opacity || '1') > 0
+                && !element.disabled
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0
+                && rect.x < window.innerWidth
+                && rect.y < window.innerHeight;
         };
         return Array.from(document.querySelectorAll('input[type="password"]')).some(isVisible);
         """
     ))
+
+
+def _black_appears_logged_in(driver: webdriver.Remote) -> bool:
+    current_url = driver.current_url.lower()
+    if BLACK_URL_PART not in current_url:
+        return False
+    if any(path in current_url for path in ("/sportsbook", "/trade", "/orders")):
+        return True
+    page_text = _visible_text_lower(driver)
+    return "sportsbook" in page_text and ("orders" in page_text or "balance" in page_text or "trade" in page_text)
 
 
 def _click_betinasia_sign_in(driver: webdriver.Remote, profile_label: str) -> bool:
@@ -790,7 +810,7 @@ def _login_black(driver: webdriver.Remote, profile_label: str) -> None:
     _wait_document_ready(driver)
     time.sleep(2)
 
-    if not _has_visible_password_input(driver):
+    if _black_appears_logged_in(driver) or not _has_visible_password_input(driver):
         print(f"[{profile_label}] Black already appears to be logged in: {driver.current_url}")
         return
 
