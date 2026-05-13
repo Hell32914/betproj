@@ -574,8 +574,9 @@ def _fill_login_form(driver: webdriver.Remote, username: str, password: str, pro
 
 
 def _login_betinasia_portal(driver: webdriver.Remote, profile_label: str) -> None:
-    if "portal.betinasia.com" in driver.current_url.lower():
-        print(f"[{profile_label}] BetInAsia portal already open: {driver.current_url}")
+    current_url = driver.current_url.lower()
+    if "portal.betinasia.com/dashboard/products" in current_url:
+        print(f"[{profile_label}] BetInAsia products page already open: {driver.current_url}")
         return
 
     if BETINASIA_URL_PART not in driver.current_url:
@@ -591,15 +592,24 @@ def _login_betinasia_portal(driver: webdriver.Remote, profile_label: str) -> Non
     _wait_document_ready(driver)
     if "portal.betinasia.com" in driver.current_url.lower():
         if not _has_visible_password_input(driver):
-            print(f"[{profile_label}] BetInAsia portal already open: {driver.current_url}")
-            return
+            driver.get(PORTAL_URL)
+            _wait_document_ready(driver)
+            time.sleep(2)
+            if "account/login" not in driver.current_url.lower():
+                print(f"[{profile_label}] BetInAsia products page open: {driver.current_url}")
+                return
 
     if _has_visible_password_input(driver):
         _fill_login_form(driver, BETINASIA_EMAIL, BETINASIA_PASSWORD, profile_label, "BetInAsia")
+        time.sleep(2)
+        driver.get(PORTAL_URL)
+        _wait_document_ready(driver)
         WebDriverWait(driver, 30).until(
-            lambda browser: "portal.betinasia.com" in browser.current_url.lower()
+            lambda browser: "portal.betinasia.com/dashboard/products" in browser.current_url.lower()
             or "products" in _visible_text_lower(browser)
         )
+        if "account/login" in driver.current_url.lower() and _has_visible_password_input(driver):
+            raise RuntimeError("BetInAsia login did not complete; still on login page after submitting credentials.")
         print(f"[{profile_label}] BetInAsia portal login complete: {driver.current_url}")
         return
 
@@ -608,55 +618,11 @@ def _login_betinasia_portal(driver: webdriver.Remote, profile_label: str) -> Non
 
 def _open_black_product(driver: webdriver.Remote, profile_label: str) -> None:
     if BLACK_URL_PART in driver.current_url.lower():
-        print(f"[{profile_label}] Black tab is already current: {driver.current_url}")
+        print(f"[{profile_label}] Black is already open: {driver.current_url}")
         return
 
-    if "portal.betinasia.com" not in driver.current_url.lower():
-        driver.get(PORTAL_URL)
-        _wait_document_ready(driver)
-        time.sleep(2)
-
-    click_result = driver.execute_script(
-        """
-        const isVisible = (element) => {
-            const rect = element.getBoundingClientRect();
-            return rect.width && rect.height && rect.x < window.innerWidth && rect.y < window.innerHeight;
-        };
-        const cards = Array.from(document.querySelectorAll('div, section, article'))
-            .filter((element) => isVisible(element) && (element.innerText || '').toLowerCase().includes('black'))
-            .sort((a, b) => {
-                const ar = a.getBoundingClientRect();
-                const br = b.getBoundingClientRect();
-                return (ar.width * ar.height) - (br.width * br.height);
-            });
-        for (const card of cards) {
-            const button = Array.from(card.querySelectorAll('button,a,[role=button]'))
-                .find((element) => isVisible(element)
-                    && (element.innerText || element.textContent || '').toLowerCase().includes('go to product'));
-            if (button) {
-                button.scrollIntoView({ block: 'center', inline: 'center' });
-                const href = button.getAttribute('href') || button.closest('a')?.getAttribute('href') || '';
-                button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-                button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-                button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                return { ok: true, href };
-            }
-        }
-        return { ok: false };
-        """
-    )
-    if not click_result or not click_result.get("ok"):
-        raise RuntimeError("Could not find 'Go to product' button in the Black product card.")
-    print(f"[{profile_label}] Clicked Black Go to product button.")
-
-    try:
-        WebDriverWait(driver, 10).until(
-            lambda browser: BLACK_URL_PART in browser.current_url.lower()
-        )
-    except Exception:
-        print(f"[{profile_label}] Product click did not navigate current tab. Opening Black directly in current tab...")
-        driver.get(BLACK_URL)
-
+    print(f"[{profile_label}] Opening Black directly in current tab...")
+    driver.get(BLACK_URL)
     _wait_document_ready(driver)
     time.sleep(2)
     print(f"[{profile_label}] Black product opened: {driver.current_url}")
