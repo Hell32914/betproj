@@ -830,6 +830,27 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const active = document.activeElement;
+        if (active && active.tagName === 'INPUT' && isVisible(active)) {
+            return active;
+        }
+
+        const modalRoots = Array.from(document.querySelectorAll('div,section,aside'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.y < 380)
+            .filter((item) => item.rect.width > 240)
+            .filter((item) => item.text.includes('all sports') || item.text.includes('live events') || item.text.includes('use ctrl-f as hotkey'))
+            .sort((a, b) => (a.rect.y - b.rect.y) || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+
+        for (const root of modalRoots) {
+            const localInputs = Array.from(root.element.querySelectorAll('input'))
+                .filter(isVisible)
+                .filter((input) => !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()))
+                .sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y);
+            if (localInputs[0]) return localInputs[0];
+        }
+
         const inputs = Array.from(document.querySelectorAll('input'))
             .filter(isVisible)
             .filter((input) => !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()))
@@ -853,7 +874,22 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
         return inputs[0]?.input || null;
         """
     ))
+    try:
+        driver.execute_script(
+            """
+            const input = arguments[0];
+            input.focus({ preventScroll: true });
+            input.click?.();
+            """,
+            search_input,
+        )
+    except Exception:
+        pass
+
+    search_input.send_keys(Keys.CONTROL, "a")
+    search_input.send_keys(Keys.DELETE)
     _set_input_value(driver, search_input, normalized_query)
+    WebDriverWait(driver, 5).until(lambda browser: (search_input.get_attribute("value") or "").strip().lower() == normalized_query.lower())
     search_input.send_keys(Keys.ENTER)
 
     WebDriverWait(driver, 15).until(
