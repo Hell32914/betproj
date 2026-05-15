@@ -1116,28 +1116,29 @@ def _open_black_orders_view(driver: webdriver.Remote, profile_label: str) -> boo
                     && rect.y < window.innerHeight;
             };
             const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-            const buttons = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
+            const panel = Array.from(document.querySelectorAll('aside,section,div'))
                 .filter(isVisible)
-                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }));
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                .filter((item) => item.rect.x > window.innerWidth * 0.68)
+                .filter((item) => item.rect.width > 180 && item.rect.height > 120)
+                .filter((item) => item.text.includes('betslip') || item.text.includes('recent orders') || item.text.includes('live orders'))
+                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+            if (!panel) return null;
 
-            const seeBets = buttons
-                .filter((item) => item.text === 'see bets' || item.text.includes('see bets'))
-                .sort((a, b) => (a.rect.y - b.rect.y) || (b.rect.x - a.rect.x))[0];
-            if (seeBets) return seeBets.element.closest('button,a,[role="button"]') || seeBets.element;
+            const recentOrders = Array.from(panel.element.querySelectorAll('button,[role="tab"],[role="button"],div,span'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                .filter((item) => item.text === 'recent orders' || item.text.includes('recent orders'))
+                .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)[0];
+            if (!recentOrders) return null;
 
-            const topOrders = buttons
-                .filter((item) => item.rect.y < 110)
-                .filter((item) => item.text === 'orders' || item.text.includes('orders'))
-                .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0];
-            if (topOrders) return topOrders.element.closest('button,a,[role="button"],li') || topOrders.element;
-
-            return null;
+            return recentOrders.element.closest('button,[role="tab"],[role="button"]') || recentOrders.element;
             """
         )
 
     target = locate_orders_target()
     if not target:
-        print(f"[{profile_label}] Could not find Black orders entry point after placing order.")
+        print(f"[{profile_label}] Could not find Black Recent Orders tab after placing order.")
         return False
 
     try:
@@ -1181,21 +1182,33 @@ def _open_black_orders_view(driver: webdriver.Remote, profile_label: str) -> boo
                         && rect.bottom > 0
                         && rect.right > 0;
                 };
-                const text = (document.body?.innerText || '').toLowerCase();
-                if (text.includes('see bets')) return false;
-                if ((window.location.pathname || '').toLowerCase().includes('/orders')) return true;
-                const nodes = Array.from(document.querySelectorAll('button,[role="tab"],div,span,section,aside'))
+                const panel = Array.from(document.querySelectorAll('aside,section,div'))
                     .filter(isVisible)
-                    .map((element) => (element.innerText || element.textContent || '').trim().toLowerCase());
-                return nodes.some((value) => value.includes('recent orders'));
+                    .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim().toLowerCase() }))
+                    .filter((item) => item.rect.x > window.innerWidth * 0.68)
+                    .filter((item) => item.rect.width > 180 && item.rect.height > 120)
+                    .filter((item) => item.text.includes('betslip') || item.text.includes('recent orders') || item.text.includes('live orders'))
+                    .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+                if (!panel) return false;
+
+                const tabs = Array.from(panel.element.querySelectorAll('button,[role="tab"],[role="button"],div,span'))
+                    .filter(isVisible)
+                    .map((element) => ({
+                        text: (element.innerText || element.textContent || '').trim().toLowerCase(),
+                        selected: (element.getAttribute('aria-selected') || '').toLowerCase() === 'true'
+                            || (element.getAttribute('class') || '').toLowerCase().includes('active')
+                            || (element.getAttribute('class') || '').toLowerCase().includes('selected'),
+                    }))
+                    .filter((item) => item.text === 'recent orders' || item.text.includes('recent orders'));
+                return tabs.some((item) => item.selected) || panel.text.includes('recent orders');
                 """
             )):
-                print(f"[{profile_label}] Opened Black orders view after placing order.")
+                print(f"[{profile_label}] Switched Black right panel to Recent Orders.")
                 return True
         except Exception:
             continue
 
-    print(f"[{profile_label}] Could not open Black orders view after placing order.")
+    print(f"[{profile_label}] Could not switch Black right panel to Recent Orders.")
     return False
 
 
