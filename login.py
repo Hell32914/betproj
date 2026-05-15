@@ -44,6 +44,10 @@ BLACK_USERNAME = os.getenv("BLACK_USERNAME")
 BLACK_PASSWORD = os.getenv("BLACK_PASSWORD")
 STAKE_PERCENT = Decimal(os.getenv("STAKE_PERCENT", "5"))
 EURO_SYMBOL = "\u20ac"
+TEAM_SUFFIXES = {
+    "fc", "afc", "cf", "sc", "ac", "fk", "bk", "ik", "if", "sv", "jk",
+    "club", "football", "team",
+}
 
 
 def fetch_profile_ids(expected: int = 2) -> list[str]:
@@ -387,6 +391,38 @@ def _visible_text_lower(driver: webdriver.Remote) -> str:
 
 def _visible_page_text(driver: webdriver.Remote) -> str:
     return driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+
+
+def _normalize_team_text(value: str | None) -> str:
+    text = (value or "").lower().strip()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    parts = [part for part in text.split() if part]
+    trimmed = [part for part in parts if part not in TEAM_SUFFIXES]
+    return " ".join(trimmed or parts)
+
+
+def _team_search_queries(team_name: str | None) -> list[str]:
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str | None) -> None:
+        value = " ".join((candidate or "").split()).strip()
+        if not value:
+            return
+        key = value.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        queries.append(value)
+
+    normalized = _normalize_team_text(team_name)
+    add(normalized)
+    add(team_name)
+
+    normalized_parts = normalized.split()
+    if len(normalized_parts) >= 2:
+        add(" ".join(normalized_parts[:2]))
+    return queries
 
 
 def _click_text_if_visible(driver: webdriver.Remote, text: str, selector: str = "button,a,[role=button]") -> bool:
@@ -1041,6 +1077,19 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
     print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
 
 
+def _search_black_live_events(driver: webdriver.Remote, team_name: str, profile_label: str) -> str:
+    last_error = None
+    for query in _team_search_queries(team_name):
+        try:
+            _fill_black_search(driver, query, profile_label)
+            return query
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"No usable Black search query for team: {team_name}")
+
+
 def _confirm_black_place_order(driver: webdriver.Remote, profile_label: str) -> None:
     try:
         modal_state = WebDriverWait(driver, 5).until(lambda browser: browser.execute_script(
@@ -1540,15 +1589,19 @@ def _open_black_live_match(
     opponent_name: str | None,
     profile_label: str,
 ) -> None:
+    team_variants = _team_search_queries(team_name)
+    opponent_variants = _team_search_queries(opponent_name)
+
     def match_opened(browser: webdriver.Remote) -> bool:
         return _black_match_context_matches(browser, team_name, opponent_name)
 
     candidate = WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
         """
-        const team = arguments[0].trim().toLowerCase();
-        const opponent = (arguments[1] || '').trim().toLowerCase();
-        const words = team.split(/\\s+/).filter((word) => word.length >= 3);
-        const opponentWords = opponent.split(/\\s+/).filter((word) => word.length >= 3);
+        const teamVariants = arguments[0];
+        const opponentVariants = arguments[1];
+        const normalize = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();
+        const teamWords = Array.from(new Set(teamVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))));
+        const opponentWords = Array.from(new Set(opponentVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))));
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -1559,20 +1612,24 @@ def _open_black_live_match(
                 && rect.bottom > 0
                 && rect.right > 0;
         };
-        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-        const scoreFor = (text) => {
+        const textOf = (element) => (element.innerText || element.textContent || '').trim();
+        const scoreFor = (text, rect) => {
+            const normalizedText = normalize(text);
             let score = 0;
-            if (text.includes(team)) score += 100;
-            if (opponent && text.includes(opponent)) score += 140;
-            const matchedWords = words.filter((word) => text.includes(word)).length;
-            const matchedOpponentWords = opponentWords.filter((word) => text.includes(word)).length;
+            if (teamVariants.some((value) => normalize(value) && normalizedText.includes(normalize(value)))) score += 120;
+            if (opponentVariants.some((value) => normalize(value) && normalizedText.includes(normalize(value)))) score += 150;
+            const matchedWords = teamWords.filter((word) => normalizedText.includes(word)).length;
+            const matchedOpponentWords = opponentWords.filter((word) => normalizedText.includes(word)).length;
             score += matchedWords * 20;
             score += matchedOpponentWords * 25;
-            if (text.includes('live') || text.includes('in-play') || text.includes('in play')) score += 30;
-            if (/\\b\\d+\\s*[:-]\\s*\\d+\\b/.test(text)) score += 20;
-            if (/\\b\\d{1,2}'\\b/.test(text)) score += 20;
-            if (text.includes('result')) score -= 15;
-            if (text.includes('over') || text.includes('under')) score -= 30;
+            if (normalizedText.includes('live') || normalizedText.includes('in play')) score += 35;
+            if (/\\b\\d+\\s*[:-]\\s*\\d+\\b/.test(normalizedText)) score += 20;
+            if (rect.x < window.innerWidth * 0.16) score -= 140;
+            if (rect.x > window.innerWidth * 0.82) score -= 170;
+            if (normalizedText.includes('order id') || normalizedText.includes('placed at') || normalizedText.includes('profit loss') || normalizedText.includes('selection status price stake')) score -= 260;
+            if (normalizedText.includes('all sports') || normalizedText.includes('football tennis') || normalizedText.includes('specials')) score -= 220;
+            if (normalizedText.includes('result')) score -= 30;
+            if (normalizedText.includes('over') || normalizedText.includes('under')) score -= 30;
             return score;
         };
 
@@ -1582,11 +1639,13 @@ def _open_black_live_match(
                 const row = element.closest('li,button,a,[role="button"]') || element;
                 const rect = row.getBoundingClientRect();
                 const text = textOf(row);
-                return { row, rect, text, score: scoreFor(text) };
+                return { row, rect, text, score: scoreFor(text, rect) };
             })
-            .filter((item) => item.rect.y > 180)
+            .filter((item) => item.rect.y > 90)
             .filter((item) => item.rect.width > 150 && item.rect.height >= 24)
-            .filter((item) => !opponent || opponentWords.length === 0 || opponentWords.some((word) => item.text.includes(word)) || item.text.includes(opponent))
+            .filter((item) => item.rect.x > window.innerWidth * 0.14)
+            .filter((item) => item.rect.x < window.innerWidth * 0.82)
+            .filter((item) => !opponentWords.length || opponentWords.some((word) => normalize(item.text).includes(word)) || opponentVariants.some((value) => normalize(value) && normalize(item.text).includes(normalize(value))))
             .filter((item) => item.score >= 80)
             .sort((a, b) => b.score - a.score || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
 
@@ -1599,8 +1658,8 @@ def _open_black_live_match(
 
         return uniqueRows[0]?.row || null;
         """,
-        team_name,
-        opponent_name or "",
+        team_variants,
+        opponent_variants,
     ))
 
     click_attempts = [
@@ -1640,8 +1699,9 @@ def _open_black_live_match(
 
     details = driver.execute_script(
         """
-        const team = arguments[0].trim().toLowerCase();
-        const opponent = (arguments[1] || '').trim().toLowerCase();
+        const teamVariants = arguments[0];
+        const opponentVariants = arguments[1];
+        const normalize = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
@@ -1656,13 +1716,14 @@ def _open_black_live_match(
         return Array.from(document.querySelectorAll('li,button,a,[role="button"],div'))
             .filter(isVisible)
             .map((element) => ({ text: textOf(element), rect: element.getBoundingClientRect() }))
-            .filter((item) => item.rect.y > 180 && item.text.includes(team))
-            .filter((item) => !opponent || item.text.includes(opponent))
+            .filter((item) => item.rect.y > 90 && item.rect.x > window.innerWidth * 0.14 && item.rect.x < window.innerWidth * 0.82)
+            .filter((item) => teamVariants.some((value) => normalize(value) && normalize(item.text).includes(normalize(value))))
+            .filter((item) => !opponentVariants.length || opponentVariants.some((value) => normalize(value) && normalize(item.text).includes(normalize(value))))
             .slice(0, 8)
             .map((item) => item.text.slice(0, 220));
         """,
-        team_name,
-        opponent_name or "",
+        team_variants,
+        opponent_variants,
     )
     raise RuntimeError(f"Could not open Black live match for team: {team_name}. Candidates: {details!r}")
 
@@ -2560,7 +2621,7 @@ def place_black_bet(session: dict, signal) -> dict:
     try:
         driver = connect_to_browser(session["browser_info"], profile_label)
         current_url = (driver.current_url or "").lower()
-        if BLACK_URL_PART not in current_url:
+        if "/sportsbook" not in current_url:
             driver.get(BLACK_SPORTSBOOK_URL)
             _wait_document_ready(driver)
             time.sleep(2)
@@ -2568,9 +2629,10 @@ def place_black_bet(session: dict, signal) -> dict:
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
             pass
-        print(f"[{profile_label}] Searching Black by first team only: {team_name}")
+        print(f"[{profile_label}] Searching Black by normalized first team: {team_name}")
         _open_black_search(driver, profile_label)
-        _fill_black_search(driver, team_name, profile_label)
+        used_query = _search_black_live_events(driver, team_name, profile_label)
+        print(f"[{profile_label}] Using Black search query: {used_query}")
         _open_black_live_match(driver, team_name, opponent_name, profile_label)
         if _black_search_dialog_open(driver):
             raise RuntimeError(f"[{profile_label}] Black search dialog is still open after match click; aborting before bet selection.")
