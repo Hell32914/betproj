@@ -2094,11 +2094,36 @@ def _parse_black_fill_breakdown(tooltip_text: str) -> list[dict]:
     return rows
 
 
+def _black_recent_orders_loaded(panel_text: str) -> bool:
+    normalized = " ".join((panel_text or "").lower().split())
+    if not normalized:
+        return False
+    if normalized in {"betslip recent orders live orders", "betslip recent orders 1 live orders"}:
+        return False
+    meaningful_tokens = (
+        "full-time",
+        "orders",
+        "stake",
+        "position",
+        "done",
+        "reconciled",
+        "accepted",
+        "matched",
+        "confirmed",
+    )
+    return any(token in normalized for token in meaningful_tokens)
+
+
 def _read_black_recent_order_fill(driver: webdriver.Remote, signal, profile_label: str) -> dict | None:
     _open_black_orders_view(driver, profile_label)
     if not _activate_black_order_tab(driver, "Recent Orders", profile_label):
         return None
-    time.sleep(0.4)
+    try:
+        WebDriverWait(driver, 4).until(
+            lambda browser: _black_recent_orders_loaded(_read_black_order_panel_text(browser, None))
+        )
+    except Exception:
+        time.sleep(0.5)
     details = driver.execute_script(
         """
         const selection = (arguments[0] || '').trim().toLowerCase();
@@ -2131,11 +2156,21 @@ def _read_black_recent_order_fill(driver: webdriver.Remote, signal, profile_labe
             .filter(isVisible)
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
             .filter((item) => item.rect.width > 180 && item.rect.height > 70)
-            .filter((item) => item.text.includes(homeTeam))
-            .filter((item) => !awayTeam || item.text.includes(awayTeam))
-            .filter((item) => item.text.includes(selection))
-            .filter((item) => normalizedLineVariants.some((line) => normalizeNumber(item.text).includes(line)))
-            .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+            .filter((item) => item.rect.y > panel.rect.y + 18)
+            .map((item) => {
+                let score = 0;
+                if (homeTeam && item.text.includes(homeTeam)) score += 4;
+                if (awayTeam && item.text.includes(awayTeam)) score += 4;
+                if (selection && item.text.includes(selection)) score += 3;
+                if (normalizedLineVariants.some((line) => normalizeNumber(item.text).includes(line))) score += 3;
+                if (item.text.includes('asian')) score += 2;
+                if (item.text.includes('over') || item.text.includes('under')) score += 1;
+                if (item.text.includes('done') || item.text.includes('reconciled') || item.text.includes('accepted') || item.text.includes('matched') || item.text.includes('confirmed')) score += 2;
+                if (item.text.includes('stake') || item.text.includes('position') || /\\b\\d+\\s+orders\\b/.test(item.text)) score += 1;
+                return { ...item, score };
+            })
+            .filter((item) => item.score >= 4 || item.text.includes(homeTeam) || item.text.includes(awayTeam))
+            .sort((a, b) => b.score - a.score || a.rect.y - b.rect.y || a.rect.x - b.rect.x);
         const card = cardCandidates[0];
         if (!card) {
             return { ok: false, reason: 'recent-order-card-not-found', panelText: panel.text.slice(0, 500) };
@@ -2278,7 +2313,6 @@ def _monitor_black_bet_status(driver: webdriver.Remote, signal, profile_label: s
     while time.monotonic() < deadline:
         snapshots = {
             "betslip": _read_black_order_panel_text(driver, None),
-            "live orders": _read_black_order_panel_text(driver, "Live orders"),
             "recent orders": _read_black_order_panel_text(driver, "Recent Orders"),
         }
         status, detail = _classify_black_order_snapshot(snapshots, signal)

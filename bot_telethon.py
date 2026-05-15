@@ -140,6 +140,16 @@ def _format_signal_work_message(signal) -> str:
     )
 
 
+def _sanitize_telegram_detail(detail: str, limit: int = 220) -> str:
+    cleaned = []
+    for char in detail or "":
+        if char in "\n\r\t" or char.isprintable():
+            cleaned.append(char)
+    compact = " | ".join(part.strip() for part in "".join(cleaned).splitlines() if part.strip())
+    compact = " ".join(compact.split())
+    return compact[:limit]
+
+
 def _format_signal_result_message(result: dict) -> str:
     status = result.get("status", "unknown")
     label = {
@@ -149,8 +159,7 @@ def _format_signal_result_message(result: dict) -> str:
         "cancelled": "Ставка отменена",
     }.get(status, f"Статус ставки: {status}")
     fills = result.get("fills") or []
-    detail = (result.get("detail") or "").strip()
-    detail = " | ".join(part.strip() for part in detail.splitlines() if part.strip())[:350]
+    detail = _sanitize_telegram_detail((result.get("detail") or "").strip())
     message = (
         f"{label}: {result.get('teams') or 'unknown match'} | "
         f"{result.get('selection')} | odds {result.get('odds')}"
