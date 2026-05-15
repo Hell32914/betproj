@@ -1782,7 +1782,7 @@ def _set_black_betslip_price_and_place(
 
 def _read_black_order_panel_text(driver: webdriver.Remote, tab_name: str | None = None) -> str:
     if tab_name:
-        driver.execute_script(
+        clicked = driver.execute_script(
             """
             const expected = arguments[0].trim().toLowerCase();
             const isVisible = (element) => {
@@ -1802,24 +1802,58 @@ def _read_black_order_panel_text(driver: webdriver.Remote, tab_name: str | None 
                 .filter((item) => item.rect.x > window.innerWidth * 0.68)
                 .filter((item) => item.rect.width > 180 && item.rect.height > 120)
                 .filter((item) => item.text.includes('betslip') || item.text.includes('recent orders') || item.text.includes('live orders'))
-                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0]?.element;
+                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
             if (!panel) return false;
 
-            const candidates = Array.from(panel.querySelectorAll('button,[role="tab"],[role="button"],div,span'))
+            const candidates = Array.from(panel.element.querySelectorAll('button,[role="tab"],[role="button"],div,span'))
                 .filter(isVisible)
                 .filter((element) => textOf(element) === expected || textOf(element).includes(expected));
-            const target = candidates[0]?.closest('button,[role="tab"],[role="button"]') || candidates[0];
+            const firstCandidate = candidates.length ? candidates[0] : null;
+            const target = firstCandidate ? (firstCandidate.closest('button,[role="tab"],[role="button"]') || firstCandidate) : null;
             if (!target) return false;
             target.scrollIntoView({ block: 'center', inline: 'center' });
             for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
                 const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
                 target.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
             }
-            try { target.click?.(); } catch (error) {}
+            try {
+                if (typeof target.click === 'function') target.click();
+            } catch (error) {}
             return true;
             """,
             tab_name,
         )
+        if clicked:
+            try:
+                WebDriverWait(driver, 4).until(lambda browser: browser.execute_script(
+                    """
+                    const expected = arguments[0].trim().toLowerCase();
+                    const isVisible = (element) => {
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0
+                            && rect.bottom > 0
+                            && rect.right > 0;
+                    };
+                    const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+                    const tabs = Array.from(document.querySelectorAll('button,[role="tab"],[role="button"],div,span'))
+                        .filter(isVisible)
+                        .map((element) => ({
+                            text: textOf(element),
+                            selected: (element.getAttribute('aria-selected') || '').toLowerCase() === 'true'
+                                || (element.getAttribute('class') || '').toLowerCase().includes('active')
+                                || (element.getAttribute('class') || '').toLowerCase().includes('selected'),
+                        }))
+                        .filter((item) => item.text === expected || item.text.includes(expected));
+                    return tabs.some((item) => item.selected);
+                    """,
+                    tab_name,
+                ))
+            except Exception:
+                pass
         time.sleep(0.4)
 
     return driver.execute_script(
@@ -1980,7 +2014,10 @@ def _read_black_recent_order_fill(driver: webdriver.Remote, signal, profile_labe
         print(f"[{profile_label}] Black recent order fills: {detail}")
         return {"status": "accepted", "detail": detail, "fills": fills}
 
-    return {"status": "accepted", "detail": details.get("cardText", ""), "fills": []}
+    card_text = details.get("cardText", "")
+    if any(word in card_text.lower() for word in ("done", "reconciled", "success", "accepted", "matched", "confirmed")):
+        return {"status": "accepted_no_fill_breakdown", "detail": card_text, "fills": []}
+    return None
 
 
 def _black_snapshot_matches_signal(snapshot_text: str, signal) -> bool:
@@ -2010,7 +2047,7 @@ def _black_snapshot_matches_signal(snapshot_text: str, signal) -> bool:
 def _classify_black_order_snapshot(snapshots: dict[str, str], signal) -> tuple[str, str]:
     failure_words = ("cancel", "cancelled", "canceled", "reject", "rejected", "declined", "void", "failed", "not accepted")
     pending_words = ("pending", "processing", "placing", "submitting")
-    success_words = ("accepted", "matched", "confirmed")
+    success_words = ("accepted", "matched", "confirmed", "done", "reconciled", "success")
 
     for tab_name in ("live orders", "recent orders", "betslip"):
         text = snapshots.get(tab_name, "")
@@ -2022,7 +2059,7 @@ def _classify_black_order_snapshot(snapshots: dict[str, str], signal) -> tuple[s
         if any(word in text for word in success_words):
             return "accepted", text[:500]
         if tab_name in {"live orders", "recent orders"}:
-            return "accepted", text[:500]
+            return "pending", text[:500]
         if any(word in text for word in pending_words):
             return "pending", text[:500]
         if "stake" in text or "price" in text or "place" in text:
@@ -2043,6 +2080,7 @@ def _monitor_black_bet_status(driver: webdriver.Remote, signal, profile_label: s
     accepted_at = None
     last_detail = ""
     accepted_fills = []
+    accepted_without_fill_at = None
 
     while time.monotonic() < deadline:
         snapshots = {
@@ -2054,11 +2092,17 @@ def _monitor_black_bet_status(driver: webdriver.Remote, signal, profile_label: s
         last_detail = detail or last_detail
 
         recent_fill = _read_black_recent_order_fill(driver, signal, profile_label)
-        if recent_fill and recent_fill.get("status") == "accepted":
-            status = "accepted"
-            detail = recent_fill.get("detail") or detail
-            last_detail = detail or last_detail
-            accepted_fills = recent_fill.get("fills") or accepted_fills
+        if recent_fill:
+            if recent_fill.get("status") == "accepted":
+                status = "accepted"
+                detail = recent_fill.get("detail") or detail
+                last_detail = detail or last_detail
+                accepted_fills = recent_fill.get("fills") or accepted_fills
+                accepted_without_fill_at = None
+            elif recent_fill.get("status") == "accepted_no_fill_breakdown":
+                if accepted_without_fill_at is None:
+                    accepted_without_fill_at = time.monotonic()
+                last_detail = recent_fill.get("detail") or last_detail
 
         if status in {"cancelled", "rejected"}:
             print(f"[{profile_label}] Black order status: {status}. {detail[:250]}")
@@ -2073,6 +2117,10 @@ def _monitor_black_bet_status(driver: webdriver.Remote, signal, profile_label: s
         else:
             if accepted_at is None and status == "pending":
                 print(f"[{profile_label}] Black order status: pending.")
+
+        if accepted_at is None and accepted_without_fill_at is not None and time.monotonic() - accepted_without_fill_at >= 6:
+            print(f"[{profile_label}] Black order status: accepted without fill breakdown. {last_detail[:250]}")
+            return {"status": "accepted", "detail": last_detail, "accepted": True, "fills": accepted_fills}
 
         time.sleep(1)
 
