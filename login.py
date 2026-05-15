@@ -1183,6 +1183,8 @@ def _read_black_top_order_row(driver: webdriver.Remote, profile_label: str, time
     if not _open_black_top_orders(driver, profile_label):
         return {"status": "pending", "accepted": False, "detail": "Top Orders view not opened.", "order_status": "Unknown", "order_stake": "?"}
 
+    time.sleep(6)
+
     def read_row(browser: webdriver.Remote):
         return browser.execute_script(
             """
