@@ -1238,7 +1238,7 @@ class BlackSelectionMissingError(RuntimeError):
 def _read_black_top_order_row(
     driver: webdriver.Remote,
     profile_label: str,
-    timeout: int = 15,
+    timeout: int = 60,
     home_team: str | None = None,
     expected_stake: Decimal | None = None,
 ) -> dict:
@@ -1373,15 +1373,21 @@ def _read_black_top_order_row(
     while time.monotonic() < deadline:
         row_data = read_row(driver)
         ok_basic = row_data and row_data.get("ok") and row_data.get("status") and row_data.get("stake")
-        # Keep polling while the wanted row hasn't arrived yet: either team didn't match,
-        # or expected stake didn't match, or status is still 'Unknown'.
+        # Keep polling until the newly placed row actually shows up. The orders table can
+        # take several seconds to add the new row, so accepting a "top" or stake-only
+        # match while waiting would silently report the wrong (older) bet.
         if ok_basic:
             matched_by = row_data.get("matchedBy")
             status_ok = row_data.get("status") != "Unknown"
-            team_ok = (not home_team_lower) or matched_by in {"team", "stake"} or status_ok
-            stake_ok = (not expected_stake_variants) or matched_by in {"team", "stake"}
-            if status_ok and team_ok and stake_ok:
-                break
+            if home_team_lower:
+                if matched_by == "team" and status_ok:
+                    break
+            elif expected_stake_variants:
+                if matched_by in {"team", "stake"} and status_ok:
+                    break
+            else:
+                if status_ok:
+                    break
         time.sleep(1)
 
     if not row_data or not row_data.get("ok"):
