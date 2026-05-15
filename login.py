@@ -1920,40 +1920,32 @@ def _activate_black_order_tab(driver: webdriver.Remote, tab_name: str, profile_l
 
     target = script_result
     driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", target)
+    activation_probe = """
+        const element = arguments[0];
+        if (!element || !element.isConnected) return false;
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    """
     for click_attempt in (
         lambda: target.click(),
         lambda: ActionChains(driver).move_to_element(target).click().perform(),
         lambda: driver.execute_script("arguments[0].click();", target),
+        lambda: driver.execute_script(
+            """
+            const target = arguments[0];
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+                target.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
+            }
+            return true;
+            """,
+            target,
+        ),
     ):
         try:
             click_attempt()
-            if WebDriverWait(driver, 4).until(lambda browser: browser.execute_script(
-                """
-                const expected = arguments[0].trim().toLowerCase();
-                const isVisible = (element) => {
-                    const style = window.getComputedStyle(element);
-                    const rect = element.getBoundingClientRect();
-                    return style.display !== 'none'
-                        && style.visibility !== 'hidden'
-                        && rect.width > 0
-                        && rect.height > 0
-                        && rect.bottom > 0
-                        && rect.right > 0;
-                };
-                const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-                const tabs = Array.from(document.querySelectorAll('button,[role="tab"],[role="button"],div,span'))
-                    .filter(isVisible)
-                    .map((element) => ({
-                        text: textOf(element),
-                        selected: (element.getAttribute('aria-selected') || '').toLowerCase() === 'true'
-                            || (element.getAttribute('class') || '').toLowerCase().includes('active')
-                            || (element.getAttribute('class') || '').toLowerCase().includes('selected'),
-                    }))
-                    .filter((item) => item.text === expected || item.text.includes(expected));
-                return tabs.some((item) => item.selected);
-                """,
-                tab_name,
-            )):
+            if WebDriverWait(driver, 2).until(lambda browser: browser.execute_script(activation_probe, target)):
                 return True
         except Exception:
             continue
@@ -2053,6 +2045,10 @@ def _read_black_recent_order_fill(driver: webdriver.Remote, signal, profile_labe
         getattr(signal, "away_team", None) or "",
     )
     if not details or not details.get("ok"):
+        reason = (details or {}).get("reason") or "unknown"
+        panel_text = (details or {}).get("panelText") or ""
+        if reason != "recent-order-card-not-found" or panel_text:
+            print(f"[{profile_label}] Recent Orders read failed: {reason}. {panel_text[:250]}")
         return None
 
     card_element = details.get("card")
