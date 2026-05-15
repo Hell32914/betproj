@@ -950,10 +950,6 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-        const active = document.activeElement;
-        if (active && active.tagName === 'INPUT' && isVisible(active)) {
-            return active;
-        }
 
         const modalRoots = Array.from(document.querySelectorAll('div,section,aside'))
             .filter(isVisible)
@@ -967,8 +963,22 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
             const localInputs = Array.from(root.element.querySelectorAll('input'))
                 .filter(isVisible)
                 .filter((input) => !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()))
-                .sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y);
-            if (localInputs[0]) return localInputs[0];
+                .map((input) => {
+                    const marker = [
+                        input.getAttribute('placeholder') || '',
+                        input.getAttribute('aria-label') || '',
+                        input.name || '',
+                        String(input.className || ''),
+                        textOf(input.parentElement || input),
+                    ].join(' ').toLowerCase();
+                    return { input, marker, rect: input.getBoundingClientRect() };
+                })
+                .sort((a, b) => {
+                    const aSearch = /search|league|game|team|event/.test(a.marker) ? 0 : 1;
+                    const bSearch = /search|league|game|team|event/.test(b.marker) ? 0 : 1;
+                    return aSearch - bSearch || a.rect.y - b.rect.y || a.rect.x - b.rect.x;
+                });
+            if (localInputs[0]) return localInputs[0].input;
         }
 
         const inputs = Array.from(document.querySelectorAll('input'))
@@ -980,7 +990,7 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                     input.getAttribute('placeholder') || '',
                     input.getAttribute('aria-label') || '',
                     input.name || '',
-                    input.className?.toString() || '',
+                    String(input.className || ''),
                     textOf(input.parentElement || input),
                 ].join(' ').toLowerCase();
                 return { input, rect, marker };
@@ -991,7 +1001,7 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                 const bSearch = /search|league|game/.test(b.marker) ? 0 : 1;
                 return aSearch - bSearch || a.rect.y - b.rect.y;
             });
-        return inputs[0]?.input || null;
+        return inputs.length ? inputs[0].input : null;
         """
     ))
     try:
@@ -999,17 +1009,29 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
             """
             const input = arguments[0];
             input.focus({ preventScroll: true });
-            input.click?.();
+            if (typeof input.click === 'function') input.click();
             """,
             search_input,
         )
     except Exception:
         pass
 
-    search_input.send_keys(Keys.CONTROL, "a")
-    search_input.send_keys(Keys.DELETE)
-    _set_input_value(driver, search_input, normalized_query)
-    WebDriverWait(driver, 5).until(lambda browser: (search_input.get_attribute("value") or "").strip().lower() == normalized_query.lower())
+    for _ in range(2):
+        search_input.send_keys(Keys.CONTROL, "a")
+        search_input.send_keys(Keys.DELETE)
+        _set_input_value(driver, search_input, normalized_query)
+        try:
+            WebDriverWait(driver, 3).until(
+                lambda browser: (search_input.get_attribute("value") or "").strip().lower() == normalized_query.lower()
+            )
+            break
+        except Exception:
+            continue
+    final_value = (search_input.get_attribute("value") or "").strip().lower()
+    if final_value != normalized_query.lower():
+        raise RuntimeError(
+            f"Black search input did not keep the requested query. Expected {normalized_query!r}, got {final_value!r}."
+        )
     search_input.send_keys(Keys.ENTER)
 
     WebDriverWait(driver, 15).until(
@@ -1017,6 +1039,64 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
         or "no results found" in _visible_text_lower(browser)
     )
     print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
+
+
+def _confirm_black_place_order(driver: webdriver.Remote, profile_label: str) -> None:
+    try:
+        modal_state = WebDriverWait(driver, 5).until(lambda browser: browser.execute_script(
+            """
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0;
+            };
+            const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+            const dialogs = Array.from(document.querySelectorAll('div,section,aside'))
+                .filter(isVisible)
+                .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+                .filter((item) => item.rect.width > 220 && item.rect.height > 120)
+                .filter((item) => item.text.includes('place order') || item.text.includes('are you sure you want to place this order'))
+                .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+            const dialog = dialogs[0];
+            if (!dialog) return false;
+            const buttons = Array.from(dialog.element.querySelectorAll('button,[role="button"]'))
+                .filter(isVisible)
+                .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }));
+            const placeOrderButton = buttons
+                .filter((item) => item.text === 'place order' || item.text.includes('place order'))
+                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+            if (!placeOrderButton) {
+                return { ok: false, reason: 'place order button not found', text: dialog.text.slice(0, 400) };
+            }
+            return { ok: true, button: placeOrderButton.element, text: dialog.text.slice(0, 400) };
+            """
+        ))
+    except TimeoutException:
+        return
+
+    if not modal_state or modal_state is False:
+        return
+    if not modal_state.get("ok"):
+        raise RuntimeError(f"Black order confirmation dialog appeared but could not be confirmed: {modal_state!r}")
+
+    button = modal_state.get("button")
+    if not button:
+        raise RuntimeError(f"Black order confirmation dialog appeared but no Place Order button was returned: {modal_state!r}")
+
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", button)
+    try:
+        button.click()
+    except Exception:
+        try:
+            ActionChains(driver).move_to_element(button).click().perform()
+        except Exception:
+            driver.execute_script("arguments[0].click();", button)
+    print(f"[{profile_label}] Confirmed Black Place Order dialog.")
 
 
 def _black_search_dialog_open(driver: webdriver.Remote) -> bool:
@@ -1696,6 +1776,7 @@ def _set_black_betslip_price_and_place(
             ActionChains(driver).move_to_element(ready_place_button).click().perform()
         except Exception:
             driver.execute_script("arguments[0].click();", ready_place_button)
+    _confirm_black_place_order(driver, profile_label)
     print(f"[{profile_label}] Entered stake {stake_text or 'existing'}, price {price_text} and clicked Place.")
 
 
