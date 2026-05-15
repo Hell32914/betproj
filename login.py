@@ -1074,6 +1074,9 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
         lambda browser: normalized_query.lower() in _visible_text_lower(browser)
         or "no results found" in _visible_text_lower(browser)
     )
+    # Give the React result list a brief moment to render fully before consumers
+    # start scanning the DOM for the match-card row.
+    time.sleep(0.8)
     print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
 
 
@@ -1467,7 +1470,9 @@ def _black_match_context_matches(
         const homeTeam = arguments[0].trim().toLowerCase();
         const awayTeam = (arguments[1] || '').trim().toLowerCase();
         const bodyText = (document.body?.innerText || '').toLowerCase();
-        if (bodyText.includes('live events') || bodyText.includes('all sports')) return false;
+        // 'live events' is unique to the search modal; 'all sports' also appears in the page's
+        // left navigation rail when not in the modal, so only reject on the modal-only marker.
+        if (bodyText.includes('live events')) return false;
 
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
@@ -1628,12 +1633,30 @@ def _open_black_live_match(
             if (rect.x > window.innerWidth * 0.82) score -= 170;
             if (normalizedText.includes('order id') || normalizedText.includes('placed at') || normalizedText.includes('profit loss') || normalizedText.includes('selection status price stake')) score -= 260;
             if (normalizedText.includes('all sports') || normalizedText.includes('football tennis') || normalizedText.includes('specials')) score -= 220;
+            if (normalizedText.includes('results in football') || normalizedText.includes('results in')) score -= 200;
             if (normalizedText.includes('result')) score -= 30;
             if (normalizedText.includes('over') || normalizedText.includes('under')) score -= 30;
+            // Penalise rows that obviously enumerate several distinct matches (multiple kickoff
+            // times / opponents) so a wrapping container never beats the single match card.
+            const kickoffMatches = normalizedText.match(/\\b[0-2]?\\d\\s+[0-5]\\d\\b/g) || [];
+            if (kickoffMatches.length >= 2) score -= 120;
+            const vsCount = (normalizedText.match(/\\bvs\\b/g) || []).length;
+            if (vsCount >= 2) score -= 180;
             return score;
         };
 
-        const roots = Array.from(document.querySelectorAll('li,button,a,[role="button"],div'))
+        const rowMatchesTeams = (text) => {
+            const t = normalize(text);
+            const hasTeam = !teamWords.length
+                || teamWords.every((word) => t.includes(word))
+                || teamVariants.some((value) => normalize(value) && t.includes(normalize(value)));
+            const hasOpponent = !opponentWords.length
+                || opponentWords.some((word) => t.includes(word))
+                || opponentVariants.some((value) => normalize(value) && t.includes(normalize(value)));
+            return hasTeam && hasOpponent;
+        };
+
+        const roots = Array.from(document.querySelectorAll('li,button,a,[role="button"],article,div'))
             .filter(isVisible)
             .map((element) => {
                 const row = element.closest('li,button,a,[role="button"]') || element;
@@ -1643,11 +1666,16 @@ def _open_black_live_match(
             })
             .filter((item) => item.rect.y > 90)
             .filter((item) => item.rect.width > 150 && item.rect.height >= 24)
+            // Single match-card rows are typically well under ~220px tall; anything taller is
+            // almost certainly a wrapper enumerating multiple matches.
+            .filter((item) => item.rect.height <= 260)
             .filter((item) => item.rect.x > window.innerWidth * 0.14)
             .filter((item) => item.rect.x < window.innerWidth * 0.82)
-            .filter((item) => !opponentWords.length || opponentWords.some((word) => normalize(item.text).includes(word)) || opponentVariants.some((value) => normalize(value) && normalize(item.text).includes(normalize(value))))
+            .filter((item) => rowMatchesTeams(item.text))
             .filter((item) => item.score >= 80)
-            .sort((a, b) => b.score - a.score || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+            // Highest score wins; on ties prefer the SMALLER element (single match card over
+            // any wrapping container that happens to also contain both team names).
+            .sort((a, b) => b.score - a.score || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
 
         const uniqueRows = [];
         for (const item of roots) {
