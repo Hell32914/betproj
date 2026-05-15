@@ -18,6 +18,7 @@ from telethon import TelegramClient, events
 
 from login import (
     BlackSelectionMissingError,
+    check_black_order_by_id,
     keep_black_session_alive,
     place_black_bet,
     refresh_black_default_stake,
@@ -229,6 +230,8 @@ async def main():
                 # is still waiting for its line just rejoins the queue after the pause.
                 selection_attempts = 3
                 selection_retry_pause = 90  # seconds — 3 attempts * 90s ≈ 4.5 min total
+                deferred_check_delay = 5 * 60  # final status check 5 min after placing
+                place_result = None
                 for attempt in range(1, selection_attempts + 1):
                     async with state.bet_lock:
                         primary_session = next(
@@ -237,15 +240,15 @@ async def main():
                         )
                         loop = asyncio.get_running_loop()
                         try:
-                            result = await loop.run_in_executor(
+                            place_result = await loop.run_in_executor(
                                 None, lambda: place_black_bet(primary_session, signal)
                             )
                             print(
-                                f"Black bet placement completed with status: {result.get('status')}",
+                                f"Black bet placement completed with status: "
+                                f"{place_result.get('status')}, orderId={place_result.get('order_id')}",
                                 flush=True,
                             )
-                            await event.reply(_format_signal_result_message(result))
-                            return
+                            break
                         except BlackSelectionMissingError as exc:
                             print(
                                 f"Black bet placement attempt {attempt}/{selection_attempts} "
@@ -261,8 +264,53 @@ async def main():
                             print(f"Black bet placement failed: {exc}", flush=True)
                             await event.reply(f"Ставка не завершена: {exc}")
                             return
-                    # Lock is released here so queued signals can place their bets while we wait.
+                    # Lock released here so queued signals can place their bets while we wait.
                     await asyncio.sleep(selection_retry_pause)
+
+                if place_result is None:
+                    return
+
+                order_id = place_result.get("order_id")
+                if not order_id:
+                    # Couldn't capture the order id — send whatever we got immediately and stop.
+                    await event.reply(_format_signal_result_message(place_result))
+                    return
+
+                # Acknowledge placement immediately, then defer the real status check by
+                # ~5 min outside the bet lock. The lookup is by exact order id, so no
+                # other bet for the same fixture can be confused with this one.
+                await event.reply(
+                    f"Ставка размещена, заказ #{order_id}. Итог проверю через 5 минут."
+                )
+                await asyncio.sleep(deferred_check_delay)
+
+                async with state.bet_lock:
+                    primary_session = next(
+                        (session for session in state.sessions if session.get("login_enabled")),
+                        state.sessions[0],
+                    )
+                    loop = asyncio.get_running_loop()
+                    try:
+                        final_result = await loop.run_in_executor(
+                            None,
+                            lambda: check_black_order_by_id(primary_session, order_id, signal),
+                        )
+                        print(
+                            f"Black deferred check for order #{order_id}: "
+                            f"status={final_result.get('order_status')}, "
+                            f"stake={final_result.get('order_stake')}",
+                            flush=True,
+                        )
+                        # Preserve teams/selection/odds from the original placement reply.
+                        final_result.setdefault("teams", place_result.get("teams"))
+                        final_result.setdefault("selection", place_result.get("selection"))
+                        final_result.setdefault("odds", place_result.get("odds"))
+                        await event.reply(_format_signal_result_message(final_result))
+                    except Exception as exc:
+                        print(f"Black deferred order check failed: {exc}", flush=True)
+                        await event.reply(
+                            f"Не удалось прочитать итог по заказу #{order_id}: {exc}"
+                        )
 
             asyncio.create_task(process_signal_reply())
 

@@ -1461,15 +1461,27 @@ def _read_black_top_order_row(
     if not row_data or not row_data.get("ok"):
         detail = ((row_data or {}).get("pageText") or "Top order row not found.")[:250]
         print(f"[{profile_label}] Could not read Black top order row. {detail}")
-        return {"status": "pending", "accepted": False, "detail": detail, "order_status": "Unknown", "order_stake": "?"}
+        return {
+            "status": "pending",
+            "accepted": False,
+            "detail": detail,
+            "order_status": "Unknown",
+            "order_stake": "?",
+            "order_id": None,
+        }
 
     raw_status = row_data.get("status") or "Unknown"
     stake = row_data.get("stake") or "?"
     detail = row_data.get("rowText") or ""
+    order_id = row_data.get("orderId")
+    if isinstance(order_id, (int, float)) and order_id:
+        order_id = int(order_id)
+    else:
+        order_id = None
     normalized_status = _normalize_black_order_status(raw_status)
     print(
         f"[{profile_label}] Black top order row: status={raw_status}, stake={stake}, "
-        f"orderId={row_data.get('orderId')} (matched by {row_data.get('matchedBy', 'top')})."
+        f"orderId={order_id} (matched by {row_data.get('matchedBy', 'top')})."
     )
     return {
         "status": normalized_status,
@@ -1477,7 +1489,123 @@ def _read_black_top_order_row(
         "detail": detail,
         "order_status": raw_status,
         "order_stake": stake,
+        "order_id": order_id,
     }
+
+
+def _read_black_order_by_id(
+    driver: webdriver.Remote,
+    profile_label: str,
+    order_id: int,
+    timeout: int = 30,
+) -> dict:
+    """Open the Black Orders view and return status/stake for the row with the exact
+    order id given. Used for the deferred (~5 min) check after a bet is placed so we
+    look up the bet we actually placed, never a sibling row for the same fixture."""
+    if not _open_black_top_orders(driver, profile_label):
+        return {
+            "status": "pending",
+            "accepted": False,
+            "detail": "Top Orders view not opened.",
+            "order_status": "Unknown",
+            "order_stake": "?",
+            "order_id": order_id,
+        }
+    time.sleep(2)
+
+    def read_row(browser: webdriver.Remote):
+        return browser.execute_script(
+            """
+            const targetId = String(arguments[0] || '');
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0;
+            };
+            const textOf = (element) => (element.innerText || element.textContent || '').trim();
+            const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+            const tables = Array.from(document.querySelectorAll('table,div,section,main'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: normalize(textOf(element)).toLowerCase() }))
+                .filter((item) => item.text.includes('selection') && item.text.includes('status') && item.text.includes('stake'))
+                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+            const table = tables[0];
+            if (!table) return null;
+            const rows = Array.from(table.element.querySelectorAll('tr,[role="row"],div,section,article'))
+                .filter(isVisible)
+                .map((element) => ({ element, text: normalize(textOf(element)) }))
+                .filter((item) => item.text.includes(targetId));
+            if (!rows.length) return { ok: false, reason: 'order-id-not-found' };
+            // Pick the smallest container so we don't get a parent that includes other rows.
+            rows.sort((a, b) => (a.text.length - b.text.length));
+            const rowItem = rows[0];
+            const rowText = rowItem.text;
+            const statusMatch = rowText.match(/\\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done)\\b/i);
+            const euroMatches = Array.from(rowText.matchAll(/\u20ac\\s*\\d+(?:[.,]\\d+)?/g)).map((m) => m[0]);
+            return {
+                ok: true,
+                status: statusMatch ? statusMatch[1] : 'Unknown',
+                stake: euroMatches[0] || '?',
+                rowText: rowText.slice(0, 500),
+            };
+            """,
+            str(order_id),
+        )
+
+    row_data = None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        row_data = read_row(driver)
+        if row_data and row_data.get("ok") and row_data.get("status") and row_data.get("status") != "Unknown":
+            break
+        time.sleep(1)
+
+    if not row_data or not row_data.get("ok"):
+        print(f"[{profile_label}] Could not find Black order id {order_id} in Orders.")
+        return {
+            "status": "pending",
+            "accepted": False,
+            "detail": "Order id not found in Orders table.",
+            "order_status": "Unknown",
+            "order_stake": "?",
+            "order_id": order_id,
+        }
+
+    raw_status = row_data.get("status") or "Unknown"
+    stake = row_data.get("stake") or "?"
+    normalized_status = _normalize_black_order_status(raw_status)
+    print(
+        f"[{profile_label}] Black deferred check for orderId={order_id}: "
+        f"status={raw_status}, stake={stake}."
+    )
+    return {
+        "status": normalized_status,
+        "accepted": normalized_status == "accepted",
+        "detail": row_data.get("rowText", ""),
+        "order_status": raw_status,
+        "order_stake": stake,
+        "order_id": order_id,
+    }
+
+
+def check_black_order_by_id(session: dict, order_id: int, signal=None) -> dict:
+    """Public helper used by the Telegram layer to look up a previously placed order
+    by id after a delay. Reuses the active browser session."""
+    profile_label = session.get("profile_label", "Profile-1")
+    driver = None
+    try:
+        driver = connect_to_browser(session["browser_info"], profile_label)
+        result = _read_black_order_by_id(driver, profile_label, int(order_id))
+    finally:
+        close_driver_bridge(driver)
+    if signal is not None:
+        result["teams"] = getattr(signal, "teams", None) or getattr(signal, "home_team", None)
+        result["selection"] = getattr(signal, "selection_label", None) or f"{signal.selection} {signal.line}"
+        result["odds"] = str(getattr(signal, "odds", ""))
+    return result
 
 
 def _open_black_orders_view(driver: webdriver.Remote, profile_label: str) -> bool:
@@ -2848,6 +2976,7 @@ def place_black_bet(session: dict, signal) -> dict:
             "fills": status_result.get("fills", []),
             "order_status": status_result.get("order_status", "Unknown"),
             "order_stake": status_result.get("order_stake", "?"),
+            "order_id": status_result.get("order_id"),
             "teams": getattr(signal, "teams", None) or team_name,
             "selection": getattr(signal, "selection_label", f"{signal.selection} {signal.line}"),
             "odds": str(signal.odds),
