@@ -1881,6 +1881,87 @@ def _read_black_order_panel_text(driver: webdriver.Remote, tab_name: str | None 
     ) or ""
 
 
+def _activate_black_order_tab(driver: webdriver.Remote, tab_name: str, profile_label: str) -> bool:
+    script_result = driver.execute_script(
+        """
+        const expected = arguments[0].trim().toLowerCase();
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const panel = Array.from(document.querySelectorAll('aside,section,div'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.x > window.innerWidth * 0.68)
+            .filter((item) => item.rect.width > 180 && item.rect.height > 120)
+            .filter((item) => item.text.includes('betslip') || item.text.includes('recent orders') || item.text.includes('live orders'))
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+        if (!panel) return null;
+
+        const candidates = Array.from(panel.element.querySelectorAll('button,[role="tab"],[role="button"],div,span'))
+            .filter(isVisible)
+            .map((element) => ({ element, text: textOf(element) }))
+            .filter((item) => item.text === expected || item.text.includes(expected));
+        const firstCandidate = candidates.length ? candidates[0].element : null;
+        const target = firstCandidate ? (firstCandidate.closest('button,[role="tab"],[role="button"]') || firstCandidate) : null;
+        return target || null;
+        """,
+        tab_name,
+    )
+    if not script_result:
+        return False
+
+    target = script_result
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", target)
+    for click_attempt in (
+        lambda: target.click(),
+        lambda: ActionChains(driver).move_to_element(target).click().perform(),
+        lambda: driver.execute_script("arguments[0].click();", target),
+    ):
+        try:
+            click_attempt()
+            if WebDriverWait(driver, 4).until(lambda browser: browser.execute_script(
+                """
+                const expected = arguments[0].trim().toLowerCase();
+                const isVisible = (element) => {
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.right > 0;
+                };
+                const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+                const tabs = Array.from(document.querySelectorAll('button,[role="tab"],[role="button"],div,span'))
+                    .filter(isVisible)
+                    .map((element) => ({
+                        text: textOf(element),
+                        selected: (element.getAttribute('aria-selected') || '').toLowerCase() === 'true'
+                            || (element.getAttribute('class') || '').toLowerCase().includes('active')
+                            || (element.getAttribute('class') || '').toLowerCase().includes('selected'),
+                    }))
+                    .filter((item) => item.text === expected || item.text.includes(expected));
+                return tabs.some((item) => item.selected);
+                """,
+                tab_name,
+            )):
+                return True
+        except Exception:
+            continue
+
+    print(f"[{profile_label}] Could not activate Black order tab: {tab_name}")
+    return False
+
+
 def _format_black_fill_breakdown(items: list[dict]) -> str:
     parts = []
     for item in items:
@@ -1909,7 +1990,9 @@ def _parse_black_fill_breakdown(tooltip_text: str) -> list[dict]:
 
 
 def _read_black_recent_order_fill(driver: webdriver.Remote, signal, profile_label: str) -> dict | None:
-    _read_black_order_panel_text(driver, "Recent Orders")
+    if not _activate_black_order_tab(driver, "Recent Orders", profile_label):
+        return None
+    time.sleep(0.4)
     details = driver.execute_script(
         """
         const selection = (arguments[0] || '').trim().toLowerCase();
@@ -2056,7 +2139,7 @@ def _classify_black_order_snapshot(snapshots: dict[str, str], signal) -> tuple[s
         if any(word in text for word in failure_words):
             status = "cancelled" if "cancel" in text or "void" in text else "rejected"
             return status, text[:500]
-        if any(word in text for word in success_words):
+        if tab_name == "betslip" and any(word in text for word in success_words):
             return "accepted", text[:500]
         if tab_name in {"live orders", "recent orders"}:
             return "pending", text[:500]
@@ -2071,7 +2154,7 @@ def _classify_black_order_snapshot(snapshots: dict[str, str], signal) -> tuple[s
     if "betslip is empty" in betslip_text and any(snapshots.get(name, "") for name in ("live orders", "recent orders")):
         combined = " | ".join(filter(None, [snapshots.get("live orders", "")[:250], snapshots.get("recent orders", "")[:250]]))
         if _black_snapshot_matches_signal(combined, signal):
-            return "accepted", combined[:500]
+            return "pending", combined[:500]
     return "unknown", betslip_text[:500]
 
 
