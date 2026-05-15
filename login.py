@@ -24,7 +24,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.common.exceptions import NoSuchWindowException, WebDriverException
+from selenium.common.exceptions import NoSuchWindowException, TimeoutException, WebDriverException
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 
 load_dotenv()
@@ -520,7 +520,100 @@ def _decimal_variants(value: Decimal) -> list[str]:
     normalized = format(value.normalize(), "f")
     fixed = format(value.quantize(Decimal("0.01")), "f")
     variants = {normalized, fixed, normalized.replace(".", ","), fixed.replace(".", ",")}
+
+    scaled = int((value * 100).copy_abs()) % 100
+    if scaled in {25, 75}:
+        low = format((value - Decimal("0.25")).normalize(), "f")
+        high = format((value + Decimal("0.25")).normalize(), "f")
+        split_variants = {
+            f"{low}/{high}",
+            f"{low.replace('.', ',')}/{high.replace('.', ',')}",
+            f"{low}/{high.replace('.', ',')}",
+            f"{low.replace('.', ',')}/{high}",
+            f"{low},{high}",
+            f"{low.replace('.', ',')},{high.replace('.', ',')}",
+            f"{low}, {high}",
+            f"{low.replace('.', ',')}, {high.replace('.', ',')}",
+        }
+        variants.update(split_variants)
+
     return sorted(variants, key=len)
+
+
+def _read_black_betslip_state(driver: webdriver.Remote) -> dict:
+    return driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const panel = Array.from(document.querySelectorAll('aside,section,div'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.x > window.innerWidth * 0.68)
+            .filter((item) => item.rect.width > 180 && item.rect.height > 160)
+            .filter((item) => item.text.includes('betslip'))
+            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0];
+        if (!panel) return { ok: false, reason: 'betslip panel not found', text: document.body?.innerText || '' };
+
+        const inputs = Array.from(panel.element.querySelectorAll('input'))
+            .filter(isVisible)
+            .filter((element) => !element.disabled && !element.readOnly)
+            .map((element) => ({
+                value: element.value || element.getAttribute('value') || '',
+                placeholder: (element.getAttribute('placeholder') || '').trim(),
+                aria: (element.getAttribute('aria-label') || '').trim(),
+            }));
+        const placeButton = Array.from(panel.element.querySelectorAll('button,[role="button"]'))
+            .filter(isVisible)
+            .find((element) => {
+                const text = textOf(element);
+                return text === 'place' || text.includes('place');
+            });
+        return {
+            ok: true,
+            text: panel.element.innerText || '',
+            inputs,
+            placeEnabled: !!placeButton && !placeButton.disabled && placeButton.getAttribute('aria-disabled') !== 'true',
+        };
+        """
+    ) or {"ok": False, "reason": "betslip panel not found", "text": ""}
+
+
+def _fill_betslip_input(driver: webdriver.Remote, element, value: str) -> None:
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
+    try:
+        ActionChains(driver).move_to_element(element).click().perform()
+    except Exception:
+        try:
+            element.click()
+        except Exception:
+            driver.execute_script("arguments[0].focus({preventScroll: true}); arguments[0].click?.();", element)
+
+    try:
+        element.send_keys(Keys.CONTROL, "a")
+        element.send_keys(Keys.DELETE)
+        element.send_keys(value)
+    except Exception:
+        _set_input_value(driver, element, value)
+    else:
+        current_value = (element.get_attribute("value") or "").strip()
+        if current_value != value:
+            _set_input_value(driver, element, value)
+
+    try:
+        element.send_keys(Keys.TAB)
+    except Exception:
+        driver.execute_script("arguments[0].blur();", element)
+
+    time.sleep(0.25)
 
 
 def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
@@ -1316,7 +1409,7 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
             if (selection === 'over') {
                 return oddsButtons
                     .filter((item) => item.rect.left >= overLabel.rect.right - 8)
-                    .filter((item) => item.rect.right <= underLabel.rect.left + 14)
+        const linePattern = /^\\d+(?:[.,]\\d+)?(?:\\s*(?:\\/|,)\\s*\\d+(?:[.,]\\d+)?)?$/;
                     .sort((a, b) => Math.abs(a.rect.left - overLabel.rect.right) - Math.abs(b.rect.left - overLabel.rect.right))[0]
                     || oddsButtons
                         .filter((item) => item.rect.left >= overLabel.rect.right - 8 && item.rect.left < underLabel.rect.left + 40)
@@ -1346,8 +1439,20 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
             if (!lineCell) {
                 return null;
             }
+            const overLabel = findSelectionLabel(element, 'over');
+            const underLabel = findSelectionLabel(element, 'under');
+            if (!overLabel || !underLabel) {
+                return null;
+            }
             const targetOdds = pickOddsForSelection(element);
             if (!targetOdds) {
+                return null;
+            }
+            const verticalCenters = [lineCell.rect, overLabel.rect, underLabel.rect, targetOdds.rect]
+                .map((candidateRect) => candidateRect.top + candidateRect.height / 2);
+            const minCenter = Math.min(...verticalCenters);
+            const maxCenter = Math.max(...verticalCenters);
+            if (maxCenter - minCenter > 22) {
                 return null;
             }
             return {
@@ -1356,6 +1461,7 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 text,
                 lineText: normalizeNumber(lineCell.text),
                 targetOdds,
+                area: rect.width * rect.height,
             };
         };
         const collectSectionCandidates = () => {
@@ -1396,7 +1502,7 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
         for (const section of marketSections) {
             const rows = section.rows
                 .filter((item) => normalizedLineVariants.includes(item.lineText))
-                .sort((a, b) => a.rect.y - b.rect.y || a.rect.height - b.rect.height);
+                .sort((a, b) => a.area - b.area || a.rect.y - b.rect.y || a.rect.height - b.rect.height);
 
             if (!rows.length) {
                 continue;
@@ -1538,19 +1644,9 @@ def _set_black_betslip_price_and_place(
         raise RuntimeError(f"Could not click Black Place. Reason: place button not found. Page: {short_text}")
 
     if stake_input and stake_text:
-        _set_input_value(driver, stake_input, stake_text)
-        try:
-            stake_input.send_keys(Keys.TAB)
-        except Exception:
-            driver.execute_script("arguments[0].blur();", stake_input)
-        time.sleep(0.2)
+        _fill_betslip_input(driver, stake_input, stake_text)
 
-    _set_input_value(driver, price_input, price_text)
-    try:
-        price_input.send_keys(Keys.TAB)
-    except Exception:
-        driver.execute_script("arguments[0].blur();", price_input)
-    time.sleep(0.3)
+    _fill_betslip_input(driver, price_input, price_text)
 
     normalized_price = format(Decimal(price_text).normalize(), "f")
     normalized_stake = None
@@ -1585,7 +1681,21 @@ def _set_black_betslip_price_and_place(
             return False
         return state
 
-    ready_state = WebDriverWait(driver, 8).until(betslip_ready)
+    try:
+        ready_state = WebDriverWait(driver, 8).until(betslip_ready)
+    except TimeoutException as exc:
+        snapshot = _read_black_betslip_state(driver)
+        panel_text = " | ".join(line.strip() for line in (snapshot.get("text", "") or "").splitlines() if line.strip())[:700]
+        inputs = snapshot.get("inputs") or []
+        inputs_text = "; ".join(
+            f"value={item.get('value', '')!r}, placeholder={item.get('placeholder', '')!r}, aria={item.get('aria', '')!r}"
+            for item in inputs[:4]
+        )
+        raise RuntimeError(
+            f"Black betslip did not become ready after filling stake/price. "
+            f"Target stake={stake_text or 'existing'}, price={price_text}. "
+            f"Inputs: {inputs_text or 'none'}. Panel: {panel_text}"
+        ) from exc
     ready_place_button = ready_state.get("placeButton")
     driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", ready_place_button)
     try:
