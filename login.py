@@ -1596,16 +1596,26 @@ def _read_black_order_by_id(
                 .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
             const table = tables[0];
             if (!table) return null;
-            const rows = Array.from(table.element.querySelectorAll('tr,[role="row"],div,section,article'))
+            const statusRegex = /\\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done)\\b/i;
+            const candidates = Array.from(table.element.querySelectorAll('tr,[role="row"],div,section,article'))
                 .filter(isVisible)
                 .map((element) => ({ element, text: normalize(textOf(element)) }))
                 .filter((item) => item.text.includes(targetId));
-            if (!rows.length) return { ok: false, reason: 'order-id-not-found' };
-            // Pick the smallest container so we don't get a parent that includes other rows.
-            rows.sort((a, b) => (a.text.length - b.text.length));
-            const rowItem = rows[0];
+            if (!candidates.length) return { ok: false, reason: 'order-id-not-found' };
+            // We want the SMALLEST container that includes the order id, a € amount, AND a
+            // status keyword — that is the full row for this order. Fallbacks: smallest
+            // with € only, then smallest overall.
+            const filterAnd = (predicate) => {
+                const subset = candidates.filter(predicate);
+                if (!subset.length) return null;
+                subset.sort((a, b) => a.text.length - b.text.length);
+                return subset[0];
+            };
+            const rowItem = filterAnd((item) => /\u20ac/.test(item.text) && statusRegex.test(item.text))
+                || filterAnd((item) => /\u20ac/.test(item.text))
+                || filterAnd(() => true);
             const rowText = rowItem.text;
-            const statusMatch = rowText.match(/\\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done)\\b/i);
+            const statusMatch = rowText.match(statusRegex);
             const euroMatches = Array.from(rowText.matchAll(/\u20ac\\s*\\d+(?:[.,]\\d+)?/g)).map((m) => m[0]);
             return {
                 ok: true,

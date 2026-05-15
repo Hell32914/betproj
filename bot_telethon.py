@@ -15,6 +15,7 @@ import sys
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.errors.common import TypeNotFoundError as TelethonTypeNotFoundError
 
 from login import (
     BlackSelectionMissingError,
@@ -322,7 +323,28 @@ async def main():
         asyncio.create_task(refresh_stakes_daily(state))
         asyncio.create_task(keep_black_session_active(state))
 
-        await client.run_until_disconnected()
+        # Telethon can crash on TypeNotFoundError when Telegram introduces a new TL
+        # object the installed Telethon doesn't know yet (the stored difference contains
+        # an unknown constructor id). Clear the cached error and resume listening so the
+        # bot stays online instead of exiting. If this keeps happening, upgrade Telethon:
+        #     .venv\Scripts\python.exe -m pip install -U telethon
+        while True:
+            try:
+                if hasattr(client, "_updates_error"):
+                    client._updates_error = None
+                await client.run_until_disconnected()
+                break
+            except TelethonTypeNotFoundError as exc:
+                print(
+                    f"Telethon TypeNotFoundError, ignoring and continuing to listen: {exc}",
+                    flush=True,
+                )
+                await asyncio.sleep(2)
+                continue
+            except Exception as exc:
+                print(f"Telethon listener crashed: {exc!r}; restarting in 5s.", flush=True)
+                await asyncio.sleep(5)
+                continue
 
 
 if __name__ == "__main__":
