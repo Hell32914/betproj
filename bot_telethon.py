@@ -272,16 +272,20 @@ async def main():
 
                 order_id = place_result.get("order_id")
                 if not order_id:
-                    # Couldn't capture the order id — send whatever we got immediately and stop.
-                    await event.reply(_format_signal_result_message(place_result))
+                    # Couldn't capture the order id — send a single error reply.
+                    await event.reply(
+                        "Не удалось определить номер заказа после ставки — проверьте вручную."
+                    )
                     return
 
-                # Acknowledge placement immediately, then defer the real status check by
-                # ~5 min outside the bet lock. The lookup is by exact order id, so no
-                # other bet for the same fixture can be confused with this one.
-                await event.reply(
-                    f"Ставка размещена, заказ #{order_id}. Итог проверю через 5 минут."
+                print(
+                    f"Black bet placed, order #{order_id}. Sleeping {deferred_check_delay}s "
+                    f"before final status check.",
+                    flush=True,
                 )
+                # No interim Telegram message — wait 5 minutes outside the bet lock so
+                # queued signals can be placed, then look up the exact order id and send
+                # the single final reply.
                 await asyncio.sleep(deferred_check_delay)
 
                 async with state.bet_lock:
@@ -301,7 +305,6 @@ async def main():
                             f"stake={final_result.get('order_stake')}",
                             flush=True,
                         )
-                        # Preserve teams/selection/odds from the original placement reply.
                         final_result.setdefault("teams", place_result.get("teams"))
                         final_result.setdefault("selection", place_result.get("selection"))
                         final_result.setdefault("odds", place_result.get("odds"))

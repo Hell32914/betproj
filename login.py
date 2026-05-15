@@ -1281,6 +1281,68 @@ def _snapshot_black_max_order_id(driver: webdriver.Remote, profile_label: str) -
     return None
 
 
+def _capture_new_black_order_id(
+    driver: webdriver.Remote,
+    profile_label: str,
+    min_order_id: int | None,
+    timeout: int = 45,
+) -> int | None:
+    """After Place, poll the Orders table for the new max order id strictly greater
+    than `min_order_id`. Order ids are monotonically increasing and only one bet is
+    placed at a time under the bet lock, so the new max IS our bet. Returns None if
+    no new id appears within `timeout`."""
+    if not _open_black_top_orders(driver, profile_label):
+        return None
+    deadline = time.monotonic() + timeout
+    last_seen = None
+    while time.monotonic() < deadline:
+        try:
+            result = driver.execute_script(
+                """
+                const isVisible = (element) => {
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0;
+                };
+                const text = Array.from(document.querySelectorAll('table,div,section,main'))
+                    .filter(isVisible)
+                    .map((element) => (element.innerText || element.textContent || ''))
+                    .filter((value) => /selection/i.test(value) && /status/i.test(value) && /stake/i.test(value))
+                    .sort((a, b) => b.length - a.length)[0] || '';
+                const matches = text.match(/\\b\\d{8,14}\\b/g) || [];
+                let max = 0;
+                for (const value of matches) {
+                    const num = parseInt(value, 10);
+                    if (Number.isFinite(num) && num > max) max = num;
+                }
+                return max || null;
+                """
+            )
+        except Exception as exc:
+            print(f"[{profile_label}] Could not read Black orders max id: {exc}", flush=True)
+            result = None
+        if isinstance(result, (int, float)) and result:
+            current_max = int(result)
+            last_seen = current_max
+            if not min_order_id or current_max > int(min_order_id):
+                print(
+                    f"[{profile_label}] Captured new Black order id: {current_max} "
+                    f"(pre-bet snapshot {min_order_id}).",
+                    flush=True,
+                )
+                return current_max
+        time.sleep(1)
+    print(
+        f"[{profile_label}] No new Black order id appeared after Place "
+        f"(snapshot {min_order_id}, last seen max {last_seen}).",
+        flush=True,
+    )
+    return None
+
+
 def _read_black_top_order_row(
     driver: webdriver.Remote,
     profile_label: str,
@@ -2961,22 +3023,20 @@ def place_black_bet(session: dict, signal) -> dict:
             ) from exc
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
         _set_black_betslip_price_and_place(driver, signal.odds, profile_label, stake=stake_value)
-        status_result = _read_black_top_order_row(
-            driver,
-            profile_label,
-            home_team=team_name,
-            expected_stake=stake_value if isinstance(stake_value, Decimal) else None,
-            min_order_id=pre_bet_max_order_id,
-        )
+        # Just remember the new order id. Order ids are monotonic and only one bet is
+        # placed at a time under the bet lock, so the new max id is unambiguously ours.
+        # The actual status/price are intentionally NOT read here — the Telegram layer
+        # waits ~5 minutes and then looks up this exact order id.
+        new_order_id = _capture_new_black_order_id(driver, profile_label, pre_bet_max_order_id)
         return {
             "profile_label": profile_label,
-            "status": status_result["status"],
-            "accepted": status_result["accepted"],
-            "detail": status_result.get("detail", ""),
-            "fills": status_result.get("fills", []),
-            "order_status": status_result.get("order_status", "Unknown"),
-            "order_stake": status_result.get("order_stake", "?"),
-            "order_id": status_result.get("order_id"),
+            "status": "placed" if new_order_id else "pending",
+            "accepted": False,
+            "detail": "",
+            "fills": [],
+            "order_status": "Unknown",
+            "order_stake": "?",
+            "order_id": new_order_id,
             "teams": getattr(signal, "teams", None) or team_name,
             "selection": getattr(signal, "selection_label", f"{signal.selection} {signal.line}"),
             "odds": str(signal.odds),
