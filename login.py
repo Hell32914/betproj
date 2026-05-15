@@ -1099,6 +1099,195 @@ def _confirm_black_place_order(driver: webdriver.Remote, profile_label: str) -> 
     print(f"[{profile_label}] Confirmed Black Place Order dialog.")
 
 
+def _open_black_top_orders(driver: webdriver.Remote, profile_label: str) -> bool:
+    target = driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0
+                && rect.x < window.innerWidth
+                && rect.y < window.innerHeight;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const orders = Array.from(document.querySelectorAll('button,a,[role="button"],div,span,li'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.y < 110)
+            .filter((item) => item.text === 'orders')
+            .sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y)[0];
+        return orders ? (orders.element.closest('button,a,[role="button"],li') || orders.element) : null;
+        """
+    )
+    if not target:
+        print(f"[{profile_label}] Could not find top Black Orders tab.")
+        return False
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", target)
+    except Exception:
+        pass
+
+    for attempt in (
+        lambda: target.click(),
+        lambda: ActionChains(driver).move_to_element(target).pause(0.1).click(target).perform(),
+        lambda: driver.execute_script("arguments[0].click();", target),
+    ):
+        try:
+            attempt()
+            if WebDriverWait(driver, 6).until(lambda browser: browser.execute_script(
+                """
+                const isVisible = (element) => {
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.right > 0;
+                };
+                const text = (document.body?.innerText || '').toLowerCase();
+                if ((window.location.pathname || '').toLowerCase().includes('/orders')) return true;
+                return text.includes('selection') && text.includes('status') && text.includes('stake') && text.includes('profit/loss');
+                """
+            )):
+                print(f"[{profile_label}] Opened Black top Orders view.")
+                return True
+        except Exception:
+            continue
+
+    print(f"[{profile_label}] Could not open Black top Orders view.")
+    return False
+
+
+def _normalize_black_order_status(raw_status: str) -> str:
+    normalized = (raw_status or '').strip().lower()
+    if normalized in {'reconciled', 'accepted', 'matched', 'confirmed', 'done', 'success'}:
+        return 'accepted'
+    if normalized in {'failed', 'rejected', 'declined'}:
+        return 'rejected'
+    if normalized in {'cancelled', 'canceled', 'void'}:
+        return 'cancelled'
+    if normalized in {'open', 'pending', 'processing'}:
+        return 'pending'
+    return 'unknown'
+
+
+def _read_black_top_order_row(driver: webdriver.Remote, profile_label: str, timeout: int = 15) -> dict:
+    if not _open_black_top_orders(driver, profile_label):
+        return {"status": "pending", "accepted": False, "detail": "Top Orders view not opened.", "order_status": "Unknown", "order_stake": "?"}
+
+    def read_row(browser: webdriver.Remote):
+        return browser.execute_script(
+            """
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0
+                    && rect.x < window.innerWidth
+                    && rect.y < window.innerHeight;
+            };
+            const textOf = (element) => (element.innerText || element.textContent || '').trim();
+            const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+
+            const tables = Array.from(document.querySelectorAll('table,div,section,main'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: normalize(textOf(element)).toLowerCase() }))
+                .filter((item) => item.text.includes('selection') && item.text.includes('status') && item.text.includes('stake'))
+                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+            const table = tables[0];
+            if (!table) return null;
+
+            const tableRows = Array.from(table.element.querySelectorAll('tr,[role="row"]'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: normalize(textOf(element)) }))
+                .filter((item) => item.rect.height > 24)
+                .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+
+            const headerRow = tableRows.find((item) => {
+                const lower = item.text.toLowerCase();
+                return lower.includes('selection') && lower.includes('status') && lower.includes('stake');
+            });
+
+            let dataRows = [];
+            if (tableRows.length >= 2 && headerRow) {
+                dataRows = tableRows.filter((item) => item.rect.y > headerRow.rect.bottom + 2 && item.text);
+            }
+
+            if (!dataRows.length) {
+                dataRows = Array.from(table.element.querySelectorAll('div,section,article'))
+                    .filter(isVisible)
+                    .map((element) => ({ element, rect: element.getBoundingClientRect(), text: normalize(textOf(element)) }))
+                    .filter((item) => item.rect.height > 26 && item.rect.width > table.rect.width * 0.6)
+                    .filter((item) => item.rect.y > (headerRow ? headerRow.rect.bottom : table.rect.y + 30))
+                    .filter((item) => item.text && !item.text.toLowerCase().includes('selection status price stake'))
+                    .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+            }
+
+            const firstRow = dataRows[0];
+            if (!firstRow) return { ok: false, reason: 'orders-row-not-found', pageText: table.text.slice(0, 600) };
+
+            const rowText = firstRow.text;
+            const statusMatch = rowText.match(/\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed)\b/i);
+            const euroMatches = Array.from(rowText.matchAll(/€\\s*\\d+(?:[.,]\\d+)?/g)).map((match) => match[0]);
+            let stake = euroMatches[0] || '';
+
+            const directCells = Array.from(firstRow.element.children || [])
+                .filter(isVisible)
+                .map((element) => normalize(textOf(element)))
+                .filter(Boolean);
+            if (directCells.length >= 5) {
+                const maybeStake = directCells.find((value, index) => index >= 3 && /€\\s*\\d+(?:[.,]\\d+)?/.test(value));
+                if (maybeStake) stake = maybeStake.match(/€\\s*\\d+(?:[.,]\\d+)?/)[0];
+            }
+
+            return {
+                ok: true,
+                status: statusMatch ? statusMatch[1] : 'Unknown',
+                stake: stake || '?',
+                rowText: rowText.slice(0, 500),
+            };
+            """
+        )
+
+    row_data = None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        row_data = read_row(driver)
+        if row_data and row_data.get("ok") and row_data.get("status") and row_data.get("stake"):
+            break
+        time.sleep(1)
+
+    if not row_data or not row_data.get("ok"):
+        detail = ((row_data or {}).get("pageText") or "Top order row not found.")[:250]
+        print(f"[{profile_label}] Could not read Black top order row. {detail}")
+        return {"status": "pending", "accepted": False, "detail": detail, "order_status": "Unknown", "order_stake": "?"}
+
+    raw_status = row_data.get("status") or "Unknown"
+    stake = row_data.get("stake") or "?"
+    detail = row_data.get("rowText") or ""
+    normalized_status = _normalize_black_order_status(raw_status)
+    print(f"[{profile_label}] Black top order row: status={raw_status}, stake={stake}.")
+    return {
+        "status": normalized_status,
+        "accepted": normalized_status == "accepted",
+        "detail": detail,
+        "order_status": raw_status,
+        "order_stake": stake,
+    }
+
+
 def _open_black_orders_view(driver: webdriver.Remote, profile_label: str) -> bool:
     def locate_orders_target() -> object:
         return driver.execute_script(
@@ -2395,14 +2584,15 @@ def place_black_bet(session: dict, signal) -> dict:
         _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
         _set_black_betslip_price_and_place(driver, signal.odds, profile_label, stake=stake_value)
-        _open_black_orders_view(driver, profile_label)
-        status_result = _monitor_black_bet_status(driver, signal, profile_label)
+        status_result = _read_black_top_order_row(driver, profile_label)
         return {
             "profile_label": profile_label,
             "status": status_result["status"],
             "accepted": status_result["accepted"],
             "detail": status_result.get("detail", ""),
             "fills": status_result.get("fills", []),
+            "order_status": status_result.get("order_status", "Unknown"),
+            "order_stake": status_result.get("order_stake", "?"),
             "teams": getattr(signal, "teams", None) or team_name,
             "selection": getattr(signal, "selection_label", f"{signal.selection} {signal.line}"),
             "odds": str(signal.odds),

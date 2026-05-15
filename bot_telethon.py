@@ -10,6 +10,7 @@ Usage:
 
 import os
 import asyncio
+import re
 import sys
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -150,7 +151,21 @@ def _sanitize_telegram_detail(detail: str, limit: int = 220) -> str:
     return compact[:limit]
 
 
+def _format_teams_vs_label(teams: str) -> str:
+    normalized = " ".join((teams or "unknown match").split())
+    normalized = re.sub(r"\s+[Vv][Ss]\.?\s+", " vs ", normalized)
+    return normalized
+
+
 def _format_signal_result_message(result: dict) -> str:
+    order_status = (result.get("order_status") or "").strip()
+    order_stake = (result.get("order_stake") or "").strip()
+    if order_status or order_stake:
+        teams_label = _format_teams_vs_label(result.get("teams") or "unknown match")
+        stake_label = order_stake or "?"
+        status_label = order_status or result.get("status", "unknown")
+        return f"Ставка: {teams_label} | сумма {stake_label} | статус {status_label}"
+
     status = result.get("status", "unknown")
     label = {
         "accepted": "Ставка принята",
