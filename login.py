@@ -1206,6 +1206,11 @@ def _verify_black_betslip_target(
         const lineVariants = arguments[1].map((value) => value.toLowerCase());
         const homeTeam = (arguments[2] || '').trim().toLowerCase();
         const awayTeam = (arguments[3] || '').trim().toLowerCase();
+        const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&');
+        const hasExactLineToken = (text) => lineVariants.some((line) => {
+            const pattern = new RegExp(`(^|[^\\d/])${escapeRegExp(line)}([^\\d/]|$)`);
+            return pattern.test(text);
+        });
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -1227,7 +1232,7 @@ def _verify_black_betslip_target(
 
         for (const panel of panels) {
             const text = panel.text;
-            const hasLine = lineVariants.some((line) => text.includes(line));
+            const hasLine = hasExactLineToken(text);
             const hasSelection = text.includes(selection);
             const hasHome = !homeTeam || text.includes(homeTeam);
             const hasAway = !awayTeam || text.includes(awayTeam);
@@ -1257,6 +1262,8 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
         const selection = arguments[0].trim().toLowerCase();
         const lineVariants = arguments[1].map((value) => value.toLowerCase());
         const preferLeft = Boolean(arguments[2]);
+        const normalizeNumber = (value) => (value || '').toLowerCase().replace(/\\s+/g, '').replace(',', '.');
+        const normalizedLineVariants = lineVariants.map(normalizeNumber);
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -1268,8 +1275,18 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-        const hasLine = (text) => lineVariants.some((line) => text.includes(line));
         const oddsPattern = /^\\d+(?:[.,]\\d+)+$/;
+        const linePattern = /^\\d+(?:[.,]\\d+)?$/;
+        const findExactLineCell = (rowElement) => {
+            const candidates = Array.from(rowElement.querySelectorAll('button,div,[role="button"],span,p,li'))
+                .filter(isVisible)
+                .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+                .filter((item) => item.text && item.text.length <= 12)
+                .filter((item) => linePattern.test(item.text));
+            return candidates
+                .filter((item) => normalizedLineVariants.includes(normalizeNumber(item.text)))
+                .sort((a, b) => a.rect.x - b.rect.x)[0] || null;
+        };
         const clickElement = (element) => {
             const clickable = element.closest('button,[role="button"]') || element;
             clickable.scrollIntoView({ block: 'center', inline: 'center' });
@@ -1322,10 +1339,11 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 .filter(isVisible)
                 .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
                 .filter((item) => item.rect.width > 280 && item.rect.height >= 24)
-                .filter((item) => hasLine(item.text) && item.text.includes(selection))
+                .map((item) => ({ ...item, lineCell: findExactLineCell(item.element) }))
+                .filter((item) => item.lineCell && item.text.includes(selection))
                 .map((item) => {
                     let score = 0;
-                    if (lineVariants.some((line) => item.text.includes(line + ' ' + selection))) score += 100;
+                    if (item.lineCell) score += 120;
                     if (item.text.includes('over') && item.text.includes('under')) score += 30;
                     if (oddsPattern.test(item.text.replace(selection, '').trim())) score += 15;
                     score += Math.min(item.rect.width, 800) / 20;
