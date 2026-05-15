@@ -56,6 +56,7 @@ async def refresh_stakes(state: RuntimeState) -> None:
         primary_session = next((session for session in state.sessions if session.get("login_enabled")), state.sessions[0])
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, lambda: refresh_black_default_stake(primary_session))
+        primary_session["stake"] = result
         state.stakes = {primary_session["profile_label"]: result}
         print(
             f"Default stake refreshed for {primary_session['profile_label']}: "

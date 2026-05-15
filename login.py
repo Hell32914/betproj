@@ -1437,11 +1437,17 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
     print(f"[{profile_label}] Selected Asian Total Goals {selection} {line}.")
 
 
-def _set_black_betslip_price_and_place(driver: webdriver.Remote, price: Decimal, profile_label: str) -> None:
+def _set_black_betslip_price_and_place(
+    driver: webdriver.Remote,
+    price: Decimal,
+    profile_label: str,
+    stake: str | None = None,
+) -> None:
     price_text = format(price.normalize(), "f")
-    result = driver.execute_script(
-        """
-        const price = arguments[0];
+    stake_text = (stake or "").strip()
+    sync_script = """
+        const desiredPrice = arguments[0];
+        const desiredStake = arguments[1] || '';
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -1453,55 +1459,171 @@ def _set_black_betslip_price_and_place(driver: webdriver.Remote, price: Decimal,
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const normalizeNumeric = (value) => {
+            let text = String(value ?? '').toLowerCase().replace(/\\s+/g, '').replace('€', '').replace(',', '.');
+            while (text.endsWith('0') && text.includes('.')) text = text.slice(0, -1);
+            if (text.endsWith('.')) text = text.slice(0, -1);
+            return text;
+        };
         const setInput = (input, value) => {
             input.focus({ preventScroll: true });
-            const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
+            input.select?.();
+            const prototype = window.HTMLInputElement?.prototype || input.__proto__;
+            const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set || Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
             if (setter) setter.call(input, value);
             else input.value = value;
             input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: value }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
-            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
-            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', code: 'Tab', bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Tab', code: 'Tab', bubbles: true }));
             input.blur();
+            return input.value || input.getAttribute('value') || '';
         };
-        const labels = Array.from(document.querySelectorAll('label,div,span,p'))
+        const panel = Array.from(document.querySelectorAll('aside,section,div'))
             .filter(isVisible)
-            .filter((element) => textOf(element) === 'price');
-        for (const label of labels) {
-            const labelRect = label.getBoundingClientRect();
-            const input = Array.from(document.querySelectorAll('input'))
-                .filter(isVisible)
-                .filter((element) => !element.disabled && !element.readOnly)
-                .map((element) => ({ element, rect: element.getBoundingClientRect() }))
-                .filter((item) => item.rect.y >= labelRect.y - 12 && item.rect.y < labelRect.y + 80)
-                .filter((item) => item.rect.x >= labelRect.x - 30 && item.rect.x < labelRect.x + 120)
-                .sort((a, b) => Math.abs(a.rect.x - labelRect.x) - Math.abs(b.rect.x - labelRect.x))[0]?.element;
-            if (input) {
-                setInput(input, price);
-                break;
-            }
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.x > window.innerWidth * 0.68)
+            .filter((item) => item.rect.width > 180 && item.rect.height > 160)
+            .filter((item) => item.text.includes('betslip'))
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+        if (!panel) {
+            return { ok: false, reason: 'betslip panel not found', text: document.body?.innerText || '' };
         }
-        const placeButton = Array.from(document.querySelectorAll('button,[role="button"]'))
+
+        const panelRect = panel.rect;
+        const inputs = Array.from(panel.element.querySelectorAll('input'))
+            .filter(isVisible)
+            .filter((element) => !element.disabled && !element.readOnly)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element.parentElement || element) }))
+            .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+
+        const findInputByLabel = (labelText, fallbackIndex) => {
+            const labels = Array.from(panel.element.querySelectorAll('label,div,span,p'))
+                .filter(isVisible)
+                .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+                .filter((item) => item.text === labelText)
+                .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+            for (const label of labels) {
+                const candidate = inputs
+                    .filter((item) => item.rect.y >= label.rect.y - 18 && item.rect.y <= label.rect.bottom + 45)
+                    .filter((item) => item.rect.x >= label.rect.x - 40)
+                    .sort((a, b) => Math.abs(a.rect.y - label.rect.y) - Math.abs(b.rect.y - label.rect.y) || Math.abs(a.rect.x - label.rect.x) - Math.abs(b.rect.x - label.rect.x))[0];
+                if (candidate) return candidate.element;
+            }
+            const rowInputs = inputs.filter((item) => item.rect.y > panelRect.top + 40 && item.rect.y < panelRect.top + 140);
+            if (rowInputs[fallbackIndex]) return rowInputs[fallbackIndex].element;
+            return inputs[fallbackIndex]?.element || null;
+        };
+
+        const stakeInput = findInputByLabel('stake', 0);
+        const priceInput = findInputByLabel('price', 1);
+        if (!priceInput) {
+            return { ok: false, reason: 'price input not found', text: panel.element.innerText || document.body?.innerText || '' };
+        }
+
+        let stakeValue = stakeInput ? (stakeInput.value || stakeInput.getAttribute('value') || '') : '';
+        if (stakeInput && desiredStake && normalizeNumeric(stakeValue) !== normalizeNumeric(desiredStake)) {
+            stakeValue = setInput(stakeInput, desiredStake);
+        }
+
+        let priceValue = priceInput.value || priceInput.getAttribute('value') || '';
+        if (normalizeNumeric(priceValue) !== normalizeNumeric(desiredPrice)) {
+            priceValue = setInput(priceInput, desiredPrice);
+        }
+
+        const placeButton = Array.from(panel.element.querySelectorAll('button,[role="button"]'))
             .filter(isVisible)
             .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
             .filter((item) => item.text === 'place' || item.text.includes('place'))
-            .sort((a, b) => b.rect.x - a.rect.x)[0]?.element;
-        if (!placeButton) return { ok: false, reason: 'place button not found', text: document.body?.innerText || '' };
+            .sort((a, b) => b.rect.y - a.rect.y || b.rect.x - a.rect.x)[0]?.element;
+        if (!placeButton) {
+            return { ok: false, reason: 'place button not found', text: panel.element.innerText || document.body?.innerText || '' };
+        }
+
+        return {
+            ok: true,
+            stakeValue,
+            priceValue,
+            placeReady: !(placeButton.disabled || placeButton.getAttribute('aria-disabled') === 'true'),
+            panelText: panel.element.innerText || '',
+        };
+    """
+    click_script = """
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const panel = Array.from(document.querySelectorAll('aside,section,div'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.x > window.innerWidth * 0.68)
+            .filter((item) => item.rect.width > 180 && item.rect.height > 160)
+            .filter((item) => item.text.includes('betslip'))
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+        if (!panel) return { ok: false, reason: 'betslip panel not found', text: document.body?.innerText || '' };
+
+        const placeButton = Array.from(panel.element.querySelectorAll('button,[role="button"]'))
+            .filter(isVisible)
+            .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+            .filter((item) => item.text === 'place' || item.text.includes('place'))
+            .sort((a, b) => b.rect.y - a.rect.y || b.rect.x - a.rect.x)[0]?.element;
+        if (!placeButton) return { ok: false, reason: 'place button not found', text: panel.element.innerText || document.body?.innerText || '' };
         if (placeButton.disabled || placeButton.getAttribute('aria-disabled') === 'true') {
-            return { ok: false, reason: 'place button disabled', text: document.body?.innerText || '' };
+            return { ok: false, reason: 'place button disabled', text: panel.element.innerText || document.body?.innerText || '' };
         }
-        for (const name of ['mousedown', 'mouseup', 'click']) {
-            placeButton.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+        placeButton.scrollIntoView({ block: 'center', inline: 'center' });
+        for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+            placeButton.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
         }
-        return { ok: true };
-        """,
-        price_text,
-    )
+        try { placeButton.click?.(); } catch (error) {}
+        return { ok: true, text: panel.element.innerText || '' };
+    """
+
+    result = driver.execute_script(sync_script, price_text, stake_text)
     if not result or not result.get("ok"):
         page_text = (result or {}).get("text", "")
-        short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:500]
-        raise RuntimeError(f"Could not click Black Place. Reason: {(result or {}).get('reason')}. Page: {short_text}")
-    print(f"[{profile_label}] Entered price {price_text} and clicked Place.")
+        short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
+        raise RuntimeError(f"Could not prepare Black betslip. Reason: {(result or {}).get('reason')}. Page: {short_text}")
+
+    normalized_price = format(Decimal(price_text).normalize(), "f")
+    normalized_stake = None
+    if stake_text:
+        normalized_stake = format(Decimal(stake_text).normalize(), "f")
+
+    def betslip_ready(browser: webdriver.Remote):
+        state = browser.execute_script(sync_script, price_text, stake_text)
+        if not state or not state.get("ok"):
+            return False
+        try:
+            current_price = format(_money_to_decimal(str(state.get("priceValue", ""))).normalize(), "f")
+        except Exception:
+            return False
+        if current_price != normalized_price:
+            return False
+        if normalized_stake is not None:
+            try:
+                current_stake = format(_money_to_decimal(str(state.get("stakeValue", ""))).normalize(), "f")
+            except Exception:
+                return False
+            if current_stake != normalized_stake:
+                return False
+        return state if state.get("placeReady") else False
+
+    ready_state = WebDriverWait(driver, 8).until(betslip_ready)
+    click_result = driver.execute_script(click_script)
+    if not click_result or not click_result.get("ok"):
+        page_text = (click_result or ready_state or {}).get("text", "")
+        short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
+        raise RuntimeError(f"Could not click Black Place. Reason: {(click_result or {}).get('reason')}. Page: {short_text}")
+    print(f"[{profile_label}] Entered stake {stake_text or 'existing'}, price {price_text} and clicked Place.")
 
 
 def _read_black_order_panel_text(driver: webdriver.Remote, tab_name: str | None = None) -> str:
@@ -1665,6 +1787,8 @@ def place_black_bet(session: dict, signal) -> dict:
     profile_label = session.get("profile_label", "Profile-1")
     team_name = getattr(signal, "home_team", None)
     opponent_name = getattr(signal, "away_team", None)
+    stake_info = session.get("stake") if isinstance(session.get("stake"), dict) else None
+    stake_value = stake_info.get("stake") if stake_info else None
     if not team_name:
         raise RuntimeError("Signal does not contain a first team name for Black search.")
 
@@ -1697,7 +1821,7 @@ def place_black_bet(session: dict, signal) -> dict:
         prefer_left = "loss" in getattr(signal, "raw_text", "").lower()
         _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
-        _set_black_betslip_price_and_place(driver, signal.odds, profile_label)
+        _set_black_betslip_price_and_place(driver, signal.odds, profile_label, stake=stake_value)
         status_result = _monitor_black_bet_status(driver, signal, profile_label)
         return {
             "profile_label": profile_label,
