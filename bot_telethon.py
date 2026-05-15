@@ -109,10 +109,36 @@ async def handle_signal(state: RuntimeState, text: str) -> None:
         primary_session = next((session for session in state.sessions if session.get("login_enabled")), state.sessions[0])
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, lambda: place_black_bet(primary_session, signal))
-            print("Black bet placement completed.", flush=True)
+            result = await loop.run_in_executor(None, lambda: place_black_bet(primary_session, signal))
+            print(f"Black bet placement completed with status: {result.get('status')}", flush=True)
         except Exception as exc:
             print(f"Black bet placement failed: {exc}", flush=True)
+
+
+def _format_signal_work_message(signal) -> str:
+    return (
+        f"Принял в работу: {signal.teams or 'unknown match'} | "
+        f"{signal.selection_label} | odds {signal.odds}"
+    )
+
+
+def _format_signal_result_message(result: dict) -> str:
+    status = result.get("status", "unknown")
+    label = {
+        "accepted": "Ставка принята",
+        "pending": "Ставка отправлена, но итоговый статус не подтвержден",
+        "rejected": "Ставка не принята",
+        "cancelled": "Ставка отменена",
+    }.get(status, f"Статус ставки: {status}")
+    detail = (result.get("detail") or "").strip()
+    detail = " | ".join(part.strip() for part in detail.splitlines() if part.strip())[:350]
+    message = (
+        f"{label}: {result.get('teams') or 'unknown match'} | "
+        f"{result.get('selection')} | odds {result.get('odds')}"
+    )
+    if detail:
+        message += f"\n{detail}"
+    return message
 
 
 async def main():
@@ -131,7 +157,27 @@ async def main():
                 name = "unknown"
             text = event.message.text or "<non-text message>"
             print(f"[MSG] {name}: {text}", flush=True)
-            asyncio.create_task(handle_signal(state, text))
+
+            signal = parse_betting_signal(text)
+            if signal is None:
+                return
+
+            await event.reply(_format_signal_work_message(signal))
+
+            async def process_signal_reply():
+                await state.ready.wait()
+                async with state.bet_lock:
+                    primary_session = next((session for session in state.sessions if session.get("login_enabled")), state.sessions[0])
+                    loop = asyncio.get_running_loop()
+                    try:
+                        result = await loop.run_in_executor(None, lambda: place_black_bet(primary_session, signal))
+                        print(f"Black bet placement completed with status: {result.get('status')}", flush=True)
+                        await event.reply(_format_signal_result_message(result))
+                    except Exception as exc:
+                        print(f"Black bet placement failed: {exc}", flush=True)
+                        await event.reply(f"Ставка не завершена: {exc}")
+
+            asyncio.create_task(process_signal_reply())
 
         adspower_task = asyncio.create_task(start_adspower_after_listener_ready(state))
         adspower_task.add_done_callback(report_adspower_task_result)

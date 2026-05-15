@@ -1404,7 +1404,164 @@ def _set_black_betslip_price_and_place(driver: webdriver.Remote, price: Decimal,
     print(f"[{profile_label}] Entered price {price_text} and clicked Place.")
 
 
-def place_black_bet(session: dict, signal) -> None:
+def _read_black_order_panel_text(driver: webdriver.Remote, tab_name: str | None = None) -> str:
+    if tab_name:
+        driver.execute_script(
+            """
+            const expected = arguments[0].trim().toLowerCase();
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0;
+            };
+            const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+            const panel = Array.from(document.querySelectorAll('aside,section,div'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                .filter((item) => item.rect.x > window.innerWidth * 0.68)
+                .filter((item) => item.rect.width > 180 && item.rect.height > 120)
+                .filter((item) => item.text.includes('betslip') || item.text.includes('recent orders') || item.text.includes('live orders'))
+                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0]?.element;
+            if (!panel) return false;
+
+            const candidates = Array.from(panel.querySelectorAll('button,[role="tab"],[role="button"],div,span'))
+                .filter(isVisible)
+                .filter((element) => textOf(element) === expected || textOf(element).includes(expected));
+            const target = candidates[0]?.closest('button,[role="tab"],[role="button"]') || candidates[0];
+            if (!target) return false;
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+                target.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
+            }
+            try { target.click?.(); } catch (error) {}
+            return true;
+            """,
+            tab_name,
+        )
+        time.sleep(0.4)
+
+    return driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const panel = Array.from(document.querySelectorAll('aside,section,div'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.x > window.innerWidth * 0.68)
+            .filter((item) => item.rect.width > 180 && item.rect.height > 120)
+            .filter((item) => item.text.includes('betslip') || item.text.includes('recent orders') || item.text.includes('live orders'))
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0]?.element;
+        return panel ? textOf(panel) : '';
+        """
+    ) or ""
+
+
+def _black_snapshot_matches_signal(snapshot_text: str, signal) -> bool:
+    text = (snapshot_text or "").lower()
+    if not text:
+        return False
+
+    team_name = (getattr(signal, "home_team", None) or "").lower()
+    opponent_name = (getattr(signal, "away_team", None) or "").lower()
+    selection = (getattr(signal, "selection", "") or "").lower()
+    line_variants = [value.lower() for value in _decimal_variants(getattr(signal, "line"))]
+
+    score = 0
+    if team_name and team_name in text:
+        score += 3
+    if opponent_name and opponent_name in text:
+        score += 3
+    if selection and selection in text:
+        score += 2
+    if any(line in text for line in line_variants):
+        score += 2
+    if "asian total goals" in text:
+        score += 2
+    return score >= 5
+
+
+def _classify_black_order_snapshot(snapshots: dict[str, str], signal) -> tuple[str, str]:
+    failure_words = ("cancel", "cancelled", "canceled", "reject", "rejected", "declined", "void", "failed", "not accepted")
+    pending_words = ("pending", "processing", "placing", "submitting")
+    success_words = ("accepted", "matched", "confirmed")
+
+    for tab_name in ("live orders", "recent orders", "betslip"):
+        text = snapshots.get(tab_name, "")
+        if not _black_snapshot_matches_signal(text, signal):
+            continue
+        if any(word in text for word in failure_words):
+            status = "cancelled" if "cancel" in text or "void" in text else "rejected"
+            return status, text[:500]
+        if any(word in text for word in success_words):
+            return "accepted", text[:500]
+        if tab_name in {"live orders", "recent orders"}:
+            return "accepted", text[:500]
+        if any(word in text for word in pending_words):
+            return "pending", text[:500]
+        if "stake" in text or "price" in text or "place" in text:
+            return "pending", text[:500]
+
+    betslip_text = snapshots.get("betslip", "")
+    if "less than min order" in betslip_text:
+        return "rejected", betslip_text[:500]
+    if "betslip is empty" in betslip_text and any(snapshots.get(name, "") for name in ("live orders", "recent orders")):
+        combined = " | ".join(filter(None, [snapshots.get("live orders", "")[:250], snapshots.get("recent orders", "")[:250]]))
+        if _black_snapshot_matches_signal(combined, signal):
+            return "accepted", combined[:500]
+    return "unknown", betslip_text[:500]
+
+
+def _monitor_black_bet_status(driver: webdriver.Remote, signal, profile_label: str, timeout: int = 40) -> dict:
+    deadline = time.monotonic() + timeout
+    accepted_at = None
+    last_detail = ""
+
+    while time.monotonic() < deadline:
+        snapshots = {
+            "betslip": _read_black_order_panel_text(driver, None),
+            "live orders": _read_black_order_panel_text(driver, "Live orders"),
+            "recent orders": _read_black_order_panel_text(driver, "Recent Orders"),
+        }
+        status, detail = _classify_black_order_snapshot(snapshots, signal)
+        last_detail = detail or last_detail
+
+        if status in {"cancelled", "rejected"}:
+            print(f"[{profile_label}] Black order status: {status}. {detail[:250]}")
+            return {"status": status, "detail": detail, "accepted": False}
+
+        if status == "accepted":
+            if accepted_at is None:
+                accepted_at = time.monotonic()
+            elif time.monotonic() - accepted_at >= 8:
+                print(f"[{profile_label}] Black order status: accepted. {detail[:250]}")
+                return {"status": "accepted", "detail": detail, "accepted": True}
+        else:
+            if accepted_at is None and status == "pending":
+                print(f"[{profile_label}] Black order status: pending.")
+
+        time.sleep(1)
+
+    final_status = "accepted" if accepted_at is not None else "pending"
+    print(f"[{profile_label}] Black order final monitor status: {final_status}. {last_detail[:250]}")
+    return {"status": final_status, "detail": last_detail, "accepted": final_status == "accepted"}
+
+
+def place_black_bet(session: dict, signal) -> dict:
     profile_label = session.get("profile_label", "Profile-1")
     team_name = getattr(signal, "home_team", None)
     opponent_name = getattr(signal, "away_team", None)
@@ -1441,6 +1598,16 @@ def place_black_bet(session: dict, signal) -> None:
         _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
         _set_black_betslip_price_and_place(driver, signal.odds, profile_label)
+        status_result = _monitor_black_bet_status(driver, signal, profile_label)
+        return {
+            "profile_label": profile_label,
+            "status": status_result["status"],
+            "accepted": status_result["accepted"],
+            "detail": status_result.get("detail", ""),
+            "teams": getattr(signal, "teams", None) or team_name,
+            "selection": getattr(signal, "selection_label", f"{signal.selection} {signal.line}"),
+            "odds": str(signal.odds),
+        }
     finally:
         close_driver_bridge(driver)
 
