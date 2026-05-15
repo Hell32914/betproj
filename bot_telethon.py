@@ -223,21 +223,46 @@ async def main():
 
             async def process_signal_reply():
                 await state.ready.wait()
-                async with state.bet_lock:
-                    primary_session = next((session for session in state.sessions if session.get("login_enabled")), state.sessions[0])
-                    loop = asyncio.get_running_loop()
-                    try:
-                        result = await loop.run_in_executor(None, lambda: place_black_bet(primary_session, signal))
-                        print(f"Black bet placement completed with status: {result.get('status')}", flush=True)
-                        await event.reply(_format_signal_result_message(result))
-                    except BlackSelectionMissingError as exc:
-                        print(f"Black bet placement gave up: {exc}", flush=True)
-                        await event.reply(
-                            "Ставка проверена 3 раза, нужная линия так и не появилась на сайте."
+                # Up to 3 attempts at placing the bet. If the Asian Total Goals line
+                # isn't on the site yet we release the bet lock between attempts so
+                # other queued signals can be placed in the meantime; the signal that
+                # is still waiting for its line just rejoins the queue after the pause.
+                selection_attempts = 3
+                selection_retry_pause = 90  # seconds — 3 attempts * 90s ≈ 4.5 min total
+                for attempt in range(1, selection_attempts + 1):
+                    async with state.bet_lock:
+                        primary_session = next(
+                            (session for session in state.sessions if session.get("login_enabled")),
+                            state.sessions[0],
                         )
-                    except Exception as exc:
-                        print(f"Black bet placement failed: {exc}", flush=True)
-                        await event.reply(f"Ставка не завершена: {exc}")
+                        loop = asyncio.get_running_loop()
+                        try:
+                            result = await loop.run_in_executor(
+                                None, lambda: place_black_bet(primary_session, signal)
+                            )
+                            print(
+                                f"Black bet placement completed with status: {result.get('status')}",
+                                flush=True,
+                            )
+                            await event.reply(_format_signal_result_message(result))
+                            return
+                        except BlackSelectionMissingError as exc:
+                            print(
+                                f"Black bet placement attempt {attempt}/{selection_attempts} "
+                                f"gave up on missing line: {exc}",
+                                flush=True,
+                            )
+                            if attempt == selection_attempts:
+                                await event.reply(
+                                    "Ставка проверена 3 раза, нужная линия так и не появилась на сайте."
+                                )
+                                return
+                        except Exception as exc:
+                            print(f"Black bet placement failed: {exc}", flush=True)
+                            await event.reply(f"Ставка не завершена: {exc}")
+                            return
+                    # Lock is released here so queued signals can place their bets while we wait.
+                    await asyncio.sleep(selection_retry_pause)
 
             asyncio.create_task(process_signal_reply())
 

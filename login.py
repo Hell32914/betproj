@@ -1342,14 +1342,14 @@ def _read_black_top_order_row(
                 };
             };
 
-            // Prefer the topmost row that matches the team and the expected stake.
+            // Prefer the topmost (most recently placed) row that matches the team. The site
+            // can silently reduce the stake (e.g. €0.97 -> €0.95), so DO NOT gate the team
+            // match on the expected stake — otherwise we fall through and pick an older row
+            // that happens to keep the original stake.
             if (homeTeam) {
                 const teamCandidates = dataRows.filter((item) => item.text.toLowerCase().includes(homeTeam));
-                for (const rowItem of teamCandidates) {
-                    const evaluated = evaluateRow(rowItem);
-                    if (!stakeVariants.length || stakeMatchesExpected(evaluated.stake)) {
-                        return { ok: true, matchedBy: 'team', ...evaluated };
-                    }
+                if (teamCandidates.length) {
+                    return { ok: true, matchedBy: 'team', ...evaluateRow(teamCandidates[0]) };
                 }
             }
             if (stakeVariants.length) {
@@ -2735,59 +2735,24 @@ def place_black_bet(session: dict, signal) -> dict:
         _wait_document_ready(driver)
         time.sleep(2)
         prefer_left = "loss" in getattr(signal, "raw_text", "").lower()
-        # If the Asian Total Goals market or the requested line isn't on the page yet, give it
-        # up to ~5 minutes by refreshing / re-entering the match up to 3 times before giving up.
-        selection_attempts = 3
-        selection_retry_pause = 90  # seconds between attempts (3 * 90s ≈ 4.5 minutes total)
-        last_selection_error: Exception | None = None
-        for attempt in range(1, selection_attempts + 1):
-            try:
-                WebDriverWait(driver, 20).until(
-                    lambda browser: "asian total goals" in _visible_text_lower(browser)
-                )
-                _ensure_black_betslip_safe_to_use(driver, profile_label)
-                _select_black_asian_total_goals(
-                    driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left
-                )
-                last_selection_error = None
-                break
-            except Exception as exc:
-                last_selection_error = exc
-                print(
-                    f"[{profile_label}] Asian Total Goals selection attempt {attempt}/"
-                    f"{selection_attempts} failed: {exc}",
-                    flush=True,
-                )
-                if attempt == selection_attempts:
-                    break
-                # Refresh / re-enter the match and try again.
-                try:
-                    time.sleep(selection_retry_pause)
-                    try:
-                        driver.refresh()
-                    except Exception:
-                        pass
-                    _wait_document_ready(driver)
-                    time.sleep(3)
-                    if not _black_match_context_matches(driver, team_name, opponent_name):
-                        # Page navigated away; reopen via search.
-                        _open_black_search(driver, profile_label)
-                        _search_black_live_events(driver, team_name, profile_label)
-                        _open_black_live_match(driver, team_name, opponent_name, profile_label)
-                        _wait_document_ready(driver)
-                        time.sleep(2)
-                except Exception as recovery_exc:
-                    print(
-                        f"[{profile_label}] Recovery before retry {attempt + 1} failed: "
-                        f"{recovery_exc}",
-                        flush=True,
-                    )
-        if last_selection_error is not None:
-            raise BlackSelectionMissingError(
-                f"Asian Total Goals {signal.selection} {signal.line} was not available after "
-                f"{selection_attempts} attempts for {team_name} vs {opponent_name or '?'}: "
-                f"{last_selection_error}"
+        # Single attempt at picking the Asian Total Goals line. If the market or the
+        # requested line isn't on the page yet, raise BlackSelectionMissingError so the
+        # caller (bot_telethon) can release the bet lock, let queued signals run, and
+        # retry this signal later. Doing the retries here would block other bets for ~5
+        # minutes.
+        try:
+            WebDriverWait(driver, 20).until(
+                lambda browser: "asian total goals" in _visible_text_lower(browser)
             )
+            _ensure_black_betslip_safe_to_use(driver, profile_label)
+            _select_black_asian_total_goals(
+                driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left
+            )
+        except Exception as exc:
+            raise BlackSelectionMissingError(
+                f"Asian Total Goals {signal.selection} {signal.line} not available for "
+                f"{team_name} vs {opponent_name or '?'}: {exc}"
+            ) from exc
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
         _set_black_betslip_price_and_place(driver, signal.odds, profile_label, stake=stake_value)
         status_result = _read_black_top_order_row(
