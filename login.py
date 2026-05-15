@@ -1445,9 +1445,7 @@ def _set_black_betslip_price_and_place(
 ) -> None:
     price_text = format(price.normalize(), "f")
     stake_text = (stake or "").strip()
-    sync_script = """
-        const desiredPrice = arguments[0];
-        const desiredStake = arguments[1] || '';
+    locate_script = """
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -1459,26 +1457,6 @@ def _set_black_betslip_price_and_place(
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-        const normalizeNumeric = (value) => {
-            let text = String(value ?? '').toLowerCase().replace(/\\s+/g, '').replace('€', '').replace(',', '.');
-            while (text.endsWith('0') && text.includes('.')) text = text.slice(0, -1);
-            if (text.endsWith('.')) text = text.slice(0, -1);
-            return text;
-        };
-        const setInput = (input, value) => {
-            input.focus({ preventScroll: true });
-            input.select?.();
-            const prototype = window.HTMLInputElement?.prototype || input.__proto__;
-            const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set || Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
-            if (setter) setter.call(input, value);
-            else input.value = value;
-            input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: value }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', code: 'Tab', bubbles: true }));
-            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Tab', code: 'Tab', bubbles: true }));
-            input.blur();
-            return input.value || input.getAttribute('value') || '';
-        };
         const panel = Array.from(document.querySelectorAll('aside,section,div'))
             .filter(isVisible)
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
@@ -1517,81 +1495,62 @@ def _set_black_betslip_price_and_place(
 
         const stakeInput = findInputByLabel('stake', 0);
         const priceInput = findInputByLabel('price', 1);
-        if (!priceInput) {
-            return { ok: false, reason: 'price input not found', text: panel.element.innerText || document.body?.innerText || '' };
-        }
-
-        let stakeValue = stakeInput ? (stakeInput.value || stakeInput.getAttribute('value') || '') : '';
-        if (stakeInput && desiredStake && normalizeNumeric(stakeValue) !== normalizeNumeric(desiredStake)) {
-            stakeValue = setInput(stakeInput, desiredStake);
-        }
-
-        let priceValue = priceInput.value || priceInput.getAttribute('value') || '';
-        if (normalizeNumeric(priceValue) !== normalizeNumeric(desiredPrice)) {
-            priceValue = setInput(priceInput, desiredPrice);
-        }
-
         const placeButton = Array.from(panel.element.querySelectorAll('button,[role="button"]'))
             .filter(isVisible)
             .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
             .filter((item) => item.text === 'place' || item.text.includes('place'))
             .sort((a, b) => b.rect.y - a.rect.y || b.rect.x - a.rect.x)[0]?.element;
-        if (!placeButton) {
-            return { ok: false, reason: 'place button not found', text: panel.element.innerText || document.body?.innerText || '' };
-        }
-
         return {
             ok: true,
-            stakeValue,
-            priceValue,
-            placeReady: !(placeButton.disabled || placeButton.getAttribute('aria-disabled') === 'true'),
-            panelText: panel.element.innerText || '',
+            panel: panel.element,
+            stakeInput,
+            priceInput,
+            placeButton,
+            panelText: panel.element.innerText || document.body?.innerText || '',
         };
     """
-    click_script = """
-        const isVisible = (element) => {
-            const style = window.getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            return style.display !== 'none'
-                && style.visibility !== 'hidden'
-                && rect.width > 0
-                && rect.height > 0
-                && rect.bottom > 0
-                && rect.right > 0;
-        };
-        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
-        const panel = Array.from(document.querySelectorAll('aside,section,div'))
-            .filter(isVisible)
-            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-            .filter((item) => item.rect.x > window.innerWidth * 0.68)
-            .filter((item) => item.rect.width > 180 && item.rect.height > 160)
-            .filter((item) => item.text.includes('betslip'))
-            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
-        if (!panel) return { ok: false, reason: 'betslip panel not found', text: document.body?.innerText || '' };
+    def normalized_decimal_text(raw_value: str) -> str:
+        return format(_money_to_decimal(raw_value).normalize(), "f")
 
-        const placeButton = Array.from(panel.element.querySelectorAll('button,[role="button"]'))
-            .filter(isVisible)
-            .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
-            .filter((item) => item.text === 'place' || item.text.includes('place'))
-            .sort((a, b) => b.rect.y - a.rect.y || b.rect.x - a.rect.x)[0]?.element;
-        if (!placeButton) return { ok: false, reason: 'place button not found', text: panel.element.innerText || document.body?.innerText || '' };
-        if (placeButton.disabled || placeButton.getAttribute('aria-disabled') === 'true') {
-            return { ok: false, reason: 'place button disabled', text: panel.element.innerText || document.body?.innerText || '' };
-        }
-        placeButton.scrollIntoView({ block: 'center', inline: 'center' });
-        for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-            const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
-            placeButton.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
-        }
-        try { placeButton.click?.(); } catch (error) {}
-        return { ok: true, text: panel.element.innerText || '' };
-    """
+    def locate_controls() -> dict:
+        controls = driver.execute_script(locate_script)
+        if not controls or not controls.get("ok"):
+            page_text = (controls or {}).get("text", "")
+            short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
+            raise RuntimeError(f"Could not prepare Black betslip. Reason: {(controls or {}).get('reason')}. Page: {short_text}")
+        return controls
 
-    result = driver.execute_script(sync_script, price_text, stake_text)
+    result = locate_controls()
     if not result or not result.get("ok"):
         page_text = (result or {}).get("text", "")
         short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
         raise RuntimeError(f"Could not prepare Black betslip. Reason: {(result or {}).get('reason')}. Page: {short_text}")
+
+    price_input = result.get("priceInput")
+    if not price_input:
+        short_text = " | ".join(line.strip() for line in (result.get("panelText", "") or "").splitlines() if line.strip())[:700]
+        raise RuntimeError(f"Could not prepare Black betslip. Reason: price input not found. Page: {short_text}")
+
+    stake_input = result.get("stakeInput")
+    place_button = result.get("placeButton")
+    if not place_button:
+        short_text = " | ".join(line.strip() for line in (result.get("panelText", "") or "").splitlines() if line.strip())[:700]
+        raise RuntimeError(f"Could not click Black Place. Reason: place button not found. Page: {short_text}")
+
+    if stake_input and stake_text:
+        _set_input_value(driver, stake_input, stake_text)
+        try:
+            stake_input.send_keys(Keys.TAB)
+        except Exception:
+            driver.execute_script("arguments[0].blur();", stake_input)
+        time.sleep(0.2)
+
+    _set_input_value(driver, price_input, price_text)
+    try:
+        price_input.send_keys(Keys.TAB)
+    except Exception:
+        driver.execute_script("arguments[0].blur();", price_input)
+    time.sleep(0.3)
 
     normalized_price = format(Decimal(price_text).normalize(), "f")
     normalized_stake = None
@@ -1599,30 +1558,43 @@ def _set_black_betslip_price_and_place(
         normalized_stake = format(Decimal(stake_text).normalize(), "f")
 
     def betslip_ready(browser: webdriver.Remote):
-        state = browser.execute_script(sync_script, price_text, stake_text)
+        state = browser.execute_script(locate_script)
         if not state or not state.get("ok"):
             return False
+        current_price_input = state.get("priceInput")
+        current_place_button = state.get("placeButton")
+        if not current_price_input or not current_place_button:
+            return False
         try:
-            current_price = format(_money_to_decimal(str(state.get("priceValue", ""))).normalize(), "f")
+            current_price = normalized_decimal_text(current_price_input.get_attribute("value") or "")
         except Exception:
             return False
         if current_price != normalized_price:
             return False
         if normalized_stake is not None:
+            current_stake_input = state.get("stakeInput")
+            if not current_stake_input:
+                return False
             try:
-                current_stake = format(_money_to_decimal(str(state.get("stakeValue", ""))).normalize(), "f")
+                current_stake = normalized_decimal_text(current_stake_input.get_attribute("value") or "")
             except Exception:
                 return False
             if current_stake != normalized_stake:
                 return False
-        return state if state.get("placeReady") else False
+        if not current_place_button.is_enabled() or current_place_button.get_attribute("aria-disabled") == "true":
+            return False
+        return state
 
     ready_state = WebDriverWait(driver, 8).until(betslip_ready)
-    click_result = driver.execute_script(click_script)
-    if not click_result or not click_result.get("ok"):
-        page_text = (click_result or ready_state or {}).get("text", "")
-        short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
-        raise RuntimeError(f"Could not click Black Place. Reason: {(click_result or {}).get('reason')}. Page: {short_text}")
+    ready_place_button = ready_state.get("placeButton")
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", ready_place_button)
+    try:
+        ready_place_button.click()
+    except Exception:
+        try:
+            ActionChains(driver).move_to_element(ready_place_button).click().perform()
+        except Exception:
+            driver.execute_script("arguments[0].click();", ready_place_button)
     print(f"[{profile_label}] Entered stake {stake_text or 'existing'}, price {price_text} and clicked Place.")
 
 
