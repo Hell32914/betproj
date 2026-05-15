@@ -1377,7 +1377,9 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
                 clickable.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
             }
-            try { clickable.click?.(); } catch (error) {}
+            try {
+                if (typeof clickable.click === 'function') clickable.click();
+            } catch (error) {}
         };
         const descendants = (root, selector) => Array.from(root.querySelectorAll(selector)).filter(isVisible);
         const findExactLineCell = (rowElement) => {
