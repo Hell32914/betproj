@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
-from login import place_black_bet, refresh_black_default_stake, run_all_profiles
+from login import keep_black_session_alive, place_black_bet, refresh_black_default_stake, run_all_profiles
 from signals import parse_betting_signal
 
 load_dotenv()
@@ -29,6 +29,7 @@ API_ID = int(os.getenv("TG_API_ID"))
 API_HASH = os.getenv("TG_API_HASH")
 GROUP_ID = int(os.getenv("TG_GR_ID"))
 ADSPOWER_PROFILE_COUNT = int(os.getenv("ADSPOWER_PROFILE_COUNT", "2"))
+BLACK_KEEPALIVE_SECONDS = 20 * 60
 
 
 class RuntimeState:
@@ -71,6 +72,22 @@ async def refresh_stakes_daily(state: RuntimeState) -> None:
             await refresh_stakes(state)
         except Exception as exc:
             print(f"Stake refresh failed: {exc}", flush=True)
+
+
+async def keep_black_session_active(state: RuntimeState) -> None:
+    await state.ready.wait()
+    while True:
+        await asyncio.sleep(BLACK_KEEPALIVE_SECONDS)
+        async with state.bet_lock:
+            if not state.sessions:
+                continue
+            primary_session = next((session for session in state.sessions if session.get("login_enabled")), state.sessions[0])
+            loop = asyncio.get_running_loop()
+            try:
+                result = await loop.run_in_executor(None, lambda: keep_black_session_alive(primary_session))
+                print(f"Black keepalive completed: {result.get('status')}.", flush=True)
+            except Exception as exc:
+                print(f"Black keepalive failed: {exc}", flush=True)
 
 
 async def start_adspower_after_listener_ready(state: RuntimeState) -> None:
@@ -182,6 +199,7 @@ async def main():
         adspower_task = asyncio.create_task(start_adspower_after_listener_ready(state))
         adspower_task.add_done_callback(report_adspower_task_result)
         asyncio.create_task(refresh_stakes_daily(state))
+        asyncio.create_task(keep_black_session_active(state))
 
         await client.run_until_disconnected()
 

@@ -2082,6 +2082,83 @@ def _login_black(driver: webdriver.Remote, profile_label: str) -> None:
     print(f"[{profile_label}] Black login complete: {driver.current_url}")
 
 
+def _ensure_black_session_ready(driver: webdriver.Remote, profile_label: str) -> bool:
+    current_url = (driver.current_url or "").lower()
+    if BLACK_URL_PART in current_url:
+        _wait_document_ready(driver)
+        time.sleep(1)
+        if _black_appears_logged_in(driver):
+            print(f"[{profile_label}] Reusing active Black session: {driver.current_url}")
+            return True
+
+    if BLACK_URL_PART not in current_url:
+        driver.get(BLACK_SPORTSBOOK_URL)
+        _wait_document_ready(driver)
+        time.sleep(2)
+        if _black_appears_logged_in(driver):
+            print(f"[{profile_label}] Active Black session recovered after sportsbook open: {driver.current_url}")
+            return True
+
+    return False
+
+
+def keep_black_session_alive(session: dict) -> dict:
+    profile_label = session.get("profile_label", "Profile-1")
+    driver = None
+    try:
+        driver = connect_to_browser(session["browser_info"], profile_label)
+        current_url = (driver.current_url or "").lower()
+        if BLACK_URL_PART not in current_url:
+            driver.get(BLACK_SPORTSBOOK_URL)
+            _wait_document_ready(driver)
+            time.sleep(2)
+
+        if not _ensure_black_session_ready(driver, profile_label):
+            raise RuntimeError("Black session is no longer active.")
+
+        result = driver.execute_script(
+            """
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0;
+            };
+            const dispatchMove = (target, x, y) => {
+                if (!target) return false;
+                const events = ['pointerover', 'mouseover', 'pointermove', 'mousemove'];
+                for (const name of events) {
+                    const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+                    target.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
+                }
+                return true;
+            };
+            const candidates = Array.from(document.querySelectorAll('main,section,div,button,a,[role="button"]'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim().toLowerCase() }))
+                .filter((item) => item.rect.y > 70 && item.rect.x < window.innerWidth * 0.85)
+                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+            const target = candidates[0]?.element || document.body;
+            const rect = (target.getBoundingClientRect && target.getBoundingClientRect()) || { x: 100, y: 100, width: 50, height: 50 };
+            const x = rect.x + Math.max(10, Math.min(rect.width / 2, 80));
+            const y = rect.y + Math.max(10, Math.min(rect.height / 2, 80));
+            target.scrollIntoView?.({ block: 'center', inline: 'center' });
+            dispatchMove(target, x, y);
+            window.dispatchEvent(new Event('focus'));
+            document.dispatchEvent(new Event('visibilitychange'));
+            return { ok: true, url: window.location.href, text: (target.innerText || target.textContent || '').trim().slice(0, 120) };
+            """
+        )
+        print(f"[{profile_label}] Black keepalive ping sent.")
+        return {"status": "alive", "detail": (result or {}).get("url", driver.current_url)}
+    finally:
+        close_driver_bridge(driver)
+
+
 def login(driver: webdriver.Remote, profile_label: str) -> None:
     """Perform BetInAsia portal login, open Black, then perform Black login."""
     time.sleep(2)
@@ -2115,14 +2192,15 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
         time.sleep(4)
 
         driver = connect_to_browser(browser_info, profile_label)
-        open_login_tab(driver, profile_label)
-        close_driver_bridge(driver)
-        driver = None
+        if not _ensure_black_session_ready(driver, profile_label):
+            open_login_tab(driver, profile_label)
+            close_driver_bridge(driver)
+            driver = None
 
-        time.sleep(2)
-        print(f"[{profile_label}] Reconnecting after opening tab...")
-        driver = connect_to_browser(browser_info, profile_label)
-        login(driver, profile_label)
+            time.sleep(2)
+            print(f"[{profile_label}] Reconnecting after opening tab...")
+            driver = connect_to_browser(browser_info, profile_label)
+            login(driver, profile_label)
         stake_result = None
         try:
             stake_result = update_black_default_stake(driver, profile_label)
