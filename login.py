@@ -319,10 +319,37 @@ def _find_first_clickable(driver: webdriver.Remote, selectors: list[tuple[str, s
 
 def _set_input_value(driver: webdriver.Remote, element, value: str) -> None:
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-    element.click()
-    element.send_keys(Keys.CONTROL, "a")
-    element.send_keys(Keys.BACKSPACE)
-    element.send_keys(value)
+    try:
+        driver.execute_script(
+            """
+            const input = arguments[0];
+            input.focus({ preventScroll: true });
+            input.click?.();
+            """,
+            element,
+        )
+    except Exception:
+        pass
+
+    try:
+        element.send_keys(Keys.CONTROL, "a")
+        element.send_keys(Keys.BACKSPACE)
+        element.send_keys(value)
+    except Exception:
+        driver.execute_script(
+            """
+            const input = arguments[0];
+            const value = arguments[1];
+            input.focus({ preventScroll: true });
+            const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
+            if (setter) setter.call(input, value);
+            else input.value = value;
+            input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: value }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            """,
+            element,
+            value,
+        )
 
     current_value = element.get_attribute("value") or ""
     if current_value == value:
