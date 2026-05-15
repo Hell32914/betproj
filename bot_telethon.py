@@ -16,7 +16,13 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
-from login import keep_black_session_alive, place_black_bet, refresh_black_default_stake, run_all_profiles
+from login import (
+    BlackSelectionMissingError,
+    keep_black_session_alive,
+    place_black_bet,
+    refresh_black_default_stake,
+    run_all_profiles,
+)
 from signals import parse_betting_signal
 
 load_dotenv()
@@ -224,6 +230,11 @@ async def main():
                         result = await loop.run_in_executor(None, lambda: place_black_bet(primary_session, signal))
                         print(f"Black bet placement completed with status: {result.get('status')}", flush=True)
                         await event.reply(_format_signal_result_message(result))
+                    except BlackSelectionMissingError as exc:
+                        print(f"Black bet placement gave up: {exc}", flush=True)
+                        await event.reply(
+                            "Ставка проверена 3 раза, нужная линия так и не появилась на сайте."
+                        )
                     except Exception as exc:
                         print(f"Black bet placement failed: {exc}", flush=True)
                         await event.reply(f"Ставка не завершена: {exc}")

@@ -1231,15 +1231,36 @@ def _normalize_black_order_status(raw_status: str) -> str:
     return 'unknown'
 
 
-def _read_black_top_order_row(driver: webdriver.Remote, profile_label: str, timeout: int = 15) -> dict:
+class BlackSelectionMissingError(RuntimeError):
+    """Raised when the requested Asian Total Goals selection never shows up on the match page after retries."""
+
+
+def _read_black_top_order_row(
+    driver: webdriver.Remote,
+    profile_label: str,
+    timeout: int = 15,
+    home_team: str | None = None,
+    expected_stake: Decimal | None = None,
+) -> dict:
     if not _open_black_top_orders(driver, profile_label):
         return {"status": "pending", "accepted": False, "detail": "Top Orders view not opened.", "order_status": "Unknown", "order_stake": "?"}
 
     time.sleep(6)
 
+    home_team_lower = (home_team or "").strip().lower()
+    if expected_stake is not None:
+        try:
+            expected_stake_variants = _decimal_variants(expected_stake)
+        except Exception:
+            expected_stake_variants = []
+    else:
+        expected_stake_variants = []
+
     def read_row(browser: webdriver.Remote):
         return browser.execute_script(
             """
+            const homeTeam = (arguments[0] || '').toLowerCase();
+            const stakeVariants = (arguments[1] || []).map((value) => String(value).toLowerCase());
             const isVisible = (element) => {
                 const style = window.getComputedStyle(element);
                 const rect = element.getBoundingClientRect();
@@ -1289,38 +1310,78 @@ def _read_black_top_order_row(driver: webdriver.Remote, profile_label: str, time
                     .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
             }
 
+            const stakeMatchesExpected = (stakeText) => {
+                if (!stakeText) return false;
+                if (!stakeVariants.length) return true;
+                const lowered = stakeText.toLowerCase();
+                return stakeVariants.some((variant) => variant && lowered.includes(variant));
+            };
+
+            const pickStake = (rowEl, rowText) => {
+                const euroMatches = Array.from(rowText.matchAll(/\u20ac\\s*\\d+(?:[.,]\\d+)?/g)).map((match) => match[0]);
+                let stake = euroMatches[0] || '';
+                const directCells = Array.from(rowEl.children || [])
+                    .filter(isVisible)
+                    .map((element) => normalize(textOf(element)))
+                    .filter(Boolean);
+                if (directCells.length >= 5) {
+                    const cellStake = directCells.find((value, index) => index >= 3 && /\u20ac\\s*\\d+(?:[.,]\\d+)?/.test(value));
+                    if (cellStake) stake = cellStake.match(/\u20ac\\s*\\d+(?:[.,]\\d+)?/)[0];
+                }
+                return stake;
+            };
+
+            const evaluateRow = (rowItem) => {
+                const rowText = rowItem.text;
+                const statusMatch = rowText.match(/\\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done)\\b/i);
+                const stake = pickStake(rowItem.element, rowText);
+                return {
+                    status: statusMatch ? statusMatch[1] : 'Unknown',
+                    stake: stake || '?',
+                    rowText: rowText.slice(0, 500),
+                };
+            };
+
+            // Prefer the topmost row that matches the team and the expected stake.
+            if (homeTeam) {
+                const teamCandidates = dataRows.filter((item) => item.text.toLowerCase().includes(homeTeam));
+                for (const rowItem of teamCandidates) {
+                    const evaluated = evaluateRow(rowItem);
+                    if (!stakeVariants.length || stakeMatchesExpected(evaluated.stake)) {
+                        return { ok: true, matchedBy: 'team', ...evaluated };
+                    }
+                }
+            }
+            if (stakeVariants.length) {
+                for (const rowItem of dataRows) {
+                    const evaluated = evaluateRow(rowItem);
+                    if (stakeMatchesExpected(evaluated.stake)) {
+                        return { ok: true, matchedBy: 'stake', ...evaluated };
+                    }
+                }
+            }
             const firstRow = dataRows[0];
             if (!firstRow) return { ok: false, reason: 'orders-row-not-found', pageText: table.text.slice(0, 600) };
-
-            const rowText = firstRow.text;
-            const statusMatch = rowText.match(/\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed)\b/i);
-            const euroMatches = Array.from(rowText.matchAll(/€\\s*\\d+(?:[.,]\\d+)?/g)).map((match) => match[0]);
-            let stake = euroMatches[0] || '';
-
-            const directCells = Array.from(firstRow.element.children || [])
-                .filter(isVisible)
-                .map((element) => normalize(textOf(element)))
-                .filter(Boolean);
-            if (directCells.length >= 5) {
-                const maybeStake = directCells.find((value, index) => index >= 3 && /€\\s*\\d+(?:[.,]\\d+)?/.test(value));
-                if (maybeStake) stake = maybeStake.match(/€\\s*\\d+(?:[.,]\\d+)?/)[0];
-            }
-
-            return {
-                ok: true,
-                status: statusMatch ? statusMatch[1] : 'Unknown',
-                stake: stake || '?',
-                rowText: rowText.slice(0, 500),
-            };
-            """
+            return { ok: true, matchedBy: 'top', ...evaluateRow(firstRow) };
+            """,
+            home_team_lower,
+            expected_stake_variants,
         )
 
     row_data = None
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         row_data = read_row(driver)
-        if row_data and row_data.get("ok") and row_data.get("status") and row_data.get("stake"):
-            break
+        ok_basic = row_data and row_data.get("ok") and row_data.get("status") and row_data.get("stake")
+        # Keep polling while the wanted row hasn't arrived yet: either team didn't match,
+        # or expected stake didn't match, or status is still 'Unknown'.
+        if ok_basic:
+            matched_by = row_data.get("matchedBy")
+            status_ok = row_data.get("status") != "Unknown"
+            team_ok = (not home_team_lower) or matched_by in {"team", "stake"} or status_ok
+            stake_ok = (not expected_stake_variants) or matched_by in {"team", "stake"}
+            if status_ok and team_ok and stake_ok:
+                break
         time.sleep(1)
 
     if not row_data or not row_data.get("ok"):
@@ -1332,7 +1393,10 @@ def _read_black_top_order_row(driver: webdriver.Remote, profile_label: str, time
     stake = row_data.get("stake") or "?"
     detail = row_data.get("rowText") or ""
     normalized_status = _normalize_black_order_status(raw_status)
-    print(f"[{profile_label}] Black top order row: status={raw_status}, stake={stake}.")
+    print(
+        f"[{profile_label}] Black top order row: status={raw_status}, stake={stake} "
+        f"(matched by {row_data.get('matchedBy', 'top')})."
+    )
     return {
         "status": normalized_status,
         "accepted": normalized_status == "accepted",
@@ -2670,13 +2734,68 @@ def place_black_bet(session: dict, signal) -> dict:
             )
         _wait_document_ready(driver)
         time.sleep(2)
-        WebDriverWait(driver, 10).until(lambda browser: "asian total goals" in _visible_text_lower(browser))
-        _ensure_black_betslip_safe_to_use(driver, profile_label)
         prefer_left = "loss" in getattr(signal, "raw_text", "").lower()
-        _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
+        # If the Asian Total Goals market or the requested line isn't on the page yet, give it
+        # up to ~5 minutes by refreshing / re-entering the match up to 3 times before giving up.
+        selection_attempts = 3
+        selection_retry_pause = 90  # seconds between attempts (3 * 90s ≈ 4.5 minutes total)
+        last_selection_error: Exception | None = None
+        for attempt in range(1, selection_attempts + 1):
+            try:
+                WebDriverWait(driver, 20).until(
+                    lambda browser: "asian total goals" in _visible_text_lower(browser)
+                )
+                _ensure_black_betslip_safe_to_use(driver, profile_label)
+                _select_black_asian_total_goals(
+                    driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left
+                )
+                last_selection_error = None
+                break
+            except Exception as exc:
+                last_selection_error = exc
+                print(
+                    f"[{profile_label}] Asian Total Goals selection attempt {attempt}/"
+                    f"{selection_attempts} failed: {exc}",
+                    flush=True,
+                )
+                if attempt == selection_attempts:
+                    break
+                # Refresh / re-enter the match and try again.
+                try:
+                    time.sleep(selection_retry_pause)
+                    try:
+                        driver.refresh()
+                    except Exception:
+                        pass
+                    _wait_document_ready(driver)
+                    time.sleep(3)
+                    if not _black_match_context_matches(driver, team_name, opponent_name):
+                        # Page navigated away; reopen via search.
+                        _open_black_search(driver, profile_label)
+                        _search_black_live_events(driver, team_name, profile_label)
+                        _open_black_live_match(driver, team_name, opponent_name, profile_label)
+                        _wait_document_ready(driver)
+                        time.sleep(2)
+                except Exception as recovery_exc:
+                    print(
+                        f"[{profile_label}] Recovery before retry {attempt + 1} failed: "
+                        f"{recovery_exc}",
+                        flush=True,
+                    )
+        if last_selection_error is not None:
+            raise BlackSelectionMissingError(
+                f"Asian Total Goals {signal.selection} {signal.line} was not available after "
+                f"{selection_attempts} attempts for {team_name} vs {opponent_name or '?'}: "
+                f"{last_selection_error}"
+            )
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
         _set_black_betslip_price_and_place(driver, signal.odds, profile_label, stake=stake_value)
-        status_result = _read_black_top_order_row(driver, profile_label)
+        status_result = _read_black_top_order_row(
+            driver,
+            profile_label,
+            home_team=team_name,
+            expected_stake=stake_value if isinstance(stake_value, Decimal) else None,
+        )
         return {
             "profile_label": profile_label,
             "status": status_result["status"],
