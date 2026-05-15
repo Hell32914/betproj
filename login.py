@@ -1261,7 +1261,6 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
         """
         const selection = arguments[0].trim().toLowerCase();
         const lineVariants = arguments[1].map((value) => value.toLowerCase());
-        const preferLeft = Boolean(arguments[2]);
         const normalizeNumber = (value) => (value || '').toLowerCase().replace(/\\s+/g, '').replace(',', '.');
         const normalizedLineVariants = lineVariants.map(normalizeNumber);
         const isVisible = (element) => {
@@ -1275,18 +1274,9 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const normalizedTextOf = (element) => textOf(element).replace(/\\s+/g, ' ').trim();
         const oddsPattern = /^\\d+(?:[.,]\\d+)+$/;
         const linePattern = /^\\d+(?:[.,]\\d+)?$/;
-        const findExactLineCell = (rowElement) => {
-            const candidates = Array.from(rowElement.querySelectorAll('button,div,[role="button"],span,p,li'))
-                .filter(isVisible)
-                .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
-                .filter((item) => item.text && item.text.length <= 12)
-                .filter((item) => linePattern.test(item.text));
-            return candidates
-                .filter((item) => normalizedLineVariants.includes(normalizeNumber(item.text)))
-                .sort((a, b) => a.rect.x - b.rect.x)[0] || null;
-        };
         const clickElement = (element) => {
             const clickable = element.closest('button,[role="button"]') || element;
             clickable.scrollIntoView({ block: 'center', inline: 'center' });
@@ -1296,80 +1286,145 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
             }
             try { clickable.click?.(); } catch (error) {}
         };
-        const pickRelativeToLabel = (rowElement) => {
-            const items = Array.from(rowElement.querySelectorAll('button,div,[role="button"],span'))
+        const descendants = (root, selector) => Array.from(root.querySelectorAll(selector)).filter(isVisible);
+        const findExactLineCell = (rowElement) => {
+            const candidates = descendants(rowElement, 'button,div,[role="button"],span,p,li')
                 .filter(isVisible)
-                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }));
-
-            const label = items
-                .filter((item) => item.text === selection || item.text.startsWith(selection + ' '))
-                .sort((a, b) => a.rect.x - b.rect.x)[0];
-
-            const oddsButtons = items
-                .filter((item) => oddsPattern.test(item.text))
-                .sort((a, b) => a.rect.x - b.rect.x);
-
-            if (label && oddsButtons.length) {
-                const preferred = preferLeft
-                    ? oddsButtons
-                        .filter((item) => item.rect.right <= label.rect.left + 6)
-                        .sort((a, b) => Math.abs(a.rect.right - label.rect.left) - Math.abs(b.rect.right - label.rect.left))[0]
-                    : oddsButtons
-                        .filter((item) => item.rect.left >= label.rect.right - 6)
-                        .sort((a, b) => Math.abs(a.rect.left - label.rect.right) - Math.abs(b.rect.left - label.rect.right))[0];
-                if (preferred) return preferred.element;
-            }
-
-            if (oddsButtons.length >= 2) {
-                return selection === 'under' ? oddsButtons[oddsButtons.length - 1].element : oddsButtons[0].element;
-            }
-            return oddsButtons[0]?.element || null;
+                .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+                .filter((item) => item.text && item.text.length <= 12)
+                .filter((item) => linePattern.test(item.text));
+            return candidates
+                .filter((item) => normalizedLineVariants.includes(normalizeNumber(item.text)))
+                .sort((a, b) => a.rect.x - b.rect.x)[0] || null;
         };
+        const findSelectionLabel = (rowElement, target) => descendants(rowElement, 'button,div,[role="button"],span,p,li')
+            .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
+            .filter((item) => item.text === target)
+            .sort((a, b) => a.rect.x - b.rect.x)[0] || null;
+        const findOddsButtons = (rowElement) => descendants(rowElement, 'button,div,[role="button"],span')
+            .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+            .filter((item) => oddsPattern.test(item.text))
+            .sort((a, b) => a.rect.x - b.rect.x);
+        const pickOddsForSelection = (rowElement) => {
+            const overLabel = findSelectionLabel(rowElement, 'over');
+            const underLabel = findSelectionLabel(rowElement, 'under');
+            const oddsButtons = findOddsButtons(rowElement);
+            if (!overLabel || !underLabel || oddsButtons.length < 2) {
+                return null;
+            }
 
-        const marketSections = Array.from(document.querySelectorAll('section,div'))
-            .filter(isVisible)
-            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-            .filter((item) => item.rect.y > 140)
-            .filter((item) => item.rect.width > 350 && item.rect.height > 100)
-            .filter((item) => item.text.includes('asian total goals'))
-            .sort((a, b) => (a.rect.y - b.rect.y) || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+            if (selection === 'over') {
+                return oddsButtons
+                    .filter((item) => item.rect.left >= overLabel.rect.right - 8)
+                    .filter((item) => item.rect.right <= underLabel.rect.left + 14)
+                    .sort((a, b) => Math.abs(a.rect.left - overLabel.rect.right) - Math.abs(b.rect.left - overLabel.rect.right))[0]
+                    || oddsButtons
+                        .filter((item) => item.rect.left >= overLabel.rect.right - 8 && item.rect.left < underLabel.rect.left + 40)
+                        .sort((a, b) => Math.abs(a.rect.left - overLabel.rect.right) - Math.abs(b.rect.left - overLabel.rect.right))[0]
+                    || null;
+            }
 
-        for (const section of marketSections.slice(0, 5)) {
-            const rows = Array.from(section.element.querySelectorAll('div,button,[role="button"],li'))
+            if (selection === 'under') {
+                return oddsButtons
+                    .filter((item) => item.rect.left >= underLabel.rect.right - 8)
+                    .sort((a, b) => Math.abs(a.rect.left - underLabel.rect.right) - Math.abs(b.rect.left - underLabel.rect.right))[0]
+                    || null;
+            }
+
+            return null;
+        };
+        const buildRowCandidate = (element) => {
+            const rect = element.getBoundingClientRect();
+            const text = normalizedTextOf(element);
+            if (rect.width <= 280 || rect.height < 24 || rect.height > 120) {
+                return null;
+            }
+            if (!text.includes('over') || !text.includes('under')) {
+                return null;
+            }
+            const lineCell = findExactLineCell(element);
+            if (!lineCell) {
+                return null;
+            }
+            const targetOdds = pickOddsForSelection(element);
+            if (!targetOdds) {
+                return null;
+            }
+            return {
+                element,
+                rect,
+                text,
+                lineText: normalizeNumber(lineCell.text),
+                targetOdds,
+            };
+        };
+        const collectSectionCandidates = () => {
+            const headers = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
                 .filter(isVisible)
-                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-                .filter((item) => item.rect.width > 280 && item.rect.height >= 24)
-                .map((item) => ({ ...item, lineCell: findExactLineCell(item.element) }))
-                .filter((item) => item.lineCell && item.text.includes(selection))
-                .map((item) => {
-                    let score = 0;
-                    if (item.lineCell) score += 120;
-                    if (item.text.includes('over') && item.text.includes('under')) score += 30;
-                    if (oddsPattern.test(item.text.replace(selection, '').trim())) score += 15;
-                    score += Math.min(item.rect.width, 800) / 20;
-                    return { ...item, score };
-                })
-                .sort((a, b) => b.score - a.score || b.rect.width - a.rect.width);
+                .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
+                .filter((item) => item.text === 'asian total goals')
+                .sort((a, b) => a.rect.y - b.rect.y);
 
-            const seen = new Set();
-            for (const row of rows) {
-                if (seen.has(row.element)) continue;
-                seen.add(row.element);
-                const target = pickRelativeToLabel(row.element);
-                if (target) {
-                    clickElement(target);
-                    return { ok: true, rowText: row.text.slice(0, 220), sectionText: section.text.slice(0, 220), preferLeft };
+            const containers = [];
+            for (const header of headers) {
+                let current = header.element;
+                for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+                    if (!current || !isVisible(current)) continue;
+                    const rect = current.getBoundingClientRect();
+                    if (rect.width <= 350 || rect.height <= 100) continue;
+                    const rows = descendants(current, 'div,section,li,button,[role="button"]')
+                        .map(buildRowCandidate)
+                        .filter(Boolean)
+                        .filter((item) => item.rect.y >= header.rect.bottom - 8);
+                    if (!rows.length) continue;
+                    containers.push({
+                        element: current,
+                        rect,
+                        headerText: header.text,
+                        headerRect: header.rect,
+                        rows,
+                    });
+                    break;
                 }
             }
+            return containers
+                .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))
+                .filter((item, index, array) => array.findIndex((candidate) => candidate.element === item.element) === index);
+        };
+
+        const marketSections = collectSectionCandidates();
+        for (const section of marketSections) {
+            const rows = section.rows
+                .filter((item) => normalizedLineVariants.includes(item.lineText))
+                .sort((a, b) => a.rect.y - b.rect.y || a.rect.height - b.rect.height);
+
+            if (!rows.length) {
+                continue;
+            }
+
+            const row = rows[0];
+            clickElement(row.targetOdds.element);
+            return {
+                ok: true,
+                rowText: row.text.slice(0, 220),
+                sectionText: section.headerText,
+                lineText: row.lineText,
+                selection,
+            };
         }
+
+        const sectionTexts = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
+            .filter(isVisible)
+            .map((element) => normalizedTextOf(element))
+            .filter((text) => text === 'asian total goals')
+            .slice(0, 5);
 
         return {
             ok: false,
             reason: 'asian-total-goals-row-not-found',
             selection,
-            preferLeft,
             lineVariants,
-            sections: marketSections.slice(0, 4).map((item) => item.text.slice(0, 220)),
+            sections: sectionTexts,
         };
         """,
         selection,
