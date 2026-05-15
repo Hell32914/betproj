@@ -1099,6 +1099,106 @@ def _confirm_black_place_order(driver: webdriver.Remote, profile_label: str) -> 
     print(f"[{profile_label}] Confirmed Black Place Order dialog.")
 
 
+def _open_black_orders_view(driver: webdriver.Remote, profile_label: str) -> bool:
+    def locate_orders_target() -> object:
+        return driver.execute_script(
+            """
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0
+                    && rect.x < window.innerWidth
+                    && rect.y < window.innerHeight;
+            };
+            const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+            const buttons = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }));
+
+            const seeBets = buttons
+                .filter((item) => item.text === 'see bets' || item.text.includes('see bets'))
+                .sort((a, b) => (a.rect.y - b.rect.y) || (b.rect.x - a.rect.x))[0];
+            if (seeBets) return seeBets.element.closest('button,a,[role="button"]') || seeBets.element;
+
+            const topOrders = buttons
+                .filter((item) => item.rect.y < 110)
+                .filter((item) => item.text === 'orders' || item.text.includes('orders'))
+                .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0];
+            if (topOrders) return topOrders.element.closest('button,a,[role="button"],li') || topOrders.element;
+
+            return null;
+            """
+        )
+
+    target = locate_orders_target()
+    if not target:
+        print(f"[{profile_label}] Could not find Black orders entry point after placing order.")
+        return False
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", target)
+    except Exception:
+        pass
+
+    click_attempts = (
+        lambda: target.click(),
+        lambda: ActionChains(driver).move_to_element(target).pause(0.1).click(target).perform(),
+        lambda: driver.execute_script("arguments[0].click();", target),
+        lambda: driver.execute_script(
+            """
+            const target = arguments[0];
+            const rect = target.getBoundingClientRect();
+            const x = rect.x + rect.width / 2;
+            const y = rect.y + rect.height / 2;
+            const liveTarget = document.elementFromPoint(x, y) || target;
+            for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+                liveTarget.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
+            }
+            liveTarget.click?.();
+            return true;
+            """,
+            target,
+        ),
+    )
+    for attempt in click_attempts:
+        try:
+            attempt()
+            if WebDriverWait(driver, 4).until(lambda browser: browser.execute_script(
+                """
+                const isVisible = (element) => {
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.right > 0;
+                };
+                const text = (document.body?.innerText || '').toLowerCase();
+                if (text.includes('see bets')) return false;
+                if ((window.location.pathname || '').toLowerCase().includes('/orders')) return true;
+                const nodes = Array.from(document.querySelectorAll('button,[role="tab"],div,span,section,aside'))
+                    .filter(isVisible)
+                    .map((element) => (element.innerText || element.textContent || '').trim().toLowerCase());
+                return nodes.some((value) => value.includes('recent orders'));
+                """
+            )):
+                print(f"[{profile_label}] Opened Black orders view after placing order.")
+                return True
+        except Exception:
+            continue
+
+    print(f"[{profile_label}] Could not open Black orders view after placing order.")
+    return False
+
+
 def _black_search_dialog_open(driver: webdriver.Remote) -> bool:
     text = _visible_text_lower(driver)
     return "live events" in text or "all sports" in text
@@ -1982,6 +2082,7 @@ def _parse_black_fill_breakdown(tooltip_text: str) -> list[dict]:
 
 
 def _read_black_recent_order_fill(driver: webdriver.Remote, signal, profile_label: str) -> dict | None:
+    _open_black_orders_view(driver, profile_label)
     if not _activate_black_order_tab(driver, "Recent Orders", profile_label):
         return None
     time.sleep(0.4)
@@ -2247,6 +2348,7 @@ def place_black_bet(session: dict, signal) -> dict:
         _select_black_asian_total_goals(driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left)
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
         _set_black_betslip_price_and_place(driver, signal.odds, profile_label, stake=stake_value)
+        _open_black_orders_view(driver, profile_label)
         status_result = _monitor_black_bet_status(driver, signal, profile_label)
         return {
             "profile_label": profile_label,
