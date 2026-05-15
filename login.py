@@ -1847,6 +1847,142 @@ def _read_black_order_panel_text(driver: webdriver.Remote, tab_name: str | None 
     ) or ""
 
 
+def _format_black_fill_breakdown(items: list[dict]) -> str:
+    parts = []
+    for item in items:
+        bookie = (item.get("bookie") or "?").strip()
+        amount = item.get("amount_text") or item.get("amount") or "0"
+        percent = item.get("percent_text") or item.get("percent") or "0"
+        parts.append(f"{bookie} {amount} euro ({percent}%)")
+    return ", ".join(parts)
+
+
+def _parse_black_fill_breakdown(tooltip_text: str) -> list[dict]:
+    rows = []
+    for line in (tooltip_text or "").splitlines():
+        normalized = " ".join(line.split()).strip()
+        match = re.match(r"^(?P<bookie>[A-Za-z0-9_+.-]+)\s+€?(?P<amount>\d+(?:[.,]\d+)?)\s+(?P<percent>\d+(?:[.,]\d+)?)%$", normalized)
+        if not match:
+            continue
+        rows.append({
+            "bookie": match.group("bookie"),
+            "amount": match.group("amount").replace(",", "."),
+            "amount_text": match.group("amount"),
+            "percent": match.group("percent").replace(",", "."),
+            "percent_text": match.group("percent"),
+        })
+    return rows
+
+
+def _read_black_recent_order_fill(driver: webdriver.Remote, signal, profile_label: str) -> dict | None:
+    _read_black_order_panel_text(driver, "Recent Orders")
+    details = driver.execute_script(
+        """
+        const selection = (arguments[0] || '').trim().toLowerCase();
+        const lineVariants = arguments[1].map((value) => value.toLowerCase());
+        const homeTeam = (arguments[2] || '').trim().toLowerCase();
+        const awayTeam = (arguments[3] || '').trim().toLowerCase();
+        const normalizeNumber = (value) => (value || '').toLowerCase().replace(/\\s+/g, '').replace(',', '.');
+        const normalizedLineVariants = lineVariants.map(normalizeNumber);
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const panel = Array.from(document.querySelectorAll('aside,section,div'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.x > window.innerWidth * 0.68)
+            .filter((item) => item.rect.width > 180 && item.rect.height > 180)
+            .filter((item) => item.text.includes('recent orders'))
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+        if (!panel) return null;
+
+        const cardCandidates = Array.from(panel.element.querySelectorAll('div,section,article'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.width > 180 && item.rect.height > 70)
+            .filter((item) => item.text.includes(homeTeam))
+            .filter((item) => !awayTeam || item.text.includes(awayTeam))
+            .filter((item) => item.text.includes(selection))
+            .filter((item) => normalizedLineVariants.some((line) => normalizeNumber(item.text).includes(line)))
+            .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+        const card = cardCandidates[0];
+        if (!card) {
+            return { ok: false, reason: 'recent-order-card-not-found', panelText: panel.text.slice(0, 500) };
+        }
+
+        const hoverCandidates = Array.from(card.element.querySelectorAll('div,span,button'))
+            .filter(isVisible)
+            .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+            .filter((item) => item.text.includes('done') || item.text.includes('success') || item.text.includes('reconciled'))
+            .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+        return {
+            ok: true,
+            card: card.element,
+            hoverTarget: hoverCandidates.length ? hoverCandidates[0].element : card.element,
+            cardText: card.text.slice(0, 500),
+        };
+        """,
+        getattr(signal, "selection", ""),
+        _decimal_variants(getattr(signal, "line")),
+        getattr(signal, "home_team", None) or "",
+        getattr(signal, "away_team", None) or "",
+    )
+    if not details or not details.get("ok"):
+        return None
+
+    card_element = details.get("card")
+    hover_target = details.get("hoverTarget") or card_element
+    if not card_element or not hover_target:
+        return None
+
+    try:
+        ActionChains(driver).move_to_element(card_element).pause(0.2).move_to_element(hover_target).perform()
+    except Exception:
+        try:
+            ActionChains(driver).move_to_element(hover_target).perform()
+        except Exception:
+            return {"status": "accepted", "detail": details.get("cardText", ""), "fills": []}
+
+    time.sleep(0.4)
+    tooltip_text = driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim();
+        const tooltips = Array.from(document.querySelectorAll('div,section,aside'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+            .filter((item) => item.rect.width > 120 && item.rect.height > 70)
+            .filter((item) => /bookie/i.test(item.text) && /amount/i.test(item.text) && /%\\s*of\\s*want/i.test(item.text))
+            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+        return tooltips.length ? tooltips[0].text : '';
+        """
+    ) or ""
+    fills = _parse_black_fill_breakdown(tooltip_text)
+    if fills:
+        detail = _format_black_fill_breakdown(fills)
+        print(f"[{profile_label}] Black recent order fills: {detail}")
+        return {"status": "accepted", "detail": detail, "fills": fills}
+
+    return {"status": "accepted", "detail": details.get("cardText", ""), "fills": []}
+
+
 def _black_snapshot_matches_signal(snapshot_text: str, signal) -> bool:
     text = (snapshot_text or "").lower()
     if not text:
@@ -1906,6 +2042,7 @@ def _monitor_black_bet_status(driver: webdriver.Remote, signal, profile_label: s
     deadline = time.monotonic() + timeout
     accepted_at = None
     last_detail = ""
+    accepted_fills = []
 
     while time.monotonic() < deadline:
         snapshots = {
@@ -1916,16 +2053,23 @@ def _monitor_black_bet_status(driver: webdriver.Remote, signal, profile_label: s
         status, detail = _classify_black_order_snapshot(snapshots, signal)
         last_detail = detail or last_detail
 
+        recent_fill = _read_black_recent_order_fill(driver, signal, profile_label)
+        if recent_fill and recent_fill.get("status") == "accepted":
+            status = "accepted"
+            detail = recent_fill.get("detail") or detail
+            last_detail = detail or last_detail
+            accepted_fills = recent_fill.get("fills") or accepted_fills
+
         if status in {"cancelled", "rejected"}:
             print(f"[{profile_label}] Black order status: {status}. {detail[:250]}")
-            return {"status": status, "detail": detail, "accepted": False}
+            return {"status": status, "detail": detail, "accepted": False, "fills": accepted_fills}
 
         if status == "accepted":
             if accepted_at is None:
                 accepted_at = time.monotonic()
-            elif time.monotonic() - accepted_at >= 8:
+            elif time.monotonic() - accepted_at >= 3:
                 print(f"[{profile_label}] Black order status: accepted. {detail[:250]}")
-                return {"status": "accepted", "detail": detail, "accepted": True}
+                return {"status": "accepted", "detail": detail, "accepted": True, "fills": accepted_fills}
         else:
             if accepted_at is None and status == "pending":
                 print(f"[{profile_label}] Black order status: pending.")
@@ -1934,7 +2078,7 @@ def _monitor_black_bet_status(driver: webdriver.Remote, signal, profile_label: s
 
     final_status = "accepted" if accepted_at is not None else "pending"
     print(f"[{profile_label}] Black order final monitor status: {final_status}. {last_detail[:250]}")
-    return {"status": final_status, "detail": last_detail, "accepted": final_status == "accepted"}
+    return {"status": final_status, "detail": last_detail, "accepted": final_status == "accepted", "fills": accepted_fills}
 
 
 def place_black_bet(session: dict, signal) -> dict:
@@ -1982,6 +2126,7 @@ def place_black_bet(session: dict, signal) -> dict:
             "status": status_result["status"],
             "accepted": status_result["accepted"],
             "detail": status_result.get("detail", ""),
+            "fills": status_result.get("fills", []),
             "teams": getattr(signal, "teams", None) or team_name,
             "selection": getattr(signal, "selection_label", f"{signal.selection} {signal.line}"),
             "odds": str(signal.odds),

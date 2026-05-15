@@ -148,12 +148,21 @@ def _format_signal_result_message(result: dict) -> str:
         "rejected": "Ставка не принята",
         "cancelled": "Ставка отменена",
     }.get(status, f"Статус ставки: {status}")
+    fills = result.get("fills") or []
     detail = (result.get("detail") or "").strip()
     detail = " | ".join(part.strip() for part in detail.splitlines() if part.strip())[:350]
     message = (
         f"{label}: {result.get('teams') or 'unknown match'} | "
         f"{result.get('selection')} | odds {result.get('odds')}"
     )
+    if status == "accepted" and fills:
+        fill_parts = []
+        for item in fills:
+            bookie = (item.get("bookie") or "?").strip()
+            amount = item.get("amount_text") or item.get("amount") or "0"
+            percent = item.get("percent_text") or item.get("percent") or "0"
+            fill_parts.append(f"{bookie} {amount} euro ({percent}%)")
+        detail = ", ".join(fill_parts)
     if detail:
         message += f"\n{detail}"
     return message
