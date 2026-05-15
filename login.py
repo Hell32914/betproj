@@ -1235,12 +1235,59 @@ class BlackSelectionMissingError(RuntimeError):
     """Raised when the requested Asian Total Goals selection never shows up on the match page after retries."""
 
 
+def _snapshot_black_max_order_id(driver: webdriver.Remote, profile_label: str) -> int | None:
+    """Open the Black top Orders view and return the largest order id currently shown.
+
+    Used as a watermark: the row of a freshly placed bet must have an order id strictly
+    greater than this snapshot, so we never mistake a leftover top row (same team and
+    even same stake) for the new bet while the new row is still rendering.
+    """
+    if not _open_black_top_orders(driver, profile_label):
+        return None
+    time.sleep(1.5)
+    try:
+        result = driver.execute_script(
+            """
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0;
+            };
+            const text = Array.from(document.querySelectorAll('table,div,section,main'))
+                .filter(isVisible)
+                .map((element) => (element.innerText || element.textContent || ''))
+                .filter((value) => /selection/i.test(value) && /status/i.test(value) && /stake/i.test(value))
+                .sort((a, b) => b.length - a.length)[0] || '';
+            const matches = text.match(/\\b\\d{8,14}\\b/g) || [];
+            if (!matches.length) return null;
+            let max = 0;
+            for (const value of matches) {
+                const num = parseInt(value, 10);
+                if (Number.isFinite(num) && num > max) max = num;
+            }
+            return max || null;
+            """
+        )
+    except Exception as exc:
+        print(f"[{profile_label}] Could not snapshot Black max order id: {exc}", flush=True)
+        return None
+    if isinstance(result, (int, float)) and result:
+        snapshot = int(result)
+        print(f"[{profile_label}] Black pre-bet max order id snapshot: {snapshot}", flush=True)
+        return snapshot
+    return None
+
+
 def _read_black_top_order_row(
     driver: webdriver.Remote,
     profile_label: str,
     timeout: int = 60,
     home_team: str | None = None,
     expected_stake: Decimal | None = None,
+    min_order_id: int | None = None,
 ) -> dict:
     if not _open_black_top_orders(driver, profile_label):
         return {"status": "pending", "accepted": False, "detail": "Top Orders view not opened.", "order_status": "Unknown", "order_stake": "?"}
@@ -1256,11 +1303,14 @@ def _read_black_top_order_row(
     else:
         expected_stake_variants = []
 
+    min_id = int(min_order_id) if isinstance(min_order_id, (int, float)) and min_order_id else 0
+
     def read_row(browser: webdriver.Remote):
         return browser.execute_script(
             """
             const homeTeam = (arguments[0] || '').toLowerCase();
             const stakeVariants = (arguments[1] || []).map((value) => String(value).toLowerCase());
+            const minOrderId = Number(arguments[2] || 0);
             const isVisible = (element) => {
                 const style = window.getComputedStyle(element);
                 const rect = element.getBoundingClientRect();
@@ -1335,9 +1385,16 @@ def _read_black_top_order_row(
                 const rowText = rowItem.text;
                 const statusMatch = rowText.match(/\\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done)\\b/i);
                 const stake = pickStake(rowItem.element, rowText);
+                const idMatches = rowText.match(/\\b\\d{8,14}\\b/g) || [];
+                let orderId = 0;
+                for (const value of idMatches) {
+                    const num = parseInt(value, 10);
+                    if (Number.isFinite(num) && num > orderId) orderId = num;
+                }
                 return {
                     status: statusMatch ? statusMatch[1] : 'Unknown',
                     stake: stake || '?',
+                    orderId: orderId || null,
                     rowText: rowText.slice(0, 500),
                 };
             };
@@ -1345,27 +1402,38 @@ def _read_black_top_order_row(
             // Prefer the topmost (most recently placed) row that matches the team. The site
             // can silently reduce the stake (e.g. €0.97 -> €0.95), so DO NOT gate the team
             // match on the expected stake — otherwise we fall through and pick an older row
-            // that happens to keep the original stake.
+            // that happens to keep the original stake. When a min order id watermark is
+            // supplied, also require the row's order id to be strictly greater so we don't
+            // pick a leftover older row for the same team that is still on top while the
+            // freshly placed row is rendering.
             if (homeTeam) {
                 const teamCandidates = dataRows.filter((item) => item.text.toLowerCase().includes(homeTeam));
-                if (teamCandidates.length) {
-                    return { ok: true, matchedBy: 'team', ...evaluateRow(teamCandidates[0]) };
+                for (const rowItem of teamCandidates) {
+                    const evaluated = evaluateRow(rowItem);
+                    if (!minOrderId || (evaluated.orderId && evaluated.orderId > minOrderId)) {
+                        return { ok: true, matchedBy: 'team', ...evaluated };
+                    }
                 }
             }
             if (stakeVariants.length) {
                 for (const rowItem of dataRows) {
                     const evaluated = evaluateRow(rowItem);
-                    if (stakeMatchesExpected(evaluated.stake)) {
-                        return { ok: true, matchedBy: 'stake', ...evaluated };
-                    }
+                    if (!stakeMatchesExpected(evaluated.stake)) continue;
+                    if (minOrderId && (!evaluated.orderId || evaluated.orderId <= minOrderId)) continue;
+                    return { ok: true, matchedBy: 'stake', ...evaluated };
                 }
             }
             const firstRow = dataRows[0];
             if (!firstRow) return { ok: false, reason: 'orders-row-not-found', pageText: table.text.slice(0, 600) };
-            return { ok: true, matchedBy: 'top', ...evaluateRow(firstRow) };
+            const topEvaluated = evaluateRow(firstRow);
+            if (minOrderId && (!topEvaluated.orderId || topEvaluated.orderId <= minOrderId)) {
+                return { ok: false, reason: 'new-order-not-arrived-yet', pageText: table.text.slice(0, 600) };
+            }
+            return { ok: true, matchedBy: 'top', ...topEvaluated };
             """,
             home_team_lower,
             expected_stake_variants,
+            min_id,
         )
 
     row_data = None
@@ -1400,8 +1468,8 @@ def _read_black_top_order_row(
     detail = row_data.get("rowText") or ""
     normalized_status = _normalize_black_order_status(raw_status)
     print(
-        f"[{profile_label}] Black top order row: status={raw_status}, stake={stake} "
-        f"(matched by {row_data.get('matchedBy', 'top')})."
+        f"[{profile_label}] Black top order row: status={raw_status}, stake={stake}, "
+        f"orderId={row_data.get('orderId')} (matched by {row_data.get('matchedBy', 'top')})."
     )
     return {
         "status": normalized_status,
@@ -2718,6 +2786,10 @@ def place_black_bet(session: dict, signal) -> dict:
     driver = None
     try:
         driver = connect_to_browser(session["browser_info"], profile_label)
+        # Snapshot the current highest order id before we place anything. The new bet's
+        # row must have a strictly greater id, which prevents picking a leftover top row
+        # for the same team while the freshly placed row is still rendering.
+        pre_bet_max_order_id = _snapshot_black_max_order_id(driver, profile_label)
         current_url = (driver.current_url or "").lower()
         if "/sportsbook" not in current_url:
             driver.get(BLACK_SPORTSBOOK_URL)
@@ -2766,6 +2838,7 @@ def place_black_bet(session: dict, signal) -> dict:
             profile_label,
             home_team=team_name,
             expected_stake=stake_value if isinstance(stake_value, Decimal) else None,
+            min_order_id=pre_bet_max_order_id,
         )
         return {
             "profile_label": profile_label,
