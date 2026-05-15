@@ -1369,7 +1369,8 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
         const normalizedTextOf = (element) => textOf(element).replace(/\\s+/g, ' ').trim();
         const oddsPattern = /^\\d+(?:[.,]\\d+)+$/;
-        const linePattern = /^\\d+(?:[.,]\\d+)?$/;
+        const linePattern = /^\\d+(?:[.,]\\d+)?(?:\\s*(?:\\/|,)\\s*\\d+(?:[.,]\\d+)?)?$/;
+        const descendants = (root, selector) => Array.from(root.querySelectorAll(selector)).filter(isVisible);
         const clickElement = (element) => {
             const clickable = element.closest('button,[role="button"]') || element;
             clickable.scrollIntoView({ block: 'center', inline: 'center' });
@@ -1381,25 +1382,23 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 if (typeof clickable.click === 'function') clickable.click();
             } catch (error) {}
         };
-        const descendants = (root, selector) => Array.from(root.querySelectorAll(selector)).filter(isVisible);
         const findExactLineCell = (rowElement) => {
             const candidates = descendants(rowElement, 'button,div,[role="button"],span,p,li')
-                .filter(isVisible)
                 .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
-                .filter((item) => item.text && item.text.length <= 12)
+                .filter((item) => item.text && item.text.length <= 16)
                 .filter((item) => linePattern.test(item.text));
             return candidates
                 .filter((item) => normalizedLineVariants.includes(normalizeNumber(item.text)))
-                .sort((a, b) => a.rect.x - b.rect.x)[0] || null;
+                .sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y)[0] || null;
         };
         const findSelectionLabel = (rowElement, target) => descendants(rowElement, 'button,div,[role="button"],span,p,li')
             .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
             .filter((item) => item.text === target)
-            .sort((a, b) => a.rect.x - b.rect.x)[0] || null;
+            .sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y)[0] || null;
         const findOddsButtons = (rowElement) => descendants(rowElement, 'button,div,[role="button"],span')
             .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
             .filter((item) => oddsPattern.test(item.text))
-            .sort((a, b) => a.rect.x - b.rect.x);
+            .sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y);
         const pickOddsForSelection = (rowElement) => {
             const overLabel = findSelectionLabel(rowElement, 'over');
             const underLabel = findSelectionLabel(rowElement, 'under');
@@ -1407,25 +1406,22 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
             if (!overLabel || !underLabel || oddsButtons.length < 2) {
                 return null;
             }
-
             if (selection === 'over') {
                 return oddsButtons
                     .filter((item) => item.rect.left >= overLabel.rect.right - 8)
-        const linePattern = /^\\d+(?:[.,]\\d+)?(?:\\s*(?:\\/|,)\\s*\\d+(?:[.,]\\d+)?)?$/;
+                    .filter((item) => item.rect.right <= underLabel.rect.left + 14)
                     .sort((a, b) => Math.abs(a.rect.left - overLabel.rect.right) - Math.abs(b.rect.left - overLabel.rect.right))[0]
                     || oddsButtons
                         .filter((item) => item.rect.left >= overLabel.rect.right - 8 && item.rect.left < underLabel.rect.left + 40)
                         .sort((a, b) => Math.abs(a.rect.left - overLabel.rect.right) - Math.abs(b.rect.left - overLabel.rect.right))[0]
                     || null;
             }
-
             if (selection === 'under') {
                 return oddsButtons
                     .filter((item) => item.rect.left >= underLabel.rect.right - 8)
                     .sort((a, b) => Math.abs(a.rect.left - underLabel.rect.right) - Math.abs(b.rect.left - underLabel.rect.right))[0]
                     || null;
             }
-
             return null;
         };
         const buildRowCandidate = (element) => {
@@ -1452,8 +1448,8 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
             }
             const verticalCenters = [lineCell.rect, overLabel.rect, underLabel.rect, targetOdds.rect]
                 .map((candidateRect) => candidateRect.top + candidateRect.height / 2);
-            const minCenter = Math.min(...verticalCenters);
-            const maxCenter = Math.max(...verticalCenters);
+            const minCenter = Math.min.apply(null, verticalCenters);
+            const maxCenter = Math.max.apply(null, verticalCenters);
             if (maxCenter - minCenter > 22) {
                 return null;
             }
@@ -1472,7 +1468,6 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
                 .filter((item) => item.text === 'asian total goals')
                 .sort((a, b) => a.rect.y - b.rect.y);
-
             const containers = [];
             for (const header of headers) {
                 let current = header.element;
@@ -1489,7 +1484,6 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                         element: current,
                         rect,
                         headerText: header.text,
-                        headerRect: header.rect,
                         rows,
                     });
                     break;
@@ -1499,17 +1493,14 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))
                 .filter((item, index, array) => array.findIndex((candidate) => candidate.element === item.element) === index);
         };
-
         const marketSections = collectSectionCandidates();
         for (const section of marketSections) {
             const rows = section.rows
                 .filter((item) => normalizedLineVariants.includes(item.lineText))
                 .sort((a, b) => a.area - b.area || a.rect.y - b.rect.y || a.rect.height - b.rect.height);
-
             if (!rows.length) {
                 continue;
             }
-
             const row = rows[0];
             clickElement(row.targetOdds.element);
             return {
@@ -1520,13 +1511,11 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
                 selection,
             };
         }
-
         const sectionTexts = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
             .filter(isVisible)
             .map((element) => normalizedTextOf(element))
             .filter((text) => text === 'asian total goals')
             .slice(0, 5);
-
         return {
             ok: false,
             reason: 'asian-total-goals-row-not-found',
