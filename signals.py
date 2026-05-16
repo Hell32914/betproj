@@ -30,14 +30,18 @@ class BettingSignal:
         if not self.teams:
             return None
         parts = re.split(r"\s+vs\s+", self.teams, maxsplit=1, flags=re.IGNORECASE)
-        return parts[0].strip() if parts and parts[0].strip() else None
+        if not parts or not parts[0].strip():
+            return None
+        return re.sub(r"[`*_~]+", "", parts[0]).strip() or None
 
     @property
     def away_team(self) -> str | None:
         if not self.teams:
             return None
         parts = re.split(r"\s+vs\s+", self.teams, maxsplit=1, flags=re.IGNORECASE)
-        return parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+        if len(parts) <= 1 or not parts[1].strip():
+            return None
+        return re.sub(r"[`*_~]+", "", parts[1]).strip() or None
 
 
 ODDS_RE = re.compile(
@@ -99,7 +103,12 @@ def parse_betting_signal(text: str) -> BettingSignal | None:
         normalized = line.strip()
         is_ranking_line = re.search(r"\(\d+(?:st|nd|rd|th)?\s+vs\s+\d+", normalized, re.IGNORECASE)
         if " vs " in normalized.lower() and not is_ranking_line:
-            teams = normalized
+            # Strip Markdown formatting (backticks / asterisks / underscores) that the
+            # InPlayGuru bot wraps around team names — otherwise they leak into the
+            # Black search query and break match lookup.
+            cleaned = re.sub(r"[`*_~]+", "", normalized)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            teams = cleaned
             break
         if is_ranking_line and league_line is None:
             league_line = _clean_league_line(normalized)
