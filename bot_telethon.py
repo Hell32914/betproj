@@ -12,6 +12,7 @@ import os
 import asyncio
 import re
 import sys
+import traceback
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -139,7 +140,37 @@ async def handle_signal(state: RuntimeState, text: str) -> None:
             result = await loop.run_in_executor(None, lambda: place_black_bet(primary_session, signal))
             print(f"Black bet placement completed with status: {result.get('status')}", flush=True)
         except Exception as exc:
-            print(f"Black bet placement failed: {exc}", flush=True)
+            print(f"Black bet placement failed: {_describe_exception(exc)}", flush=True)
+            traceback.print_exc()
+
+
+def _describe_exception(exc: BaseException) -> str:
+    """Return a non-empty diagnostic string for ``exc``.
+
+    Selenium ``WebDriverException`` subclasses often stringify to ``'Message: '``
+    with an empty payload, which makes both console logs and Telegram replies
+    useless. Fall back to the type name plus a short traceback tail so failures
+    are always actionable.
+    """
+
+    text = str(exc).strip() if exc is not None else ""
+    # Strip Selenium's empty 'Message:' prefix when there's nothing after it.
+    if text.lower().startswith("message:"):
+        text = text[len("message:"):].strip()
+    if text.lower() == "none":
+        text = ""
+    type_name = type(exc).__name__ if exc is not None else "Exception"
+    if text:
+        return f"{type_name}: {text}"
+    # Fall back to the last traceback frame so we know where it blew up.
+    tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    last_frame = ""
+    for line in reversed(tb):
+        line = line.strip()
+        if line.startswith("File "):
+            last_frame = line
+            break
+    return f"{type_name} (no message){' @ ' + last_frame if last_frame else ''}"
 
 
 def _format_signal_work_message(signal) -> str:
@@ -262,8 +293,10 @@ async def main():
                                 )
                                 return
                         except Exception as exc:
-                            print(f"Black bet placement failed: {exc}", flush=True)
-                            await event.reply(f"Ставка не завершена: {exc}")
+                            detail = _describe_exception(exc)
+                            print(f"Black bet placement failed: {detail}", flush=True)
+                            traceback.print_exc()
+                            await event.reply(f"Ставка не завершена: {detail}")
                             return
                     # Lock released here so queued signals can place their bets while we wait.
                     await asyncio.sleep(selection_retry_pause)
@@ -332,6 +365,25 @@ async def main():
             try:
                 if hasattr(client, "_updates_error"):
                     client._updates_error = None
+                if not client.is_connected():
+                    try:
+                        await client.connect()
+                    except Exception as conn_exc:
+                        print(
+                            f"Telethon reconnect failed: {conn_exc!r}; retrying in 5s.",
+                            flush=True,
+                        )
+                        await asyncio.sleep(5)
+                        continue
+                    if not await client.is_user_authorized():
+                        print(
+                            "Telethon session is not authorized after reconnect; "
+                            "delete the .session file and re-login.",
+                            flush=True,
+                        )
+                        await asyncio.sleep(30)
+                        continue
+                    print("Telethon reconnected; resuming listener.", flush=True)
                 await client.run_until_disconnected()
                 break
             except TelethonTypeNotFoundError as exc:
@@ -343,6 +395,10 @@ async def main():
                 continue
             except Exception as exc:
                 print(f"Telethon listener crashed: {exc!r}; restarting in 5s.", flush=True)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
                 await asyncio.sleep(5)
                 continue
 
