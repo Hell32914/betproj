@@ -41,6 +41,10 @@ BETINASIA_EMAIL = os.getenv("BETINASIA_EMAIL")
 BETINASIA_PASSWORD = os.getenv("BETINASIA_PASSWORD")
 BLACK_USERNAME = os.getenv("BLACK_USERNAME")
 BLACK_PASSWORD = os.getenv("BLACK_PASSWORD")
+BETFAIR_USERNAME = os.getenv("BETFAIR_USERNAME", "asint2018")
+BETFAIR_PASSWORD = os.getenv("BETFAIR_PASSWORD", ";4m/TyS7-u-bY?*")
+BETFAIR_LOGIN_URL = "https://www.betfair.com/exchange/plus/"
+BETFAIR_URL_PART = "betfair.com"
 STAKE_PERCENT = Decimal(os.getenv("STAKE_PERCENT", "5"))
 EURO_SYMBOL = "\u20ac"
 TEAM_SUFFIXES = {
@@ -3585,6 +3589,146 @@ def login(driver: webdriver.Remote, profile_label: str) -> None:
     _login_black(driver, profile_label)
 
 
+def _is_betfair_logged_in(driver: webdriver.Remote) -> bool:
+    """Detect whether the Betfair top bar shows a logged-in state."""
+    try:
+        return bool(driver.execute_script(
+            r"""
+            const text = (document.body && document.body.innerText || '').toLowerCase();
+            // 'Log Out' / 'My Account' appear only when authenticated.
+            if (text.indexOf('log out') !== -1) return true;
+            if (text.indexOf('my account') !== -1) return true;
+            // The login form disappears when logged in.
+            const loginBtn = document.querySelector(
+                "button#login_now_button, button[data-test-id='login-button'], input#login_now_button"
+            );
+            return !loginBtn;
+            """
+        ))
+    except Exception:
+        return False
+
+
+def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
+    """Log into betfair.com/exchange/plus/ using the top-bar form.
+
+    Idempotent: returns immediately when the account is already authenticated.
+    """
+    if BETFAIR_URL_PART not in (driver.current_url or "").lower():
+        print(f"[{profile_label}] Navigating to Betfair: {BETFAIR_LOGIN_URL}")
+        driver.get(BETFAIR_LOGIN_URL)
+
+    # Allow the page to settle.
+    try:
+        WebDriverWait(driver, 20).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except Exception:
+        pass
+
+    if _is_betfair_logged_in(driver):
+        print(f"[{profile_label}] Betfair already logged in; skipping form fill.")
+        return
+
+    if not BETFAIR_USERNAME or not BETFAIR_PASSWORD:
+        raise RuntimeError(
+            "Missing BETFAIR_USERNAME / BETFAIR_PASSWORD; cannot log into Betfair."
+        )
+
+    # Locate username + password inputs from the top-bar form. Try several
+    # selectors because Betfair occasionally changes ids/attributes.
+    user_selectors = [
+        "input#ssc-liu",
+        "input[name='username']",
+        "input[data-test-id='login-username']",
+        "input[placeholder*='username' i]",
+        "input[type='text']",
+    ]
+    pwd_selectors = [
+        "input#ssc-lipw",
+        "input[name='password']",
+        "input[data-test-id='login-password']",
+        "input[placeholder*='password' i]",
+        "input[type='password']",
+    ]
+    login_btn_selectors = [
+        "button#login_now_button",
+        "input#login_now_button",
+        "button[data-test-id='login-button']",
+        "button[type='submit']",
+    ]
+
+    def first_visible(selectors):
+        for sel in selectors:
+            try:
+                for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+            except Exception:
+                continue
+        return None
+
+    deadline = time.time() + 30
+    user_el = pwd_el = None
+    while time.time() < deadline:
+        user_el = first_visible(user_selectors)
+        pwd_el = first_visible(pwd_selectors)
+        if user_el and pwd_el:
+            break
+        time.sleep(0.5)
+
+    if not user_el or not pwd_el:
+        raise RuntimeError(
+            f"[{profile_label}] Betfair login form not found "
+            f"(username={bool(user_el)}, password={bool(pwd_el)})."
+        )
+
+    try:
+        user_el.click()
+    except Exception:
+        pass
+    try:
+        user_el.clear()
+    except Exception:
+        pass
+    user_el.send_keys(BETFAIR_USERNAME)
+
+    try:
+        pwd_el.click()
+    except Exception:
+        pass
+    try:
+        pwd_el.clear()
+    except Exception:
+        pass
+    pwd_el.send_keys(BETFAIR_PASSWORD)
+
+    btn = first_visible(login_btn_selectors)
+    if btn is not None:
+        try:
+            btn.click()
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].click();", btn)
+            except Exception:
+                pwd_el.send_keys(Keys.ENTER)
+    else:
+        pwd_el.send_keys(Keys.ENTER)
+
+    # Wait for the login to complete (login button disappears or 'Log Out' shows).
+    end = time.time() + 30
+    while time.time() < end:
+        if _is_betfair_logged_in(driver):
+            print(f"[{profile_label}] Betfair login successful.")
+            return
+        time.sleep(1)
+
+    print(
+        f"[{profile_label}] WARNING: Could not confirm Betfair login state within 30s. "
+        "Check the browser manually."
+    )
+
+
 def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True) -> dict:
     """Full lifecycle: start profile, log into BetInAsia/Black, keep open."""
     driver = None
@@ -3594,13 +3738,30 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
         browser_info, was_already_running = start_adspower_profile(profile_id)
 
         if not login_enabled:
-            print(f"[{profile_label}] Skipping BetInAsia/Black login; only the first profile may use the account.")
+            # Profile-2 is dedicated to Betfair, not BetInAsia/Black.
+            print(
+                f"[{profile_label}] Skipping BetInAsia/Black login; this profile is "
+                f"reserved for Betfair."
+            )
+            time.sleep(4)
+            betfair_driver = None
+            try:
+                betfair_driver = connect_to_browser(browser_info, profile_label)
+                login_betfair(betfair_driver, profile_label)
+            except Exception as bf_exc:
+                print(
+                    f"[{profile_label}] Betfair login failed (continuing anyway): {bf_exc}",
+                    file=sys.stderr,
+                )
+            finally:
+                close_driver_bridge(betfair_driver)
             return {
                 "profile_id": profile_id,
                 "profile_label": profile_label,
                 "browser_info": browser_info,
                 "was_already_running": was_already_running,
                 "login_enabled": False,
+                "betfair": True,
             }
 
         # Wait for the browser to fully initialize before connecting
@@ -3669,7 +3830,10 @@ def run_all_profiles(expected_profiles: int = 2, wait_for_enter: bool = False) -
         label = f"Profile-{idx}"
         sessions.append(run_profile(profile_id, label, login_enabled=(idx == 1)))
 
-    print("\nAdsPower profiles are ready. BetInAsia/Black login was performed only on Profile-1.")
+    print(
+        "\nAdsPower profiles are ready. Profile-1 -> BetInAsia/Black, "
+        "Profile-2 -> Betfair."
+    )
 
     if wait_for_enter:
         print("Press Enter to exit (browsers will stay running)...")
