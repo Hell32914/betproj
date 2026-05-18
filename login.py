@@ -422,7 +422,23 @@ def _team_search_queries(team_name: str | None) -> list[str]:
     add(normalized)
     add(team_name)
 
+    # Reserve / youth / women markers that some books strip from their listings
+    # (e.g. "Defensor Sporting (Res)" appears as just "Defensor Sporting" on Black).
+    reserve_markers = {
+        "res", "reserve", "reserves",
+        "ii", "iii", "iv",
+        "b", "c",
+        "u17", "u18", "u19", "u20", "u21", "u23",
+        "w", "women", "fem", "femenino", "feminin", "ladies",
+        "youth", "jr", "juniors", "academy",
+    }
     normalized_parts = normalized.split()
+    stripped_parts = [p for p in normalized_parts if p not in reserve_markers]
+    if stripped_parts and stripped_parts != normalized_parts:
+        add(" ".join(stripped_parts))
+        if len(stripped_parts) >= 2:
+            add(" ".join(stripped_parts[:2]))
+
     if len(normalized_parts) >= 2:
         add(" ".join(normalized_parts[:2]))
     return queries
