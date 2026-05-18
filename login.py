@@ -3590,19 +3590,25 @@ def login(driver: webdriver.Remote, profile_label: str) -> None:
 
 
 def _is_betfair_logged_in(driver: webdriver.Remote) -> bool:
-    """Detect whether the Betfair top bar shows a logged-in state."""
+    """Detect whether the Betfair top bar shows a logged-in state.
+
+    Primary signal: there is no visible password input on the page. The login
+    form sits in the top header and disappears once the user is authenticated.
+    """
     try:
         return bool(driver.execute_script(
             r"""
-            const text = (document.body && document.body.innerText || '').toLowerCase();
-            // 'Log Out' / 'My Account' appear only when authenticated.
-            if (text.indexOf('log out') !== -1) return true;
-            if (text.indexOf('my account') !== -1) return true;
-            // The login form disappears when logged in.
-            const loginBtn = document.querySelector(
-                "button#login_now_button, button[data-test-id='login-button'], input#login_now_button"
-            );
-            return !loginBtn;
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            const pwds = Array.from(document.querySelectorAll("input[type='password']"))
+                .filter(visible);
+            // If a visible password field exists, we are NOT logged in.
+            return pwds.length === 0;
             """
         ))
     except Exception:
