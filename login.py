@@ -3635,45 +3635,58 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
             "Missing BETFAIR_USERNAME / BETFAIR_PASSWORD; cannot log into Betfair."
         )
 
-    # Locate username + password inputs from the top-bar form. Try several
-    # selectors because Betfair occasionally changes ids/attributes.
-    user_selectors = [
-        "input#ssc-liu",
-        "input[name='username']",
-        "input[data-test-id='login-username']",
-        "input[placeholder*='username' i]",
-        "input[type='text']",
-    ]
-    pwd_selectors = [
-        "input#ssc-lipw",
-        "input[name='password']",
-        "input[data-test-id='login-password']",
-        "input[placeholder*='password' i]",
-        "input[type='password']",
-    ]
-    login_btn_selectors = [
-        "button#login_now_button",
-        "input#login_now_button",
-        "button[data-test-id='login-button']",
-        "button[type='submit']",
-    ]
-
-    def first_visible(selectors):
-        for sel in selectors:
-            try:
-                for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                    if el.is_displayed() and el.is_enabled():
-                        return el
-            except Exception:
-                continue
-        return None
-
+    # Locate the login form robustly: pick the <form> that contains a password
+    # field (top-bar login form). Works regardless of UI language.
     deadline = time.time() + 30
-    user_el = pwd_el = None
+    user_el = pwd_el = btn_el = None
     while time.time() < deadline:
-        user_el = first_visible(user_selectors)
-        pwd_el = first_visible(pwd_selectors)
-        if user_el and pwd_el:
+        try:
+            elems = driver.execute_script(
+                r"""
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
+                }
+                const pwds = Array.from(document.querySelectorAll("input[type='password']"))
+                    .filter(visible);
+                if (pwds.length === 0) return null;
+                const pwd = pwds[0];
+                const form = pwd.closest('form') || pwd.parentElement;
+                // Find a visible text/email input within the same form, preferring
+                // ones that come BEFORE the password input.
+                let candidates = [];
+                if (form) {
+                    candidates = Array.from(form.querySelectorAll(
+                        "input[type='text'], input[type='email'], input:not([type])"
+                    )).filter(visible);
+                }
+                // Fall back to nearest text input in the document if needed.
+                if (candidates.length === 0) {
+                    candidates = Array.from(document.querySelectorAll(
+                        "input[type='text'], input[type='email']"
+                    )).filter(visible);
+                }
+                const user = candidates[0] || null;
+                let btn = null;
+                if (form) {
+                    btn = form.querySelector(
+                        "button[type='submit'], input[type='submit'], button#login_now_button, input#login_now_button"
+                    );
+                    if (!btn) {
+                        const btns = Array.from(form.querySelectorAll('button')).filter(visible);
+                        btn = btns[btns.length - 1] || null;
+                    }
+                }
+                return [user, pwd, btn];
+                """
+            )
+        except Exception:
+            elems = None
+        if elems and elems[0] and elems[1]:
+            user_el, pwd_el, btn_el = elems[0], elems[1], elems[2]
             break
         time.sleep(0.5)
 
@@ -3703,13 +3716,12 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
         pass
     pwd_el.send_keys(BETFAIR_PASSWORD)
 
-    btn = first_visible(login_btn_selectors)
-    if btn is not None:
+    if btn_el is not None:
         try:
-            btn.click()
+            btn_el.click()
         except Exception:
             try:
-                driver.execute_script("arguments[0].click();", btn)
+                driver.execute_script("arguments[0].click();", btn_el)
             except Exception:
                 pwd_el.send_keys(Keys.ENTER)
     else:
