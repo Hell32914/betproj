@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors.common import TypeNotFoundError as TelethonTypeNotFoundError
+from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 
 from login import (
     BlackSelectionMissingError,
@@ -368,6 +369,15 @@ async def main():
                 if not client.is_connected():
                     try:
                         await client.connect()
+                    except AuthKeyDuplicatedError as exc:
+                        print(
+                            "Telethon auth key is permanently invalidated "
+                            "(session file used from two IPs simultaneously): "
+                            f"{exc}. Delete betproj_session.session and re-login. "
+                            "Stopping listener to avoid infinite reconnect spam.",
+                            flush=True,
+                        )
+                        return
                     except Exception as conn_exc:
                         print(
                             f"Telethon reconnect failed: {conn_exc!r}; retrying in 5s.",
@@ -393,6 +403,19 @@ async def main():
                 )
                 await asyncio.sleep(2)
                 continue
+            except AuthKeyDuplicatedError as exc:
+                print(
+                    "Telethon auth key is permanently invalidated "
+                    "(session file used from two IPs simultaneously): "
+                    f"{exc}. Delete betproj_session.session and re-login. "
+                    "Stopping listener to avoid infinite reconnect spam.",
+                    flush=True,
+                )
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return
             except Exception as exc:
                 print(f"Telethon listener crashed: {exc!r}; restarting in 5s.", flush=True)
                 try:
