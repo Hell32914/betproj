@@ -27,6 +27,7 @@ from login import (
     place_black_bet,
     refresh_black_default_stake,
     run_all_profiles,
+    update_betfair_default_stake,
 )
 from signals import parse_betting_signal
 
@@ -76,6 +77,28 @@ async def refresh_stakes(state: RuntimeState) -> None:
             f"balance EUR {result['balance']}, stake EUR {result['stake']} ({result['percent']}%).",
             flush=True,
         )
+
+        # Refresh Betfair default stake on Profile-2 (if present).
+        betfair_session = next((s for s in state.sessions if s.get("betfair")), None)
+        if betfair_session is not None:
+            async with state.betfair_lock:
+                try:
+                    bf_result = await loop.run_in_executor(
+                        None, lambda: update_betfair_default_stake(betfair_session)
+                    )
+                    betfair_session["stake"] = bf_result
+                    state.stakes[betfair_session["profile_label"]] = bf_result
+                    print(
+                        f"Default stake refreshed for {betfair_session['profile_label']}: "
+                        f"balance EUR {bf_result['balance']}, stake EUR {bf_result['stake']} "
+                        f"({bf_result['percent']}%).",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"Betfair default stake refresh failed: {exc!r}",
+                        flush=True,
+                    )
 
 
 async def refresh_stakes_daily(state: RuntimeState) -> None:

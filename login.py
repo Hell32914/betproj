@@ -3802,140 +3802,142 @@ def _find_betfair_search_input(driver: webdriver.Remote):
 
 
 def open_betfair_match(session: dict, signal) -> dict:
-    """Open the live match on Betfair for the signal's first team (Profile-2 flow).
+    """Open the match on Betfair for the signal, then click the Back cell of
+    the matching Over/Under <line> Goals market.
 
-    Just navigates and opens the match: no bet placement. Returns a dict with
-    summary info for logging.
+    The driver is closed before returning. Returns a dict with summary info.
     """
     profile_label = session.get("profile_label", "Profile-2")
     team_name = getattr(signal, "home_team", None)
-    opponent_name = getattr(signal, "away_team", None)
     if not team_name:
         raise RuntimeError("Signal does not contain a first team name for Betfair search.")
 
     driver = None
     try:
         driver = connect_to_browser(session["browser_info"], profile_label)
-
-        if BETFAIR_URL_PART not in (driver.current_url or "").lower():
-            print(f"[{profile_label}] Navigating to Betfair: {BETFAIR_LOGIN_URL}")
-            driver.get(BETFAIR_LOGIN_URL)
-            try:
-                WebDriverWait(driver, 20).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-            except Exception:
-                pass
-
-        # Locate the top search input.
-        deadline = time.time() + 20
-        search_el = None
-        while time.time() < deadline:
-            search_el = _find_betfair_search_input(driver)
-            if search_el:
-                break
-            time.sleep(0.5)
-        if not search_el:
-            raise RuntimeError(f"[{profile_label}] Betfair search input not found.")
-
-        # Focus and clear, then type the team name.
+        open_result = _betfair_search_and_open(driver, signal, profile_label)
+        if not open_result.get("opened"):
+            return open_result
         try:
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", search_el)
-        except Exception:
-            pass
-        try:
-            search_el.click()
-        except Exception:
-            try:
-                driver.execute_script("arguments[0].focus();", search_el)
-            except Exception:
-                pass
-        try:
-            search_el.send_keys(Keys.CONTROL, "a")
-            search_el.send_keys(Keys.DELETE)
-        except Exception:
-            pass
-        try:
-            search_el.clear()
-        except Exception:
-            pass
-
-        print(f"[{profile_label}] Betfair search: typing team '{team_name}'")
-        search_el.send_keys(team_name)
-
-        # Wait for the autocomplete dropdown to render, then click the best result.
-        opponent_norm = _normalize_team_text(opponent_name) if opponent_name else ""
-        team_norm = _normalize_team_text(team_name)
-        end = time.time() + 12
-        clicked_label = None
-        while time.time() < end:
-            clicked_label = driver.execute_script(
-                r"""
-                const teamNorm = arguments[0];
-                const oppNorm = arguments[1];
-                function visible(el) {
-                    if (!el) return false;
-                    const r = el.getBoundingClientRect();
-                    if (r.width === 0 || r.height === 0) return false;
-                    const cs = window.getComputedStyle(el);
-                    return cs.visibility !== 'hidden' && cs.display !== 'none';
-                }
-                function norm(s) {
-                    return (s || '').toLowerCase()
-                        .replace(/[^a-z0-9]+/g, ' ')
-                        .trim();
-                }
-                // Gather plausible result items: links/list-items/buttons that appeared
-                // after typing into the search box.
-                const items = Array.from(document.querySelectorAll(
-                    "a, li, [role='option'], [role='listitem'], [role='menuitem']"
-                )).filter(visible).map((el) => {
-                    const text = (el.innerText || el.textContent || '').trim();
-                    return { el, text, n: norm(text) };
-                }).filter((it) => it.text && it.n.indexOf(teamNorm) !== -1);
-                if (items.length === 0) return null;
-                // Prefer one that also mentions the opponent.
-                let pick = null;
-                if (oppNorm) {
-                    pick = items.find((it) => it.n.indexOf(oppNorm) !== -1);
-                }
-                if (!pick) pick = items[0];
-                pick.el.scrollIntoView({block: 'center'});
-                pick.el.click();
-                return pick.text.slice(0, 200);
-                """,
-                team_norm,
-                opponent_norm,
+            sel_result = _select_betfair_overunder_back(driver, signal, profile_label)
+            open_result.update(sel_result)
+        except Exception as exc:
+            print(
+                f"[{profile_label}] Betfair Over/Under selection failed: {exc}",
+                flush=True,
             )
-            if clicked_label:
-                break
-            time.sleep(0.5)
+            open_result["selection_error"] = str(exc)
+        return open_result
+    finally:
+        close_driver_bridge(driver)
 
-        if not clicked_label:
-            # No autocomplete match — submit the search and let Betfair show the
-            # results page. The user can then proceed manually if needed.
-            print(f"[{profile_label}] No Betfair autocomplete result; submitting search via Enter.")
-            try:
-                search_el.send_keys(Keys.ENTER)
-            except Exception:
-                pass
-            try:
-                WebDriverWait(driver, 10).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-            except Exception:
-                pass
-            return {
-                "profile_label": profile_label,
-                "team": team_name,
-                "opponent": opponent_name,
-                "opened": False,
-                "url": driver.current_url,
-            }
 
-        print(f"[{profile_label}] Betfair opened result: {clicked_label!r}")
+def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: str) -> dict:
+    """Search Betfair for the signal's first team and open the best match.
+
+    Returns a dict with at least {opened: bool, url: str, label: str|None}.
+    """
+    team_name = getattr(signal, "home_team", None)
+    opponent_name = getattr(signal, "away_team", None)
+    if not team_name:
+        raise RuntimeError("Signal does not contain a first team name for Betfair search.")
+
+    if BETFAIR_URL_PART not in (driver.current_url or "").lower():
+        print(f"[{profile_label}] Navigating to Betfair: {BETFAIR_LOGIN_URL}")
+        driver.get(BETFAIR_LOGIN_URL)
         try:
-            WebDriverWait(driver, 15).until(
+            WebDriverWait(driver, 20).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            pass
+
+    deadline = time.time() + 20
+    search_el = None
+    while time.time() < deadline:
+        search_el = _find_betfair_search_input(driver)
+        if search_el:
+            break
+        time.sleep(0.5)
+    if not search_el:
+        raise RuntimeError(f"[{profile_label}] Betfair search input not found.")
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", search_el)
+    except Exception:
+        pass
+    try:
+        search_el.click()
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].focus();", search_el)
+        except Exception:
+            pass
+    try:
+        search_el.send_keys(Keys.CONTROL, "a")
+        search_el.send_keys(Keys.DELETE)
+    except Exception:
+        pass
+    try:
+        search_el.clear()
+    except Exception:
+        pass
+
+    print(f"[{profile_label}] Betfair search: typing team '{team_name}'")
+    search_el.send_keys(team_name)
+
+    opponent_norm = _normalize_team_text(opponent_name) if opponent_name else ""
+    team_norm = _normalize_team_text(team_name)
+    end = time.time() + 12
+    clicked_label = None
+    while time.time() < end:
+        clicked_label = driver.execute_script(
+            r"""
+            const teamNorm = arguments[0];
+            const oppNorm = arguments[1];
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            function norm(s) {
+                return (s || '').toLowerCase()
+                    .replace(/[^a-z0-9]+/g, ' ')
+                    .trim();
+            }
+            const items = Array.from(document.querySelectorAll(
+                "a, li, [role='option'], [role='listitem'], [role='menuitem']"
+            )).filter(visible).map((el) => {
+                const text = (el.innerText || el.textContent || '').trim();
+                return { el, text, n: norm(text) };
+            }).filter((it) => it.text && it.n.indexOf(teamNorm) !== -1);
+            if (items.length === 0) return null;
+            let pick = null;
+            if (oppNorm) {
+                pick = items.find((it) => it.n.indexOf(oppNorm) !== -1);
+            }
+            if (!pick) pick = items[0];
+            pick.el.scrollIntoView({block: 'center'});
+            pick.el.click();
+            return pick.text.slice(0, 200);
+            """,
+            team_norm,
+            opponent_norm,
+        )
+        if clicked_label:
+            break
+        time.sleep(0.5)
+
+    if not clicked_label:
+        print(f"[{profile_label}] No Betfair autocomplete result; submitting search via Enter.")
+        try:
+            search_el.send_keys(Keys.ENTER)
+        except Exception:
+            pass
+        try:
+            WebDriverWait(driver, 10).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
         except Exception:
@@ -3944,10 +3946,477 @@ def open_betfair_match(session: dict, signal) -> dict:
             "profile_label": profile_label,
             "team": team_name,
             "opponent": opponent_name,
-            "opened": True,
-            "label": clicked_label,
+            "opened": False,
             "url": driver.current_url,
         }
+
+    print(f"[{profile_label}] Betfair opened result: {clicked_label!r}")
+    try:
+        WebDriverWait(driver, 15).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except Exception:
+        pass
+    return {
+        "profile_label": profile_label,
+        "team": team_name,
+        "opponent": opponent_name,
+        "opened": True,
+        "label": clicked_label,
+        "url": driver.current_url,
+    }
+
+
+def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_label: str) -> dict:
+    """Click the Back (blue) odds cell for the Over/Under <line> Goals selection.
+
+    Picks blue vs pink by comparing computed background-color (Back is blue, Lay
+    is pink), with fallbacks on class/aria hints.
+    """
+    selection = (getattr(signal, "selection", "") or "").strip().lower()
+    if selection not in ("over", "under"):
+        raise RuntimeError(f"Unsupported Betfair selection: {selection!r}")
+    line_value = getattr(signal, "line", None)
+    if line_value is None:
+        raise RuntimeError("Signal has no line value for Betfair Over/Under.")
+    line_str = format(Decimal(str(line_value)).normalize(), "f")
+
+    # Wait for the match page to render markets.
+    end = time.time() + 25
+    info = None
+    while time.time() < end:
+        info = driver.execute_script(
+            r"""
+            const want = arguments[0];           // 'over' or 'under'
+            const lineStr = arguments[1];        // '1.5'
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            function txt(el) { return ((el.innerText || el.textContent || '')).trim(); }
+            function parseRgb(s) {
+                const m = (s || '').match(/rgba?\(([^)]+)\)/);
+                if (!m) return null;
+                const parts = m[1].split(',').map((x) => parseFloat(x.trim()));
+                return { r: parts[0]||0, g: parts[1]||0, b: parts[2]||0 };
+            }
+            // Find a market card whose header text contains 'over/under <line> goals'.
+            const wantHeader = ('over/under ' + lineStr + ' goals').toLowerCase();
+            const headerCandidates = Array.from(document.querySelectorAll(
+                "h1,h2,h3,h4,h5,div,span,a,header"
+            )).filter(visible).filter((el) => {
+                const t = txt(el).toLowerCase();
+                return t.indexOf(wantHeader) !== -1 && t.length < 80;
+            });
+            if (headerCandidates.length === 0) {
+                return { error: 'market header not found', wantHeader };
+            }
+            // Pick the header whose nearest ancestor card has selection rows under it.
+            let card = null;
+            for (const h of headerCandidates) {
+                let p = h;
+                for (let i = 0; i < 8 && p; i++) {
+                    p = p.parentElement;
+                    if (!p) break;
+                    const t = (p.innerText || '').toLowerCase();
+                    if (t.indexOf('over') !== -1 && t.indexOf('under') !== -1) {
+                        card = p;
+                        break;
+                    }
+                }
+                if (card) break;
+            }
+            if (!card) {
+                return { error: 'market card not found', wantHeader };
+            }
+            // Find the row whose label starts with the wanted selection.
+            const rowCandidates = Array.from(card.querySelectorAll("*"))
+                .filter(visible)
+                .filter((el) => {
+                    const t = txt(el).toLowerCase();
+                    if (t.length === 0 || t.length > 200) return false;
+                    return t.startsWith(want + ' ') || t === want;
+                });
+            if (rowCandidates.length === 0) {
+                return { error: 'selection label not found in card', want };
+            }
+            // Walk up from the label until we find a row container that also has
+            // price cells beside it.
+            function findRow(label) {
+                let p = label;
+                for (let i = 0; i < 6 && p; i++) {
+                    p = p.parentElement;
+                    if (!p) break;
+                    // A row should contain numeric price text.
+                    const priceCells = Array.from(p.querySelectorAll("*"))
+                        .filter(visible)
+                        .filter((el) => /^\d+(\.\d+)?$/.test(txt(el)));
+                    if (priceCells.length >= 2) return { row: p, prices: priceCells };
+                }
+                return null;
+            }
+            let rowInfo = null;
+            for (const lab of rowCandidates) {
+                rowInfo = findRow(lab);
+                if (rowInfo) break;
+            }
+            if (!rowInfo) {
+                return { error: 'row container with price cells not found' };
+            }
+            // Score each price cell to pick the Back (blue) one.
+            const scored = rowInfo.prices.map((priceEl) => {
+                // Find a clickable ancestor (button or with role=button or with
+                // class containing 'back'/'lay').
+                let target = priceEl;
+                for (let i = 0; i < 6 && target.parentElement; i++) {
+                    const tag = target.tagName.toLowerCase();
+                    const cls = (target.className && target.className.toString
+                        ? target.className.toString().toLowerCase() : '');
+                    if (tag === 'button' || target.getAttribute('role') === 'button'
+                        || cls.indexOf('back') !== -1 || cls.indexOf('lay') !== -1) {
+                        break;
+                    }
+                    target = target.parentElement;
+                }
+                const cs = window.getComputedStyle(target);
+                const bg = parseRgb(cs.backgroundColor) || { r: 255, g: 255, b: 255 };
+                const cls = (target.className && target.className.toString
+                    ? target.className.toString().toLowerCase() : '');
+                const aria = ((target.getAttribute('aria-label') || '') + ' '
+                    + (target.getAttribute('title') || '')).toLowerCase();
+                let score = 0;
+                if (cls.indexOf('back') !== -1) score += 50;
+                if (cls.indexOf('lay') !== -1) score -= 50;
+                if (aria.indexOf('back') !== -1) score += 30;
+                if (aria.indexOf('lay') !== -1) score -= 30;
+                // Blue dominates over red for Back; pink/red dominates for Lay.
+                if (bg.b > bg.r + 10) score += 20;
+                if (bg.r > bg.b + 10) score -= 20;
+                const rect = target.getBoundingClientRect();
+                return { target, score, rect, priceText: txt(priceEl), bg, cls };
+            });
+            scored.sort((a, b) => b.score - a.score || a.rect.left - b.rect.left);
+            const pick = scored[0];
+            if (!pick || pick.score < 0) {
+                return { error: 'no Back cell could be identified', scored: scored.map((s) => ({ score: s.score, price: s.priceText, cls: s.cls })) };
+            }
+            pick.target.scrollIntoView({ block: 'center', inline: 'center' });
+            pick.target.click();
+            return { ok: true, priceText: pick.priceText, score: pick.score, bg: pick.bg, cls: pick.cls };
+            """,
+            selection,
+            line_str,
+        )
+        if info and info.get("ok"):
+            break
+        time.sleep(0.6)
+
+    if not info or not info.get("ok"):
+        raise RuntimeError(
+            f"[{profile_label}] Could not select Betfair Back {selection.title()} "
+            f"{line_str} Goals: {info!r}"
+        )
+    print(
+        f"[{profile_label}] Betfair Back selected: {selection.title()} {line_str} "
+        f"Goals at odds {info.get('priceText')}"
+    )
+    return {
+        "betfair_selection": f"{selection.title()} {line_str}",
+        "betfair_odds": info.get("priceText"),
+    }
+
+
+def _read_betfair_balance(driver: webdriver.Remote, profile_label: str) -> Decimal:
+    """Read the main balance shown in the top bar after Betfair login."""
+    text = driver.execute_script(
+        r"""
+        function visible(el) {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const cs = window.getComputedStyle(el);
+            return cs.visibility !== 'hidden' && cs.display !== 'none';
+        }
+        // The balance area contains the text 'Main' near a currency amount.
+        const nodes = Array.from(document.querySelectorAll("*")).filter(visible);
+        for (const n of nodes) {
+            const t = (n.innerText || '').trim();
+            if (t.length > 0 && t.length < 200 && /\bmain\b/i.test(t)
+                && /[€£$]\s*\d/.test(t)) {
+                return t;
+            }
+        }
+        return null;
+        """
+    )
+    if not text:
+        raise RuntimeError(f"[{profile_label}] Could not read Betfair balance from top bar.")
+    m = re.search(r"[€£$]\s*([\d.,]+)", text)
+    if not m:
+        raise RuntimeError(f"[{profile_label}] Betfair balance text has no amount: {text!r}")
+    amount = m.group(1).replace(",", "")
+    return Decimal(amount)
+
+
+def _open_betfair_settings_panel(driver: webdriver.Remote, profile_label: str) -> None:
+    opened = driver.execute_script(
+        r"""
+        function visible(el) {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const cs = window.getComputedStyle(el);
+            return cs.visibility !== 'hidden' && cs.display !== 'none';
+        }
+        // Find a clickable element labeled 'Settings'.
+        const candidates = Array.from(document.querySelectorAll(
+            "a, button, [role='button'], div, span"
+        )).filter(visible).filter((el) => {
+            const t = (el.innerText || '').trim().toLowerCase();
+            return (t === 'settings' || t.startsWith('settings'))
+                && t.length < 30;
+        });
+        if (candidates.length === 0) return false;
+        // Prefer one near the top-right.
+        candidates.sort((a, b) => {
+            const ra = a.getBoundingClientRect();
+            const rb = b.getBoundingClientRect();
+            return (ra.top + (window.innerWidth - ra.right)) - (rb.top + (window.innerWidth - rb.right));
+        });
+        candidates[0].scrollIntoView({ block: 'center' });
+        candidates[0].click();
+        return true;
+        """
+    )
+    if not opened:
+        raise RuntimeError(f"[{profile_label}] Could not click Betfair Settings link.")
+    time.sleep(0.6)
+
+
+def _set_betfair_default_stake(driver: webdriver.Remote, stake: str, profile_label: str) -> None:
+    _open_betfair_settings_panel(driver, profile_label)
+
+    # Click the "Betting" tab.
+    clicked_betting = False
+    end = time.time() + 8
+    while time.time() < end and not clicked_betting:
+        clicked_betting = bool(driver.execute_script(
+            r"""
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            const cands = Array.from(document.querySelectorAll(
+                "a, button, [role='button'], [role='tab'], li, div, span"
+            )).filter(visible).filter((el) => {
+                const t = (el.innerText || '').trim().toLowerCase();
+                return t === 'betting' && t.length < 20;
+            });
+            if (cands.length === 0) return false;
+            cands[0].scrollIntoView({ block: 'center' });
+            cands[0].click();
+            return true;
+            """
+        ))
+        if not clicked_betting:
+            time.sleep(0.4)
+    if not clicked_betting:
+        raise RuntimeError(f"[{profile_label}] Could not click Betting tab in Settings.")
+
+    # Ensure 'Default stake' checkbox is checked (some users have it off).
+    try:
+        driver.execute_script(
+            r"""
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            const labels = Array.from(document.querySelectorAll("label, div, span"))
+                .filter(visible).filter((el) => {
+                    const t = (el.innerText || '').trim().toLowerCase();
+                    return t === 'default stake';
+                });
+            for (const lab of labels) {
+                let scope = lab.closest('label') || lab.parentElement;
+                if (!scope) continue;
+                const cb = scope.querySelector("input[type='checkbox']");
+                if (cb && !cb.checked) cb.click();
+            }
+            """
+        )
+    except Exception:
+        pass
+    time.sleep(0.3)
+
+    # Click 'Edit' button inside the Betting panel.
+    clicked_edit = bool(driver.execute_script(
+        r"""
+        function visible(el) {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const cs = window.getComputedStyle(el);
+            return cs.visibility !== 'hidden' && cs.display !== 'none';
+        }
+        const cands = Array.from(document.querySelectorAll(
+            "a, button, [role='button'], span, div"
+        )).filter(visible).filter((el) => {
+            const t = (el.innerText || '').trim().toLowerCase();
+            return t === 'edit';
+        });
+        if (cands.length === 0) return false;
+        // Prefer one whose nearest container also mentions 'Default stake'.
+        let pick = cands.find((el) => {
+            let p = el;
+            for (let i = 0; i < 6 && p; i++) {
+                p = p.parentElement;
+                if (!p) break;
+                if (((p.innerText || '').toLowerCase()).indexOf('default stake') !== -1) return true;
+            }
+            return false;
+        });
+        if (!pick) pick = cands[0];
+        pick.scrollIntoView({ block: 'center' });
+        pick.click();
+        return true;
+        """
+    ))
+    if not clicked_edit:
+        raise RuntimeError(f"[{profile_label}] Could not click Edit for Default stake.")
+    time.sleep(0.4)
+
+    # Fill the 3 stake inputs and click 'Set'.
+    result = driver.execute_script(
+        r"""
+        const stake = arguments[0];
+        function visible(el) {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const cs = window.getComputedStyle(el);
+            return cs.visibility !== 'hidden' && cs.display !== 'none';
+        }
+        // Find the 'Default stake' label, walk up to a container holding inputs.
+        const labels = Array.from(document.querySelectorAll("label, div, span"))
+            .filter(visible).filter((el) => {
+                const t = (el.innerText || '').trim().toLowerCase();
+                return t === 'default stake';
+            });
+        let container = null;
+        for (const lab of labels) {
+            let p = lab;
+            for (let i = 0; i < 8 && p; i++) {
+                p = p.parentElement;
+                if (!p) break;
+                const inputs = Array.from(p.querySelectorAll("input"))
+                    .filter(visible)
+                    .filter((inp) => {
+                        const t = (inp.type || '').toLowerCase();
+                        return t === '' || t === 'text' || t === 'number' || t === 'tel';
+                    });
+                if (inputs.length >= 3) { container = p; break; }
+            }
+            if (container) break;
+        }
+        if (!container) {
+            // Fall back: any container that has 3+ numeric inputs near a 'Set' button.
+            const setBtns = Array.from(document.querySelectorAll("a, button, [role='button']"))
+                .filter(visible).filter((el) => (el.innerText || '').trim().toLowerCase() === 'set');
+            for (const b of setBtns) {
+                let p = b;
+                for (let i = 0; i < 8 && p; i++) {
+                    p = p.parentElement;
+                    if (!p) break;
+                    const inputs = Array.from(p.querySelectorAll("input")).filter(visible)
+                        .filter((inp) => {
+                            const t = (inp.type || '').toLowerCase();
+                            return t === '' || t === 'text' || t === 'number' || t === 'tel';
+                        });
+                    if (inputs.length >= 3) { container = p; break; }
+                }
+                if (container) break;
+            }
+        }
+        if (!container) return { error: 'stake inputs container not found' };
+        const inputs = Array.from(container.querySelectorAll("input")).filter(visible)
+            .filter((inp) => {
+                const t = (inp.type || '').toLowerCase();
+                return t === '' || t === 'text' || t === 'number' || t === 'tel';
+            }).slice(0, 3);
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value').set;
+        for (const inp of inputs) {
+            try { inp.focus(); } catch (e) {}
+            try { inp.select(); } catch (e) {}
+            nativeSetter.call(inp, '');
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            nativeSetter.call(inp, stake);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            inp.dispatchEvent(new Event('blur', { bubbles: true }));
+        }
+        // Click 'Set' inside the same container if present, else globally.
+        let setBtn = Array.from(container.querySelectorAll("a, button, [role='button']"))
+            .filter(visible).find((el) => (el.innerText || '').trim().toLowerCase() === 'set');
+        if (!setBtn) {
+            setBtn = Array.from(document.querySelectorAll("a, button, [role='button']"))
+                .filter(visible).find((el) => (el.innerText || '').trim().toLowerCase() === 'set');
+        }
+        if (setBtn) {
+            setBtn.scrollIntoView({ block: 'center' });
+            setBtn.click();
+        }
+        return { ok: true, filled: inputs.length, set: !!setBtn };
+        """,
+        stake,
+    )
+    if not result or not result.get("ok"):
+        raise RuntimeError(f"[{profile_label}] Could not set Betfair default stake: {result!r}")
+    print(
+        f"[{profile_label}] Betfair Default Stake set to EUR {stake} "
+        f"(inputs filled: {result.get('filled')}, set clicked: {result.get('set')})."
+    )
+    time.sleep(0.5)
+    # Try to dismiss the Settings panel by sending Escape (best-effort).
+    try:
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    except Exception:
+        pass
+
+
+def update_betfair_default_stake(session: dict) -> dict:
+    """Read Betfair balance, compute stake and write it as default stake (×3 inputs).
+
+    Returns {balance, stake, percent} like update_black_default_stake.
+    """
+    profile_label = session.get("profile_label", "Profile-2")
+    driver = None
+    try:
+        driver = connect_to_browser(session["browser_info"], profile_label)
+        # Make sure we're on a Betfair page where the balance and Settings live.
+        if BETFAIR_URL_PART not in (driver.current_url or "").lower():
+            driver.get(BETFAIR_LOGIN_URL)
+            try:
+                WebDriverWait(driver, 20).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
+                pass
+        balance = _read_betfair_balance(driver, profile_label)
+        print(f"[{profile_label}] Betfair balance: EUR {balance}")
+        stake_amount = _calculate_stake_from_balance(balance)
+        stake = _format_stake_amount(stake_amount)
+        _set_betfair_default_stake(driver, stake, profile_label)
+        return {"balance": str(balance), "stake": stake, "percent": str(STAKE_PERCENT)}
     finally:
         close_driver_bridge(driver)
 
@@ -3978,6 +4447,24 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
                 )
             finally:
                 close_driver_bridge(betfair_driver)
+            betfair_stake_result = None
+            try:
+                betfair_stake_result = update_betfair_default_stake({
+                    "browser_info": browser_info,
+                    "profile_label": profile_label,
+                })
+                print(
+                    f"[{profile_label}] Betfair default stake refreshed on startup: "
+                    f"balance EUR {betfair_stake_result['balance']}, "
+                    f"stake EUR {betfair_stake_result['stake']} "
+                    f"({betfair_stake_result['percent']}%)."
+                )
+            except Exception as st_exc:
+                print(
+                    f"[{profile_label}] Startup Betfair default stake refresh failed, "
+                    f"continuing: {st_exc}",
+                    file=sys.stderr,
+                )
             return {
                 "profile_id": profile_id,
                 "profile_label": profile_label,
@@ -3985,6 +4472,7 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
                 "was_already_running": was_already_running,
                 "login_enabled": False,
                 "betfair": True,
+                "stake": betfair_stake_result,
             }
 
         # Wait for the browser to fully initialize before connecting
