@@ -4390,25 +4390,48 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
             }
             inp.dispatchEvent(new Event('input', { bubbles: true }));
             inp.dispatchEvent(new Event('change', { bubbles: true }));
-            // Find and click the Place Bet button.
-            const btns = Array.from(document.querySelectorAll(
-                "button, [role='button'], input[type='submit']"
-            )).filter(visible).filter((el) => {
-                const t = (el.innerText || el.value || '').trim().toLowerCase();
-                return t === 'place bets' || t === 'place bet' || t.startsWith('place bet');
-            });
-            if (btns.length === 0) return { stakeSet: true, error: 'place bet button not found' };
-            btns[0].scrollIntoView({ block: 'center' });
-            btns[0].click();
-            return { ok: true };
+            return { stakeSet: true };
             """,
             stake_str,
         )
-        if isinstance(placed, dict) and placed.get("ok"):
-            bet_placed = True
-            print(f"[{profile_label}] Betfair: bet placed — {selection.title()} {line_str} @ {odds_text}, stake {stake_str}")
+        if not (isinstance(placed, dict) and placed.get("stakeSet")):
+            print(f"[{profile_label}] Betfair: stake fill result: {placed!r}", flush=True)
         else:
-            print(f"[{profile_label}] Betfair: bet placement result: {placed!r}", flush=True)
+            # Wait for Betfair UI to update button label to "Confirm bet".
+            time.sleep(1.2)
+            confirmed = driver.execute_script(
+                r"""
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
+                }
+                const btns = Array.from(document.querySelectorAll(
+                    "button, [role='button'], input[type='submit']"
+                )).filter(visible).filter((el) => {
+                    const t = (el.innerText || el.value || '').trim().toLowerCase();
+                    return t === 'confirm bet' || t === 'confirm bets'
+                        || t === 'place bet' || t === 'place bets'
+                        || t.startsWith('confirm bet') || t.startsWith('place bet');
+                });
+                if (btns.length === 0) return { error: 'confirm/place button not found' };
+                const btn = btns[0];
+                btn.scrollIntoView({ block: 'center' });
+                btn.click();
+                return { ok: true, label: (btn.innerText || btn.value || '').trim() };
+                """
+            )
+            if isinstance(confirmed, dict) and confirmed.get("ok"):
+                bet_placed = True
+                print(
+                    f"[{profile_label}] Betfair: bet confirmed — "
+                    f"{selection.title()} {line_str} @ {odds_text}, stake {stake_str} "
+                    f"(btn: {confirmed.get('label')!r})"
+                )
+            else:
+                print(f"[{profile_label}] Betfair: confirm click result: {confirmed!r}", flush=True)
 
     return {
         "betfair_selection": f"{selection.title()} {line_str}",
