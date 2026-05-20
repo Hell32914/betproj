@@ -2004,11 +2004,23 @@ def _open_black_live_match(
 
         const rowMatchesTeams = (text) => {
             const t = normalize(text);
+            const fuzzyHas = (word) => {
+                if (!word) return false;
+                if (t.includes(word)) return true;
+                // Allow a >=4-char shared prefix with any token (typo tolerance).
+                const toks = t.split(' ');
+                for (const tok of toks) {
+                    const k = Math.min(tok.length, word.length, 4);
+                    if (k >= 4 && tok.slice(0, k) === word.slice(0, k)) return true;
+                }
+                return false;
+            };
+            const teamHits = teamWords.filter(fuzzyHas).length;
             const hasTeam = !teamWords.length
-                || teamWords.every((word) => t.includes(word))
+                || teamHits >= Math.max(1, teamWords.length - 1)
                 || teamVariants.some((value) => normalize(value) && t.includes(normalize(value)));
             const hasOpponent = !opponentWords.length
-                || opponentWords.some((word) => t.includes(word))
+                || opponentWords.some(fuzzyHas)
                 || opponentVariants.some((value) => normalize(value) && t.includes(normalize(value)));
             return hasTeam && hasOpponent;
         };
@@ -3832,6 +3844,57 @@ def open_betfair_match(session: dict, signal) -> dict:
         close_driver_bridge(driver)
 
 
+_BETFAIR_FUZZY_HELPERS = r"""
+function visible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.visibility !== 'hidden' && cs.display !== 'none';
+}
+function norm(s) {
+    return (s || '').toLowerCase()
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+function tokens(s) {
+    return norm(s).split(' ').filter((w) => w.length >= 3);
+}
+function wordMatch(text, word) {
+    // Word matches if it appears as a substring, OR shares a >=4-char prefix
+    // with any whitespace-separated token (covers source typos like "whalen" vs "whale").
+    if (!word) return false;
+    if (text.indexOf(word) !== -1) return true;
+    const toks = text.split(' ');
+    for (const t of toks) {
+        if (!t) continue;
+        const k = Math.min(t.length, word.length, 4);
+        if (k >= 4 && t.slice(0, k) === word.slice(0, k)) return true;
+    }
+    return false;
+}
+function fuzzyTeamScore(candidateNorm, teamNorm, oppNorm) {
+    const t = candidateNorm || '';
+    const teamWords = tokens(teamNorm);
+    const oppWords = tokens(oppNorm);
+    let score = 0;
+    let teamHits = 0, oppHits = 0;
+    for (const w of teamWords) if (wordMatch(t, w)) teamHits++;
+    for (const w of oppWords) if (wordMatch(t, w)) oppHits++;
+    if (teamWords.length === 0 && oppWords.length === 0) return 0;
+    // Need at least one hit and at most one missing team word.
+    if (teamWords.length && teamHits < Math.max(1, teamWords.length - 1)) return 0;
+    score += teamHits * 30;
+    score += oppHits * 35;
+    // Heavy bonus for exact substring of full normalized team/opp.
+    if (teamNorm && t.indexOf(teamNorm) !== -1) score += 60;
+    if (oppNorm && t.indexOf(oppNorm) !== -1) score += 80;
+    return score;
+}
+"""
+
+
 def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: str) -> dict:
     """Search Betfair for the signal's first team and open the best match.
 
@@ -3892,33 +3955,18 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
     clicked_label = None
     while time.time() < end:
         clicked_label = driver.execute_script(
-            r"""
+            _BETFAIR_FUZZY_HELPERS + r"""
             const teamNorm = arguments[0];
             const oppNorm = arguments[1];
-            function visible(el) {
-                if (!el) return false;
-                const r = el.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) return false;
-                const cs = window.getComputedStyle(el);
-                return cs.visibility !== 'hidden' && cs.display !== 'none';
-            }
-            function norm(s) {
-                return (s || '').toLowerCase()
-                    .replace(/[^a-z0-9]+/g, ' ')
-                    .trim();
-            }
             const items = Array.from(document.querySelectorAll(
                 "a, li, [role='option'], [role='listitem'], [role='menuitem']"
             )).filter(visible).map((el) => {
                 const text = (el.innerText || el.textContent || '').trim();
-                return { el, text, n: norm(text) };
-            }).filter((it) => it.text && it.n.indexOf(teamNorm) !== -1);
+                return { el, text, n: norm(text), score: fuzzyTeamScore(norm(text), teamNorm, oppNorm) };
+            }).filter((it) => it.text && it.text.length < 250 && it.score > 0);
             if (items.length === 0) return null;
-            let pick = null;
-            if (oppNorm) {
-                pick = items.find((it) => it.n.indexOf(oppNorm) !== -1);
-            }
-            if (!pick) pick = items[0];
+            items.sort((a, b) => b.score - a.score);
+            const pick = items[0];
             pick.el.scrollIntoView({block: 'center'});
             pick.el.click();
             return pick.text.slice(0, 200);
@@ -4002,36 +4050,24 @@ def _follow_betfair_search_results(
         if not on_results:
             return None
         clicked = driver.execute_script(
-            r"""
+            _BETFAIR_FUZZY_HELPERS + r"""
             const teamNorm = arguments[0];
             const oppNorm = arguments[1];
-            function visible(el) {
-                if (!el) return false;
-                const r = el.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) return false;
-                const cs = window.getComputedStyle(el);
-                return cs.visibility !== 'hidden' && cs.display !== 'none';
-            }
-            function norm(s) {
-                return (s || '').toLowerCase()
-                    .replace(/[^a-z0-9]+/g, ' ')
-                    .trim();
-            }
             // Result links: anchors in the results area; we filter by text and
             // exclude obvious nav links.
             const anchors = Array.from(document.querySelectorAll("a"))
                 .filter(visible)
                 .map((a) => {
                     const text = (a.innerText || a.textContent || '').trim();
-                    return { el: a, text, n: norm(text), href: a.getAttribute('href') || '' };
+                    const n = norm(text);
+                    return { el: a, text, n,
+                        score: fuzzyTeamScore(n, teamNorm, oppNorm),
+                        hasVs: /\bv(s)?\b/i.test(text) };
                 })
-                .filter((it) => it.text && it.text.length < 200
-                    && it.n.indexOf(teamNorm) !== -1
-                    && /\bv(s)?\b/i.test(it.text));
+                .filter((it) => it.text && it.text.length < 250 && it.hasVs && it.score > 0);
             if (anchors.length === 0) return null;
-            let pick = null;
-            if (oppNorm) pick = anchors.find((it) => it.n.indexOf(oppNorm) !== -1);
-            if (!pick) pick = anchors[0];
+            anchors.sort((a, b) => b.score - a.score);
+            const pick = anchors[0];
             pick.el.scrollIntoView({ block: 'center' });
             pick.el.click();
             return pick.text.slice(0, 200);
