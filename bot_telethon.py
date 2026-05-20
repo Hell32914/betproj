@@ -23,6 +23,7 @@ from login import (
     BlackSelectionMissingError,
     check_black_order_by_id,
     keep_black_session_alive,
+    open_betfair_match,
     place_black_bet,
     refresh_black_default_stake,
     run_all_profiles,
@@ -50,6 +51,7 @@ class RuntimeState:
         self.ready = asyncio.Event()
         self.bet_lock = asyncio.Lock()
         self.stake_lock = asyncio.Lock()
+        self.betfair_lock = asyncio.Lock()
 
 
 def seconds_until_next_stake_refresh() -> float:
@@ -254,6 +256,33 @@ async def main():
                 return
 
             await event.reply(_format_signal_work_message(signal))
+
+            async def process_betfair_open():
+                """Profile-2 mirror flow: open the same match on Betfair."""
+                await state.ready.wait()
+                betfair_session = next(
+                    (s for s in state.sessions if s.get("betfair")),
+                    None,
+                )
+                if betfair_session is None:
+                    return
+                async with state.betfair_lock:
+                    loop = asyncio.get_running_loop()
+                    try:
+                        result = await loop.run_in_executor(
+                            None, lambda: open_betfair_match(betfair_session, signal)
+                        )
+                        print(
+                            f"Betfair match open completed: opened={result.get('opened')}, "
+                            f"label={result.get('label')!r}, url={result.get('url')}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        detail = _describe_exception(exc)
+                        print(f"Betfair match open failed: {detail}", flush=True)
+                        traceback.print_exc()
+
+            asyncio.create_task(process_betfair_open())
 
             async def process_signal_reply():
                 await state.ready.wait()

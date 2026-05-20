@@ -3763,6 +3763,195 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
     )
 
 
+def _find_betfair_search_input(driver: webdriver.Remote):
+    """Return the top-bar Betfair search input element, or None."""
+    return driver.execute_script(
+        r"""
+        function visible(el) {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const cs = window.getComputedStyle(el);
+            return cs.visibility !== 'hidden' && cs.display !== 'none';
+        }
+        // Prefer explicit search inputs (type=search), then text inputs whose
+        // placeholder/aria mentions team/competition/event/sport in any language.
+        const all = Array.from(document.querySelectorAll(
+            "input[type='search'], input[type='text'], input:not([type])"
+        )).filter(visible);
+        // Exclude obvious login fields by ignoring inputs whose closest <form>
+        // also contains a password field.
+        const candidates = all.filter((el) => {
+            const f = el.closest('form');
+            if (f && f.querySelector("input[type='password']")) return false;
+            return true;
+        });
+        const hint = (el) => ((el.getAttribute('placeholder') || '') + ' '
+            + (el.getAttribute('aria-label') || '') + ' '
+            + (el.getAttribute('name') || '') + ' '
+            + (el.id || '')).toLowerCase();
+        const keywords = [
+            'search', 'find', 'team', 'teams', 'competition', 'event', 'sport', 'market',
+            'команд', 'соревн', 'событ', 'поиск', 'найти'
+        ];
+        const scored = candidates
+            .filter((el) => keywords.some((kw) => hint(el).indexOf(kw) !== -1));
+        return scored[0] || candidates[0] || null;
+        """
+    )
+
+
+def open_betfair_match(session: dict, signal) -> dict:
+    """Open the live match on Betfair for the signal's first team (Profile-2 flow).
+
+    Just navigates and opens the match: no bet placement. Returns a dict with
+    summary info for logging.
+    """
+    profile_label = session.get("profile_label", "Profile-2")
+    team_name = getattr(signal, "home_team", None)
+    opponent_name = getattr(signal, "away_team", None)
+    if not team_name:
+        raise RuntimeError("Signal does not contain a first team name for Betfair search.")
+
+    driver = None
+    try:
+        driver = connect_to_browser(session["browser_info"], profile_label)
+
+        if BETFAIR_URL_PART not in (driver.current_url or "").lower():
+            print(f"[{profile_label}] Navigating to Betfair: {BETFAIR_LOGIN_URL}")
+            driver.get(BETFAIR_LOGIN_URL)
+            try:
+                WebDriverWait(driver, 20).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
+                pass
+
+        # Locate the top search input.
+        deadline = time.time() + 20
+        search_el = None
+        while time.time() < deadline:
+            search_el = _find_betfair_search_input(driver)
+            if search_el:
+                break
+            time.sleep(0.5)
+        if not search_el:
+            raise RuntimeError(f"[{profile_label}] Betfair search input not found.")
+
+        # Focus and clear, then type the team name.
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", search_el)
+        except Exception:
+            pass
+        try:
+            search_el.click()
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].focus();", search_el)
+            except Exception:
+                pass
+        try:
+            search_el.send_keys(Keys.CONTROL, "a")
+            search_el.send_keys(Keys.DELETE)
+        except Exception:
+            pass
+        try:
+            search_el.clear()
+        except Exception:
+            pass
+
+        print(f"[{profile_label}] Betfair search: typing team '{team_name}'")
+        search_el.send_keys(team_name)
+
+        # Wait for the autocomplete dropdown to render, then click the best result.
+        opponent_norm = _normalize_team_text(opponent_name) if opponent_name else ""
+        team_norm = _normalize_team_text(team_name)
+        end = time.time() + 12
+        clicked_label = None
+        while time.time() < end:
+            clicked_label = driver.execute_script(
+                r"""
+                const teamNorm = arguments[0];
+                const oppNorm = arguments[1];
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
+                }
+                function norm(s) {
+                    return (s || '').toLowerCase()
+                        .replace(/[^a-z0-9]+/g, ' ')
+                        .trim();
+                }
+                // Gather plausible result items: links/list-items/buttons that appeared
+                // after typing into the search box.
+                const items = Array.from(document.querySelectorAll(
+                    "a, li, [role='option'], [role='listitem'], [role='menuitem']"
+                )).filter(visible).map((el) => {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    return { el, text, n: norm(text) };
+                }).filter((it) => it.text && it.n.indexOf(teamNorm) !== -1);
+                if (items.length === 0) return null;
+                // Prefer one that also mentions the opponent.
+                let pick = null;
+                if (oppNorm) {
+                    pick = items.find((it) => it.n.indexOf(oppNorm) !== -1);
+                }
+                if (!pick) pick = items[0];
+                pick.el.scrollIntoView({block: 'center'});
+                pick.el.click();
+                return pick.text.slice(0, 200);
+                """,
+                team_norm,
+                opponent_norm,
+            )
+            if clicked_label:
+                break
+            time.sleep(0.5)
+
+        if not clicked_label:
+            # No autocomplete match — submit the search and let Betfair show the
+            # results page. The user can then proceed manually if needed.
+            print(f"[{profile_label}] No Betfair autocomplete result; submitting search via Enter.")
+            try:
+                search_el.send_keys(Keys.ENTER)
+            except Exception:
+                pass
+            try:
+                WebDriverWait(driver, 10).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
+                pass
+            return {
+                "profile_label": profile_label,
+                "team": team_name,
+                "opponent": opponent_name,
+                "opened": False,
+                "url": driver.current_url,
+            }
+
+        print(f"[{profile_label}] Betfair opened result: {clicked_label!r}")
+        try:
+            WebDriverWait(driver, 15).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            pass
+        return {
+            "profile_label": profile_label,
+            "team": team_name,
+            "opponent": opponent_name,
+            "opened": True,
+            "label": clicked_label,
+            "url": driver.current_url,
+        }
+    finally:
+        close_driver_bridge(driver)
+
+
 def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True) -> dict:
     """Full lifecycle: start profile, log into BetInAsia/Black, keep open."""
     driver = None
