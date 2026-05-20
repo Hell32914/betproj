@@ -4424,12 +4424,51 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
                 """
             )
             if isinstance(confirmed, dict) and confirmed.get("ok"):
-                bet_placed = True
+                first_label = confirmed.get("label", "")
                 print(
-                    f"[{profile_label}] Betfair: bet confirmed — "
-                    f"{selection.title()} {line_str} @ {odds_text}, stake {stake_str} "
-                    f"(btn: {confirmed.get('label')!r})"
+                    f"[{profile_label}] Betfair: clicked '{first_label}' — "
+                    f"{selection.title()} {line_str} @ {odds_text}, stake {stake_str}"
                 )
+                # If the first button was "Place bet/bets", Betfair shows a
+                # second "Confirm bet" button. Wait and click it.
+                if "place" in first_label.lower():
+                    time.sleep(1.2)
+                    confirmed2 = driver.execute_script(
+                        r"""
+                        function visible(el) {
+                            if (!el) return false;
+                            const r = el.getBoundingClientRect();
+                            if (r.width === 0 || r.height === 0) return false;
+                            const cs = window.getComputedStyle(el);
+                            return cs.visibility !== 'hidden' && cs.display !== 'none';
+                        }
+                        const btns = Array.from(document.querySelectorAll(
+                            "button, [role='button'], input[type='submit']"
+                        )).filter(visible).filter((el) => {
+                            const t = (el.innerText || el.value || '').trim().toLowerCase();
+                            return t === 'confirm bet' || t === 'confirm bets'
+                                || t.startsWith('confirm bet');
+                        });
+                        if (btns.length === 0) return { error: 'confirm bet button not found' };
+                        const btn = btns[0];
+                        btn.scrollIntoView({ block: 'center' });
+                        btn.click();
+                        return { ok: true, label: (btn.innerText || btn.value || '').trim() };
+                        """
+                    )
+                    if isinstance(confirmed2, dict) and confirmed2.get("ok"):
+                        print(
+                            f"[{profile_label}] Betfair: confirmed — "
+                            f"'{confirmed2.get('label')}'"
+                        )
+                        bet_placed = True
+                    else:
+                        print(
+                            f"[{profile_label}] Betfair: confirm-2 result: {confirmed2!r}",
+                            flush=True,
+                        )
+                else:
+                    bet_placed = True
             else:
                 print(f"[{profile_label}] Betfair: confirm click result: {confirmed!r}", flush=True)
 
