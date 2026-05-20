@@ -4092,7 +4092,8 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
     """Click the Back (blue) odds cell for the Over/Under <line> Goals selection.
 
     Picks blue vs pink by comparing computed background-color (Back is blue, Lay
-    is pink), with fallbacks on class/aria hints.
+    is pink), with fallbacks on class/aria hints. If the requested market is not
+    on screen, click the matching left-sidebar link to open it.
     """
     selection = (getattr(signal, "selection", "") or "").strip().lower()
     if selection not in ("over", "under"):
@@ -4101,15 +4102,47 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
     if line_value is None:
         raise RuntimeError("Signal has no line value for Betfair Over/Under.")
     line_str = format(Decimal(str(line_value)).normalize(), "f")
+    label_text = f"{selection} {line_str} goals"
+    market_text = f"over/under {line_str} goals"
 
-    # Wait for the match page to render markets.
-    end = time.time() + 25
+    # 1) Try to bring the market into the DOM: click the left-sidebar entry if
+    # the market section is not already visible.
+    try:
+        driver.execute_script(
+            r"""
+            const marketText = arguments[0];
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            const links = Array.from(document.querySelectorAll("a, button, [role='button'], li"))
+                .filter(visible)
+                .filter((el) => {
+                    const t = (el.innerText || '').trim().toLowerCase();
+                    return t === marketText;
+                });
+            if (links.length > 0) {
+                links[0].scrollIntoView({ block: 'center' });
+                links[0].click();
+            }
+            """,
+            market_text,
+        )
+    except Exception:
+        pass
+
+    # 2) Poll for a row whose label text equals 'Over <line> Goals' / 'Under <line> Goals'
+    end = time.time() + 30
     info = None
     while time.time() < end:
         info = driver.execute_script(
             r"""
             const want = arguments[0];           // 'over' or 'under'
             const lineStr = arguments[1];        // '1.5'
+            const labelText = arguments[2];      // 'over 1.5 goals'
             function visible(el) {
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
@@ -4124,112 +4157,110 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
                 const parts = m[1].split(',').map((x) => parseFloat(x.trim()));
                 return { r: parts[0]||0, g: parts[1]||0, b: parts[2]||0 };
             }
-            // Find a market card whose header text contains 'over/under <line> goals'.
-            const wantHeader = ('over/under ' + lineStr + ' goals').toLowerCase();
-            const headerCandidates = Array.from(document.querySelectorAll(
-                "h1,h2,h3,h4,h5,div,span,a,header"
-            )).filter(visible).filter((el) => {
-                const t = txt(el).toLowerCase();
-                return t.indexOf(wantHeader) !== -1 && t.length < 80;
-            });
-            if (headerCandidates.length === 0) {
-                return { error: 'market header not found', wantHeader };
-            }
-            // Pick the header whose nearest ancestor card has selection rows under it.
-            let card = null;
-            for (const h of headerCandidates) {
-                let p = h;
-                for (let i = 0; i < 8 && p; i++) {
-                    p = p.parentElement;
-                    if (!p) break;
-                    const t = (p.innerText || '').toLowerCase();
-                    if (t.indexOf('over') !== -1 && t.indexOf('under') !== -1) {
-                        card = p;
-                        break;
-                    }
-                }
-                if (card) break;
-            }
-            if (!card) {
-                return { error: 'market card not found', wantHeader };
-            }
-            // Find the row whose label starts with the wanted selection.
-            const rowCandidates = Array.from(card.querySelectorAll("*"))
+            // Find the SMALLEST element whose visible text equals (or starts with) the label.
+            // Exclude 'first half' / 'half time' / 'second half' rows so we hit the
+            // full-match Over/Under market, matching how Black always treats the
+            // signal as full-time.
+            const labels = Array.from(document.querySelectorAll("*"))
                 .filter(visible)
                 .filter((el) => {
                     const t = txt(el).toLowerCase();
-                    if (t.length === 0 || t.length > 200) return false;
-                    return t.startsWith(want + ' ') || t === want;
+                    if (!t || t.length > 200) return false;
+                    if (t.indexOf(labelText) === -1) return false;
+                    if (t.indexOf('half') !== -1) return false;
+                    return true;
                 });
-            if (rowCandidates.length === 0) {
-                return { error: 'selection label not found in card', want };
+            if (labels.length === 0) {
+                return { error: 'label not found', labelText };
             }
-            // Walk up from the label until we find a row container that also has
-            // price cells beside it.
-            function findRow(label) {
+            // Prefer leaf-most label (shortest text containing it).
+            labels.sort((a, b) => txt(a).length - txt(b).length);
+
+            // For each candidate, walk up to a row container that has 2+ clickable
+            // price buttons but does NOT contain a second 'X.5 Goals' row label.
+            function findRowAndCells(label) {
                 let p = label;
-                for (let i = 0; i < 6 && p; i++) {
+                for (let i = 0; i < 10 && p; i++) {
                     p = p.parentElement;
                     if (!p) break;
-                    // A row should contain numeric price text.
-                    const priceCells = Array.from(p.querySelectorAll("*"))
-                        .filter(visible)
-                        .filter((el) => /^\d+(\.\d+)?$/.test(txt(el)));
-                    if (priceCells.length >= 2) return { row: p, prices: priceCells };
+                    const rowText = (p.innerText || '').toLowerCase();
+                    const goalCounts = (rowText.match(/\d+(\.\d+)?\s*goals/g) || []).length;
+                    // Find clickable cells with numeric content inside this container.
+                    let cells = Array.from(p.querySelectorAll(
+                        "button, [role='button'], a, td, div"
+                    )).filter(visible).filter((el) => {
+                        const t = txt(el);
+                        if (!t || t.length > 40) return false;
+                        return /^\d+(\.\d+)?\b/.test(t);
+                    });
+                    // Deduplicate ancestor containers — keep only the smallest unique cell.
+                    cells = cells.filter((cell) => {
+                        return !cells.some((other) => other !== cell && cell.contains(other));
+                    });
+                    if (cells.length >= 2) {
+                        // Make sure container is just this row, not the whole card.
+                        if (goalCounts > 1) continue;
+                        return { row: p, cells };
+                    }
                 }
                 return null;
             }
-            let rowInfo = null;
-            for (const lab of rowCandidates) {
-                rowInfo = findRow(lab);
-                if (rowInfo) break;
+            let chosen = null;
+            for (const lab of labels) {
+                chosen = findRowAndCells(lab);
+                if (chosen) break;
             }
-            if (!rowInfo) {
-                return { error: 'row container with price cells not found' };
+            if (!chosen) {
+                return { error: 'row with price cells not found', labelText };
             }
-            // Score each price cell to pick the Back (blue) one.
-            const scored = rowInfo.prices.map((priceEl) => {
-                // Find a clickable ancestor (button or with role=button or with
-                // class containing 'back'/'lay').
-                let target = priceEl;
-                for (let i = 0; i < 6 && target.parentElement; i++) {
-                    const tag = target.tagName.toLowerCase();
-                    const cls = (target.className && target.className.toString
-                        ? target.className.toString().toLowerCase() : '');
-                    if (tag === 'button' || target.getAttribute('role') === 'button'
-                        || cls.indexOf('back') !== -1 || cls.indexOf('lay') !== -1) {
-                        break;
-                    }
-                    target = target.parentElement;
-                }
-                const cs = window.getComputedStyle(target);
+            // Score each clickable cell — pick the Back (blue) one furthest to the right
+            // of the 'Back' group (which is leftmost). Back cells: cls includes 'back',
+            // background blue dominates red. Lay cells: cls includes 'lay', red>blue.
+            const scored = chosen.cells.map((cell) => {
+                const cs = window.getComputedStyle(cell);
                 const bg = parseRgb(cs.backgroundColor) || { r: 255, g: 255, b: 255 };
-                const cls = (target.className && target.className.toString
-                    ? target.className.toString().toLowerCase() : '');
-                const aria = ((target.getAttribute('aria-label') || '') + ' '
-                    + (target.getAttribute('title') || '')).toLowerCase();
+                const cls = (cell.className && cell.className.toString
+                    ? cell.className.toString().toLowerCase() : '');
+                const aria = ((cell.getAttribute('aria-label') || '') + ' '
+                    + (cell.getAttribute('title') || '')).toLowerCase();
                 let score = 0;
-                if (cls.indexOf('back') !== -1) score += 50;
-                if (cls.indexOf('lay') !== -1) score -= 50;
+                if (cls.indexOf('back') !== -1) score += 60;
+                if (cls.indexOf('lay') !== -1) score -= 60;
                 if (aria.indexOf('back') !== -1) score += 30;
                 if (aria.indexOf('lay') !== -1) score -= 30;
-                // Blue dominates over red for Back; pink/red dominates for Lay.
-                if (bg.b > bg.r + 10) score += 20;
-                if (bg.r > bg.b + 10) score -= 20;
-                const rect = target.getBoundingClientRect();
-                return { target, score, rect, priceText: txt(priceEl), bg, cls };
+                // Walk up a few ancestors to inherit Back/Lay class if missing on cell.
+                let p = cell.parentElement;
+                for (let j = 0; j < 4 && p; j++) {
+                    const pc = (p.className && p.className.toString
+                        ? p.className.toString().toLowerCase() : '');
+                    if (pc.indexOf('back') !== -1) { score += 25; break; }
+                    if (pc.indexOf('lay') !== -1) { score -= 25; break; }
+                    p = p.parentElement;
+                }
+                // Color comparison.
+                if (bg.b > bg.r + 5) score += 30;
+                if (bg.r > bg.b + 5) score -= 30;
+                const rect = cell.getBoundingClientRect();
+                return { cell, score, rect, priceText: txt(cell), bg, cls };
             });
-            scored.sort((a, b) => b.score - a.score || a.rect.left - b.rect.left);
-            const pick = scored[0];
-            if (!pick || pick.score < 0) {
+            // Among Back-scoring cells, prefer the rightmost (best Back price column).
+            const backs = scored.filter((s) => s.score > 0);
+            backs.sort((a, b) => b.rect.right - a.rect.right);
+            const pick = backs[0];
+            if (!pick) {
                 return { error: 'no Back cell could be identified', scored: scored.map((s) => ({ score: s.score, price: s.priceText, cls: s.cls })) };
             }
-            pick.target.scrollIntoView({ block: 'center', inline: 'center' });
-            pick.target.click();
+            pick.cell.scrollIntoView({ block: 'center', inline: 'center' });
+            try { pick.cell.click(); }
+            catch (e) {
+                const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                pick.cell.dispatchEvent(evt);
+            }
             return { ok: true, priceText: pick.priceText, score: pick.score, bg: pick.bg, cls: pick.cls };
             """,
             selection,
             line_str,
+            label_text,
         )
         if info and info.get("ok"):
             break

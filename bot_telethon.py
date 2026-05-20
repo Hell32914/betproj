@@ -201,7 +201,7 @@ def _describe_exception(exc: BaseException) -> str:
 
 def _format_signal_work_message(signal) -> str:
     return (
-        f"Принял в работу: {signal.teams or 'unknown match'} | "
+        f"Asia: Принял в работу: {signal.teams or 'unknown match'} | "
         f"{signal.selection_label} | odds {signal.odds}"
     )
 
@@ -229,15 +229,15 @@ def _format_signal_result_message(result: dict) -> str:
         teams_label = _format_teams_vs_label(result.get("teams") or "unknown match")
         stake_label = order_stake or "?"
         status_label = order_status or result.get("status", "unknown")
-        return f"Ставка: {teams_label} | сумма {stake_label} | статус {status_label}"
+        return f"Asia: Ставка: {teams_label} | сумма {stake_label} | статус {status_label}"
 
     status = result.get("status", "unknown")
     label = {
-        "accepted": "Ставка принята",
-        "pending": "Ставка отправлена, но итоговый статус не подтвержден",
-        "rejected": "Ставка не принята",
-        "cancelled": "Ставка отменена",
-    }.get(status, f"Статус ставки: {status}")
+        "accepted": "Asia: Ставка принята",
+        "pending": "Asia: Ставка отправлена, но итоговый статус не подтвержден",
+        "rejected": "Asia: Ставка не принята",
+        "cancelled": "Asia: Ставка отменена",
+    }.get(status, f"Asia: Статус ставки: {status}")
     fills = result.get("fills") or []
     detail = _sanitize_telegram_detail((result.get("detail") or "").strip())
     message = (
@@ -367,14 +367,14 @@ async def main():
                             )
                             if attempt == selection_attempts:
                                 await event.reply(
-                                    "Ставка проверена 3 раза, нужная линия так и не появилась на сайте."
+                                    "Asia: Ставка проверена 3 раза, нужная линия так и не появилась на сайте."
                                 )
                                 return
                         except Exception as exc:
                             detail = _describe_exception(exc)
                             print(f"Black bet placement failed: {detail}", flush=True)
                             traceback.print_exc()
-                            await event.reply(f"Ставка не завершена: {detail}")
+                            await event.reply(f"Asia: Ставка не завершена: {detail}")
                             return
                     # Lock released here so queued signals can place their bets while we wait.
                     await asyncio.sleep(selection_retry_pause)
@@ -383,10 +383,10 @@ async def main():
                     return
 
                 order_id = place_result.get("order_id")
-                if not order_id:
+                if order_id is None or order_id == "":
                     # Couldn't capture the order id — send a single error reply.
                     await event.reply(
-                        "Не удалось определить номер заказа после ставки — проверьте вручную."
+                        "Asia: Не удалось определить номер заказа после ставки — проверьте вручную."
                     )
                     return
 
@@ -424,7 +424,7 @@ async def main():
                     except Exception as exc:
                         print(f"Black deferred order check failed: {exc}", flush=True)
                         await event.reply(
-                            f"Не удалось прочитать итог по заказу #{order_id}: {exc}"
+                            f"Asia: Не удалось прочитать итог по заказу #{order_id}: {exc}"
                         )
 
             asyncio.create_task(process_signal_reply())
