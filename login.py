@@ -4030,7 +4030,8 @@ def _follow_betfair_search_results(
 
     Returns the clicked link text on success, otherwise None.
     """
-    end = time.time() + 8
+    end = time.time() + 15
+    last_debug = None
     while time.time() < end:
         url = (driver.current_url or "").lower()
         on_results = "/search" in url or "search?" in url
@@ -4049,34 +4050,89 @@ def _follow_betfair_search_results(
             ))
         if not on_results:
             return None
-        clicked = driver.execute_script(
+        result = driver.execute_script(
             _BETFAIR_FUZZY_HELPERS + r"""
             const teamNorm = arguments[0];
             const oppNorm = arguments[1];
-            // Result links: anchors in the results area; we filter by text and
-            // exclude obvious nav links.
-            const anchors = Array.from(document.querySelectorAll("a"))
-                .filter(visible)
-                .map((a) => {
-                    const text = (a.innerText || a.textContent || '').trim();
-                    const n = norm(text);
-                    return { el: a, text, n,
-                        score: fuzzyTeamScore(n, teamNorm, oppNorm),
-                        hasVs: /\bv(s)?\b/i.test(text) };
-                })
-                .filter((it) => it.text && it.text.length < 250 && it.hasVs && it.score > 0);
-            if (anchors.length === 0) return null;
-            anchors.sort((a, b) => b.score - a.score);
-            const pick = anchors[0];
-            pick.el.scrollIntoView({ block: 'center' });
-            pick.el.click();
-            return pick.text.slice(0, 200);
+            // Result links: every anchor on the page. We DON'T require visible()
+            // because Betfair sometimes renders anchors as inline within a flex
+            // row whose bounding rect collapses; we filter via href shape and
+            // text content instead.
+            const all = Array.from(document.querySelectorAll("a"));
+            const scored = all.map((a) => {
+                const text = (a.innerText || a.textContent || '').trim();
+                const href = a.getAttribute('href') || '';
+                const n = norm(text);
+                const score = fuzzyTeamScore(n, teamNorm, oppNorm);
+                // Match-page links on Betfair Exchange look like
+                // /exchange/plus/.../<slug>-betting-<id> or contain 'eventId='.
+                const hrefLooksLikeMatch = /-betting-\d+/i.test(href)
+                    || /[?&]eventId=\d+/i.test(href)
+                    || /\/exchange\/plus\/.+\/.+-v-.+/i.test(href);
+                return { el: a, text, n, href, score, hrefLooksLikeMatch };
+            });
+            // Primary candidates: anchors with a match-shaped href AND positive score.
+            let cands = scored.filter((it) => it.hrefLooksLikeMatch && it.score > 0);
+            // Fallback: anchors with a match-shaped href even if text is empty
+            // (text might be inside a child rendered via flexbox / pseudo-elements).
+            if (cands.length === 0) {
+                cands = scored.filter((it) => it.hrefLooksLikeMatch);
+            }
+            // Last resort: anchors whose text scores positively.
+            if (cands.length === 0) {
+                cands = scored.filter((it) => it.score > 0);
+            }
+            if (cands.length === 0) {
+                // Return debug snapshot for the caller to log.
+                return {
+                    error: 'no candidate',
+                    hrefSample: scored.slice(0, 10).map((s) => s.href).filter((h) => h),
+                    textSample: scored.slice(0, 10).map((s) => s.text.slice(0, 60)).filter((t) => t),
+                };
+            }
+            cands.sort((a, b) => b.score - a.score);
+            const pick = cands[0];
+            try { pick.el.scrollIntoView({ block: 'center' }); } catch (e) {}
+            let clicked = false;
+            try {
+                pick.el.click();
+                clicked = true;
+            } catch (e) {}
+            if (!clicked) {
+                try {
+                    const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                    pick.el.dispatchEvent(evt);
+                    clicked = true;
+                } catch (e) {}
+            }
+            // Hard fallback: navigate to the href directly so the SPA loads the match.
+            if (pick.href) {
+                try {
+                    const absolute = new URL(pick.href, window.location.origin).href;
+                    if (window.location.href !== absolute) {
+                        // Only navigate if the SPA click didn't trigger a route change.
+                        setTimeout(() => {
+                            if (window.location.href.indexOf('/search') !== -1) {
+                                window.location.href = absolute;
+                            }
+                        }, 800);
+                    }
+                } catch (e) {}
+            }
+            return { ok: true, text: (pick.text || pick.href).slice(0, 200), href: pick.href };
             """,
             team_norm,
             opponent_norm,
         )
-        if clicked:
+        if isinstance(result, dict) and result.get("ok"):
+            clicked = result.get("text") or result.get("href")
             print(f"[{profile_label}] Betfair search-results: followed link {clicked!r}")
+            try:
+                WebDriverWait(driver, 12).until(
+                    lambda d: "/search" not in (d.current_url or "").lower()
+                )
+            except Exception:
+                pass
             try:
                 WebDriverWait(driver, 10).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
@@ -4084,7 +4140,16 @@ def _follow_betfair_search_results(
             except Exception:
                 pass
             return clicked
+        if isinstance(result, dict) and result.get("error"):
+            last_debug = result
         time.sleep(0.5)
+    if last_debug is not None:
+        print(
+            f"[{profile_label}] Betfair search-results: no match clicked. "
+            f"hrefSample={last_debug.get('hrefSample')!r} "
+            f"textSample={last_debug.get('textSample')!r}",
+            flush=True,
+        )
     return None
 
 
