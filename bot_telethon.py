@@ -320,9 +320,13 @@ async def main():
                             return
                         bf_sel = result.get("betfair_selection")
                         bf_odds = result.get("betfair_odds")
+                        bf_stake = result.get("betfair_stake")
+                        bf_placed = result.get("betfair_bet_placed", False)
                         if bf_sel:
+                            stake_part = f", ставка {bf_stake}" if bf_stake else ""
+                            placed_part = " ✓" if bf_placed else ""
                             await event.reply(
-                                f"Betfair: выбрал Back {bf_sel} @ {bf_odds}"
+                                f"Betfair: выбрал Back {bf_sel} @ {bf_odds}{stake_part}{placed_part}"
                             )
                     except Exception as exc:
                         detail = _describe_exception(exc)

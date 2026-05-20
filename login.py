@@ -4336,13 +4336,85 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
             f"[{profile_label}] Could not select Betfair Back {selection.title()} "
             f"{line_str} Goals: {info!r}"
         )
+    odds_text = info.get("priceText", "")
     print(
         f"[{profile_label}] Betfair Back selected: {selection.title()} {line_str} "
-        f"Goals at odds {info.get('priceText')}"
+        f"Goals at odds {odds_text}"
     )
+
+    # 3) Fill in stake and place the bet.
+    stake_str = None
+    bet_placed = False
+    try:
+        balance = _read_betfair_balance(driver, profile_label)
+        stake_amount = _calculate_stake_from_balance(balance)
+        stake_str = _format_stake_amount(stake_amount)
+        print(f"[{profile_label}] Betfair stake: {stake_str} (balance {balance})")
+    except Exception as exc:
+        print(f"[{profile_label}] Betfair: could not compute stake: {exc}", flush=True)
+
+    if stake_str:
+        placed = driver.execute_script(
+            r"""
+            const stakeVal = arguments[0];
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            // Find the stake input: <input> whose placeholder or nearby label says "stake".
+            const inputs = Array.from(document.querySelectorAll("input[type='text'], input[type='number'], input:not([type])"))
+                .filter(visible)
+                .filter((el) => {
+                    const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                    const nm = (el.getAttribute('name') || '').toLowerCase();
+                    const id = (el.getAttribute('id') || '').toLowerCase();
+                    const cls = (el.className && el.className.toString ? el.className.toString().toLowerCase() : '');
+                    return ph.indexOf('stake') !== -1 || nm.indexOf('stake') !== -1
+                        || id.indexOf('stake') !== -1 || cls.indexOf('stake') !== -1;
+                });
+            if (inputs.length === 0) return { error: 'stake input not found' };
+            const inp = inputs[0];
+            inp.scrollIntoView({ block: 'center' });
+            inp.focus();
+            // Clear existing value using React/Angular-compatible setter.
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            );
+            if (nativeInputValueSetter && nativeInputValueSetter.set) {
+                nativeInputValueSetter.set.call(inp, stakeVal);
+            } else {
+                inp.value = stakeVal;
+            }
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            // Find and click the Place Bet button.
+            const btns = Array.from(document.querySelectorAll(
+                "button, [role='button'], input[type='submit']"
+            )).filter(visible).filter((el) => {
+                const t = (el.innerText || el.value || '').trim().toLowerCase();
+                return t === 'place bets' || t === 'place bet' || t.startsWith('place bet');
+            });
+            if (btns.length === 0) return { stakeSet: true, error: 'place bet button not found' };
+            btns[0].scrollIntoView({ block: 'center' });
+            btns[0].click();
+            return { ok: true };
+            """,
+            stake_str,
+        )
+        if isinstance(placed, dict) and placed.get("ok"):
+            bet_placed = True
+            print(f"[{profile_label}] Betfair: bet placed — {selection.title()} {line_str} @ {odds_text}, stake {stake_str}")
+        else:
+            print(f"[{profile_label}] Betfair: bet placement result: {placed!r}", flush=True)
+
     return {
         "betfair_selection": f"{selection.title()} {line_str}",
-        "betfair_odds": info.get("priceText"),
+        "betfair_odds": odds_text,
+        "betfair_stake": stake_str,
+        "betfair_bet_placed": bet_placed,
     }
 
 
