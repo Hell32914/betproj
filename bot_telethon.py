@@ -279,6 +279,10 @@ async def main():
                 return
 
             await event.reply(_format_signal_work_message(signal))
+            await event.reply(
+                f"Betfair: взял в работу — {signal.teams or 'unknown match'} | "
+                f"{signal.selection_label}"
+            )
 
             async def process_betfair_open():
                 """Profile-2 mirror flow: open the same match on Betfair."""
@@ -288,6 +292,7 @@ async def main():
                     None,
                 )
                 if betfair_session is None:
+                    await event.reply("Betfair: профиль не готов — пропускаю.")
                     return
                 async with state.betfair_lock:
                     loop = asyncio.get_running_loop()
@@ -300,10 +305,30 @@ async def main():
                             f"label={result.get('label')!r}, url={result.get('url')}",
                             flush=True,
                         )
+                        if not result.get("opened"):
+                            await event.reply(
+                                "Betfair: матч не найден — открыта страница поиска."
+                            )
+                            return
+                        label = (result.get("label") or "").strip()
+                        await event.reply(
+                            f"Betfair: открыл матч — {label or signal.teams or 'unknown'}"
+                        )
+                        sel_err = result.get("selection_error")
+                        if sel_err:
+                            await event.reply(f"Betfair: не выбрал линию — {sel_err}")
+                            return
+                        bf_sel = result.get("betfair_selection")
+                        bf_odds = result.get("betfair_odds")
+                        if bf_sel:
+                            await event.reply(
+                                f"Betfair: выбрал Back {bf_sel} @ {bf_odds}"
+                            )
                     except Exception as exc:
                         detail = _describe_exception(exc)
                         print(f"Betfair match open failed: {detail}", flush=True)
                         traceback.print_exc()
+                        await event.reply(f"Betfair: ошибка — {detail}")
 
             asyncio.create_task(process_betfair_open())
 

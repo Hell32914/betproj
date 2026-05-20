@@ -3942,29 +3942,114 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
             )
         except Exception:
             pass
-        return {
-            "profile_label": profile_label,
-            "team": team_name,
-            "opponent": opponent_name,
-            "opened": False,
-            "url": driver.current_url,
-        }
 
-    print(f"[{profile_label}] Betfair opened result: {clicked_label!r}")
+    # If autocomplete navigated us — or the Enter fallback landed us — on a
+    # Betfair Search Results page, click the result row that matches our team.
+    followed = _follow_betfair_search_results(driver, team_norm, opponent_norm, profile_label)
+    if followed:
+        clicked_label = followed
+
     try:
         WebDriverWait(driver, 15).until(
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
     except Exception:
         pass
+
+    if clicked_label:
+        print(f"[{profile_label}] Betfair opened result: {clicked_label!r}")
+        return {
+            "profile_label": profile_label,
+            "team": team_name,
+            "opponent": opponent_name,
+            "opened": True,
+            "label": clicked_label,
+            "url": driver.current_url,
+        }
     return {
         "profile_label": profile_label,
         "team": team_name,
         "opponent": opponent_name,
-        "opened": True,
-        "label": clicked_label,
+        "opened": False,
         "url": driver.current_url,
     }
+
+
+def _follow_betfair_search_results(
+    driver: webdriver.Remote, team_norm: str, opponent_norm: str, profile_label: str
+):
+    """If we are on a Betfair Search Results listing, click the matching match link.
+
+    Returns the clicked link text on success, otherwise None.
+    """
+    end = time.time() + 8
+    while time.time() < end:
+        url = (driver.current_url or "").lower()
+        on_results = "/search" in url or "search?" in url
+        if not on_results:
+            # Also check for the visible "Search Results" header (covers cases
+            # where the URL changed via SPA routing without the path word).
+            on_results = bool(driver.execute_script(
+                r"""
+                const nodes = document.querySelectorAll("h1, h2, h3, header");
+                for (const n of nodes) {
+                    const t = (n.innerText || '').trim().toLowerCase();
+                    if (t === 'search results' || t.startsWith('search results')) return true;
+                }
+                return false;
+                """
+            ))
+        if not on_results:
+            return None
+        clicked = driver.execute_script(
+            r"""
+            const teamNorm = arguments[0];
+            const oppNorm = arguments[1];
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            function norm(s) {
+                return (s || '').toLowerCase()
+                    .replace(/[^a-z0-9]+/g, ' ')
+                    .trim();
+            }
+            // Result links: anchors in the results area; we filter by text and
+            // exclude obvious nav links.
+            const anchors = Array.from(document.querySelectorAll("a"))
+                .filter(visible)
+                .map((a) => {
+                    const text = (a.innerText || a.textContent || '').trim();
+                    return { el: a, text, n: norm(text), href: a.getAttribute('href') || '' };
+                })
+                .filter((it) => it.text && it.text.length < 200
+                    && it.n.indexOf(teamNorm) !== -1
+                    && /\bv(s)?\b/i.test(it.text));
+            if (anchors.length === 0) return null;
+            let pick = null;
+            if (oppNorm) pick = anchors.find((it) => it.n.indexOf(oppNorm) !== -1);
+            if (!pick) pick = anchors[0];
+            pick.el.scrollIntoView({ block: 'center' });
+            pick.el.click();
+            return pick.text.slice(0, 200);
+            """,
+            team_norm,
+            opponent_norm,
+        )
+        if clicked:
+            print(f"[{profile_label}] Betfair search-results: followed link {clicked!r}")
+            try:
+                WebDriverWait(driver, 10).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
+                pass
+            return clicked
+        time.sleep(0.5)
+    return None
 
 
 def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_label: str) -> dict:
