@@ -4065,22 +4065,23 @@ def _follow_betfair_search_results(
                 const n = norm(text);
                 const score = fuzzyTeamScore(n, teamNorm, oppNorm);
                 // Match-page links on Betfair Exchange look like
-                // /exchange/plus/.../<slug>-betting-<id> or contain 'eventId='.
-                const hrefLooksLikeMatch = /-betting-\d+/i.test(href)
-                    || /[?&]eventId=\d+/i.test(href)
-                    || /\/exchange\/plus\/.+\/.+-v-.+/i.test(href);
-                return { el: a, text, n, href, score, hrefLooksLikeMatch };
+                // /exchange/plus/.../<slug>-betting-<id> — event IDs are 6+ digits.
+                // Competition/league pages use short IDs (1-4 digits), so we exclude them.
+                const hrefLooksLikeMatch = /-betting-\d{6,}/i.test(href)
+                    || /[?&]eventId=\d+/i.test(href);
+                // Text contains a ' v ' separator (e.g. 'Team A v Team B').
+                const hasVs = /\bv\b/i.test(text);
+                return { el: a, text, n, href, score, hrefLooksLikeMatch, hasVs };
             });
-            // Primary candidates: anchors with a match-shaped href AND positive score.
+            // Primary: match-shaped href AND positive fuzzy score.
             let cands = scored.filter((it) => it.hrefLooksLikeMatch && it.score > 0);
-            // Fallback: anchors with a match-shaped href even if text is empty
-            // (text might be inside a child rendered via flexbox / pseudo-elements).
+            // Fallback A: match-shaped href AND text contains ' v ' separator.
             if (cands.length === 0) {
-                cands = scored.filter((it) => it.hrefLooksLikeMatch);
+                cands = scored.filter((it) => it.hrefLooksLikeMatch && it.hasVs);
             }
-            // Last resort: anchors whose text scores positively.
+            // Fallback B: positive score AND text contains ' v ' separator.
             if (cands.length === 0) {
-                cands = scored.filter((it) => it.score > 0);
+                cands = scored.filter((it) => it.score > 0 && it.hasVs);
             }
             if (cands.length === 0) {
                 // Return debug snapshot for the caller to log.
@@ -4354,6 +4355,8 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
         print(f"[{profile_label}] Betfair: could not compute stake: {exc}", flush=True)
 
     if stake_str:
+        # Give the betslip panel time to render after clicking the Back cell.
+        time.sleep(1.5)
         placed = driver.execute_script(
             r"""
             const stakeVal = arguments[0];
@@ -4364,19 +4367,49 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
                 const cs = window.getComputedStyle(el);
                 return cs.visibility !== 'hidden' && cs.display !== 'none';
             }
-            // Find the stake input: <input> whose placeholder or nearby label says "stake".
-            const inputs = Array.from(document.querySelectorAll("input[type='text'], input[type='number'], input:not([type])"))
-                .filter(visible)
-                .filter((el) => {
-                    const ph = (el.getAttribute('placeholder') || '').toLowerCase();
-                    const nm = (el.getAttribute('name') || '').toLowerCase();
-                    const id = (el.getAttribute('id') || '').toLowerCase();
-                    const cls = (el.className && el.className.toString ? el.className.toString().toLowerCase() : '');
-                    return ph.indexOf('stake') !== -1 || nm.indexOf('stake') !== -1
-                        || id.indexOf('stake') !== -1 || cls.indexOf('stake') !== -1;
-                });
-            if (inputs.length === 0) return { error: 'stake input not found' };
-            const inp = inputs[0];
+            // Find the stake input. Betfair betslip inputs may not carry 'stake' in
+            // their attributes — try several strategies in order of confidence.
+            let inp = null;
+            // Strategy 1: attribute mentions 'stake'.
+            const allInputs = Array.from(document.querySelectorAll(
+                "input[type='text'], input[type='number'], input:not([type])"
+            )).filter(visible);
+            inp = allInputs.find((el) => {
+                const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                const nm = (el.getAttribute('name') || '').toLowerCase();
+                const id = (el.getAttribute('id') || '').toLowerCase();
+                const cls = (el.className && el.className.toString ? el.className.toString().toLowerCase() : '');
+                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                return ph.indexOf('stake') !== -1 || nm.indexOf('stake') !== -1
+                    || id.indexOf('stake') !== -1 || cls.indexOf('stake') !== -1
+                    || aria.indexOf('stake') !== -1;
+            }) || null;
+            // Strategy 2: find a betslip/betEntry container and take the second
+            // visible input inside it (first = odds, second = stake).
+            if (!inp) {
+                const containers = Array.from(document.querySelectorAll(
+                    "[class*='betslip' i], [class*='bet-slip' i], [class*='betEntry' i],"
+                    + "[class*='bet-entry' i], [aria-label*='betslip' i], [data-test*='betslip' i]"
+                )).filter(visible);
+                for (const c of containers) {
+                    const ins = Array.from(c.querySelectorAll(
+                        "input[type='text'], input[type='number'], input:not([type])"
+                    )).filter(visible);
+                    if (ins.length >= 2) { inp = ins[1]; break; }
+                    if (ins.length === 1) { inp = ins[0]; break; }
+                }
+            }
+            // Strategy 3: among all visible inputs, pick the one whose current value
+            // is empty or '0' (not the odds field which holds a non-zero decimal).
+            if (!inp && allInputs.length > 0) {
+                inp = allInputs.find((el) => {
+                    const v = (el.value || '').trim();
+                    return v === '' || v === '0';
+                }) || allInputs[allInputs.length - 1];
+            }
+            if (!inp) return { error: 'stake input not found',
+                inputCount: allInputs.length,
+                inputValues: allInputs.map((e) => e.value).slice(0, 5) };
             inp.scrollIntoView({ block: 'center' });
             inp.focus();
             // Clear existing value using React/Angular-compatible setter.
