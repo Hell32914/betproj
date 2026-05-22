@@ -13,6 +13,7 @@ import sys
 import time
 import socket
 import subprocess
+import unicodedata
 import requests
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from dotenv import load_dotenv
@@ -396,8 +397,15 @@ def _visible_page_text(driver: webdriver.Remote) -> str:
     return driver.execute_script("return document.body ? document.body.innerText : '';") or ""
 
 
+def _strip_diacritics(value: str) -> str:
+    return "".join(
+        char for char in unicodedata.normalize("NFKD", value or "")
+        if not unicodedata.combining(char)
+    )
+
+
 def _normalize_team_text(value: str | None) -> str:
-    text = (value or "").lower().strip()
+    text = _strip_diacritics(value or "").lower().strip()
     text = re.sub(r"[^a-z0-9]+", " ", text)
     parts = [part for part in text.split() if part]
     trimmed = [part for part in parts if part not in TEAM_SUFFIXES]
@@ -674,7 +682,7 @@ def _fill_betslip_input(driver: webdriver.Remote, element, value: str) -> None:
 def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
     def search_dialog_open(browser: webdriver.Remote) -> bool:
         text = _visible_text_lower(browser)
-        return "live events" in text or "all sports" in text
+        return "live events" in text or ("all sports" in text and "use ctrl-f" in text)
 
     def open_search_with_shortcut(browser: webdriver.Remote) -> bool:
         shortcut_attempts = [
@@ -723,7 +731,7 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
                 const ordersNode = item.element.closest('li,button,a,[role="button"]') || item.element;
                 const listSibling = ordersNode.nextElementSibling;
                 if (listSibling && isVisible(listSibling)) {
-                    return listSibling.querySelector('svg,path') || listSibling;
+                    return listSibling;
                 }
 
                 const centerY = item.rect.y + item.rect.height / 2;
@@ -762,12 +770,12 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
                     });
                 const first = candidates[0]?.element;
                 if (first) {
-                    return first.querySelector('svg,path') || first;
+                    return first;
                 }
 
                 const directSibling = item.element.parentElement?.nextElementSibling;
                 if (directSibling && isVisible(directSibling)) {
-                    return directSibling.querySelector('svg,path') || directSibling;
+                    return directSibling;
                 }
             }
 
@@ -783,7 +791,7 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         """
         const dialogAlreadyOpen = () => {
             const text = (document.body?.innerText || '').toLowerCase();
-            return text.includes('live events') || text.includes('all sports');
+            return text.includes('live events') || (text.includes('all sports') && text.includes('use ctrl-f'));
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim();
         if (dialogAlreadyOpen()) return true;
@@ -987,11 +995,12 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
 
 def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str) -> None:
     normalized_query = query.strip()
+    query_words = [word for word in _normalize_team_text(normalized_query).split() if len(word) >= 3]
     search_input = WebDriverWait(driver, 10).until(lambda browser: browser.execute_script(
         """
         const dialogOpen = () => {
             const text = (document.body?.innerText || '').toLowerCase();
-            return text.includes('live events') || text.includes('all sports');
+            return text.includes('live events') || (text.includes('all sports') && text.includes('use ctrl-f'));
         };
         if (!dialogOpen()) return null;
         const isVisible = (element) => {
@@ -1089,13 +1098,44 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
         )
     search_input.send_keys(Keys.ENTER)
 
-    WebDriverWait(driver, 15).until(
-        lambda browser: normalized_query.lower() in _visible_text_lower(browser)
-        or "no results found" in _visible_text_lower(browser)
-    )
+    WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
+        """
+        const requested = arguments[0];
+        const queryWords = arguments[1] || [];
+        const normalize = (value) => (value || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\\u0300-\\u036f]/g, '')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\\s+/g, ' ')
+            .trim();
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const body = normalize(document.body?.innerText || '');
+        if (body.includes('no results found') || body.includes('no events found')) return true;
+        const normalizedRequest = normalize(requested);
+        if (normalizedRequest && body.includes(normalizedRequest)) return true;
+        if (queryWords.some((word) => body.includes(normalize(word)))) return true;
+        const inputValues = Array.from(document.querySelectorAll('input'))
+            .filter(isVisible)
+            .map((input) => normalize(input.value || input.getAttribute('value') || ''))
+            .join(' ');
+        return normalizedRequest && inputValues.includes(normalizedRequest);
+        """,
+        normalized_query,
+        query_words,
+    ))
     # Give the React result list a brief moment to render fully before consumers
     # start scanning the DOM for the match-card row.
-    time.sleep(0.8)
+    time.sleep(1.2)
     print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
 
 
@@ -1814,7 +1854,7 @@ def _open_black_orders_view(driver: webdriver.Remote, profile_label: str) -> boo
 
 def _black_search_dialog_open(driver: webdriver.Remote) -> bool:
     text = _visible_text_lower(driver)
-    return "live events" in text or "all sports" in text
+    return "live events" in text or ("all sports" in text and "use ctrl-f" in text)
 
 
 def _black_match_context_matches(
@@ -1822,10 +1862,41 @@ def _black_match_context_matches(
     home_team: str,
     away_team: str | None,
 ) -> bool:
+    home_variants = _team_search_queries(home_team)
+    away_variants = _team_search_queries(away_team)
     return bool(driver.execute_script(
         """
-        const homeTeam = arguments[0].trim().toLowerCase();
-        const awayTeam = (arguments[1] || '').trim().toLowerCase();
+        const homeVariants = arguments[0] || [];
+        const awayVariants = arguments[1] || [];
+        const normalize = (value) => (value || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\\u0300-\\u036f]/g, '')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\\s+/g, ' ')
+            .trim();
+        const wordsFor = (variants) => Array.from(new Set(
+            variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))
+        ));
+        const wordMatch = (text, word) => {
+            if (!word) return false;
+            if (text.includes(word)) return true;
+            for (const token of text.split(' ')) {
+                const prefix = Math.min(token.length, word.length, 4);
+                if (prefix >= 4 && token.slice(0, prefix) === word.slice(0, prefix)) return true;
+            }
+            return false;
+        };
+        const teamPresent = (text, variants, words, allowOneWordFallback) => {
+            if (!variants.length && !words.length) return true;
+            if (variants.some((value) => normalize(value) && text.includes(normalize(value)))) return true;
+            const hits = words.filter((word) => wordMatch(text, word)).length;
+            if (!words.length) return false;
+            const required = allowOneWordFallback ? 1 : Math.max(1, words.length - 1);
+            return hits >= required;
+        };
+        const homeWords = wordsFor(homeVariants);
+        const awayWords = wordsFor(awayVariants);
         const bodyText = (document.body?.innerText || '').toLowerCase();
         // 'live events' is unique to the search modal; 'all sports' also appears in the page's
         // left navigation rail when not in the modal, so only reject on the modal-only marker.
@@ -1851,14 +1922,15 @@ def _black_match_context_matches(
             .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
 
         for (const section of sections.slice(0, 12)) {
-            if (!section.text.includes(homeTeam)) continue;
-            if (awayTeam && !section.text.includes(awayTeam)) continue;
+            const normalizedText = normalize(section.text);
+            if (!teamPresent(normalizedText, homeVariants, homeWords, false)) continue;
+            if (!teamPresent(normalizedText, awayVariants, awayWords, true)) continue;
             return true;
         }
         return false;
         """,
-        home_team,
-        away_team or "",
+        home_variants,
+        away_variants,
     ))
 
 
@@ -1961,7 +2033,13 @@ def _open_black_live_match(
         """
         const teamVariants = arguments[0];
         const opponentVariants = arguments[1];
-        const normalize = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();
+        const normalize = (value) => (value || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\\u0300-\\u036f]/g, '')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\\s+/g, ' ')
+            .trim();
         const teamWords = Array.from(new Set(teamVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))));
         const opponentWords = Array.from(new Set(opponentVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))));
         const isVisible = (element) => {
@@ -2022,7 +2100,8 @@ def _open_black_live_match(
             const hasOpponent = !opponentWords.length
                 || opponentWords.some(fuzzyHas)
                 || opponentVariants.some((value) => normalize(value) && t.includes(normalize(value)));
-            return hasTeam && hasOpponent;
+            const strongTeamOnly = hasTeam && teamHits >= Math.max(1, Math.min(teamWords.length, 2));
+            return hasTeam && (hasOpponent || strongTeamOnly);
         };
 
         const roots = Array.from(document.querySelectorAll('li,button,a,[role="button"],article,div'))
@@ -2098,7 +2177,24 @@ def _open_black_live_match(
         """
         const teamVariants = arguments[0];
         const opponentVariants = arguments[1];
-        const normalize = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();
+        const normalize = (value) => (value || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\\u0300-\\u036f]/g, '')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\\s+/g, ' ')
+            .trim();
+        const teamWords = Array.from(new Set(teamVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))));
+        const opponentWords = Array.from(new Set(opponentVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))));
+        const fuzzyHas = (text, word) => {
+            if (!word) return false;
+            if (text.includes(word)) return true;
+            for (const token of text.split(' ')) {
+                const prefix = Math.min(token.length, word.length, 4);
+                if (prefix >= 4 && token.slice(0, prefix) === word.slice(0, prefix)) return true;
+            }
+            return false;
+        };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
         const isVisible = (element) => {
             const style = window.getComputedStyle(element);
@@ -2114,8 +2210,17 @@ def _open_black_live_match(
             .filter(isVisible)
             .map((element) => ({ text: textOf(element), rect: element.getBoundingClientRect() }))
             .filter((item) => item.rect.y > 90 && item.rect.x > window.innerWidth * 0.14 && item.rect.x < window.innerWidth * 0.82)
-            .filter((item) => teamVariants.some((value) => normalize(value) && normalize(item.text).includes(normalize(value))))
-            .filter((item) => !opponentVariants.length || opponentVariants.some((value) => normalize(value) && normalize(item.text).includes(normalize(value))))
+            .filter((item) => {
+                const text = normalize(item.text);
+                return teamVariants.some((value) => normalize(value) && text.includes(normalize(value)))
+                    || teamWords.some((word) => fuzzyHas(text, word));
+            })
+            .filter((item) => {
+                if (!opponentVariants.length && !opponentWords.length) return true;
+                const text = normalize(item.text);
+                return opponentVariants.some((value) => normalize(value) && text.includes(normalize(value)))
+                    || opponentWords.some((word) => fuzzyHas(text, word));
+            })
             .slice(0, 8)
             .map((item) => item.text.slice(0, 220));
         """,
@@ -2135,12 +2240,41 @@ def _verify_black_betslip_target(
 ) -> None:
     line_variants = _decimal_variants(line)
     selection_lower = selection.strip().lower()
+    home_variants = _team_search_queries(home_team)
+    away_variants = _team_search_queries(away_team)
     verified = WebDriverWait(driver, 8).until(lambda browser: browser.execute_script(
         """
         const selection = arguments[0].trim().toLowerCase();
         const lineVariants = arguments[1].map((value) => value.toLowerCase());
-        const homeTeam = (arguments[2] || '').trim().toLowerCase();
-        const awayTeam = (arguments[3] || '').trim().toLowerCase();
+        const homeVariants = arguments[2] || [];
+        const awayVariants = arguments[3] || [];
+        const normalize = (value) => (value || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\\u0300-\\u036f]/g, '')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\\s+/g, ' ')
+            .trim();
+        const wordsFor = (variants) => Array.from(new Set(
+            variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))
+        ));
+        const wordMatch = (text, word) => {
+            if (!word) return false;
+            if (text.includes(word)) return true;
+            return text.split(' ').some((token) => {
+                const prefix = Math.min(token.length, word.length, 4);
+                return prefix >= 4 && token.slice(0, prefix) === word.slice(0, prefix);
+            });
+        };
+        const teamPresent = (text, variants, words, allowOneWordFallback) => {
+            if (!variants.length && !words.length) return true;
+            if (variants.some((value) => normalize(value) && text.includes(normalize(value)))) return true;
+            const hits = words.filter((word) => wordMatch(text, word)).length;
+            if (!words.length) return false;
+            return hits >= (allowOneWordFallback ? 1 : Math.max(1, words.length - 1));
+        };
+        const homeWords = wordsFor(homeVariants);
+        const awayWords = wordsFor(awayVariants);
         const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&');
         const hasExactLineToken = (text) => lineVariants.some((line) => {
             const pattern = new RegExp(`(^|[^\\d/])${escapeRegExp(line)}([^\\d/]|$)`);
@@ -2167,10 +2301,11 @@ def _verify_black_betslip_target(
 
         for (const panel of panels) {
             const text = panel.text;
+            const normalizedText = normalize(text);
             const hasLine = hasExactLineToken(text);
             const hasSelection = text.includes(selection);
-            const hasHome = !homeTeam || text.includes(homeTeam);
-            const hasAway = !awayTeam || text.includes(awayTeam);
+            const hasHome = teamPresent(normalizedText, homeVariants, homeWords, false);
+            const hasAway = teamPresent(normalizedText, awayVariants, awayWords, true);
             if (hasLine && hasSelection && hasHome && hasAway) {
                 return { ok: true, text: text.slice(0, 300) };
             }
@@ -2179,8 +2314,8 @@ def _verify_black_betslip_target(
         """,
         selection_lower,
         line_variants,
-        home_team or "",
-        away_team or "",
+        home_variants,
+        away_variants,
     ))
     if not verified:
         page_text = _visible_page_text(driver)
@@ -2408,10 +2543,17 @@ def _set_black_betslip_price_and_place(
         }
 
         const panelRect = panel.rect;
+        const placeButtonItem = Array.from(panel.element.querySelectorAll('button,[role="button"]'))
+            .filter(isVisible)
+            .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+            .filter((item) => item.text === 'place' || item.text.includes('place'))
+            .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)[0] || null;
+        const topControlsBottom = placeButtonItem ? placeButtonItem.rect.bottom + 14 : panelRect.top + 180;
         const inputs = Array.from(panel.element.querySelectorAll('input'))
             .filter(isVisible)
             .filter((element) => !element.disabled && !element.readOnly)
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element.parentElement || element) }))
+            .filter((item) => item.rect.y < topControlsBottom)
             .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
 
         const findInputByLabel = (labelText, fallbackIndex) => {
@@ -2419,6 +2561,7 @@ def _set_black_betslip_price_and_place(
                 .filter(isVisible)
                 .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
                 .filter((item) => item.text === labelText)
+                .filter((item) => item.rect.y < topControlsBottom)
                 .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
             for (const label of labels) {
                 const candidate = inputs
@@ -2434,11 +2577,7 @@ def _set_black_betslip_price_and_place(
 
         const stakeInput = findInputByLabel('stake', 0);
         const priceInput = findInputByLabel('price', 1);
-        const placeButton = Array.from(panel.element.querySelectorAll('button,[role="button"]'))
-            .filter(isVisible)
-            .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
-            .filter((item) => item.text === 'place' || item.text.includes('place'))
-            .sort((a, b) => b.rect.y - a.rect.y || b.rect.x - a.rect.x)[0]?.element;
+        const placeButton = placeButtonItem?.element || null;
         return {
             ok: true,
             panel: panel.element,
@@ -3026,6 +3165,17 @@ def place_black_bet(session: dict, signal) -> dict:
             driver.get(BLACK_SPORTSBOOK_URL)
             _wait_document_ready(driver)
             time.sleep(2)
+        if not stake_value:
+            try:
+                balance = _read_black_balance(driver, profile_label)
+                stake_value = _format_stake_amount(_calculate_stake_from_balance(balance))
+                session["stake"] = {"balance": str(balance), "stake": stake_value, "percent": str(STAKE_PERCENT)}
+                print(
+                    f"[{profile_label}] Using calculated Black stake EUR {stake_value} "
+                    f"from balance EUR {balance} because no default stake was cached."
+                )
+            except Exception as exc:
+                print(f"[{profile_label}] Could not calculate fallback Black stake: {exc}", flush=True)
         try:
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
@@ -3854,6 +4004,8 @@ function visible(el) {
 }
 function norm(s) {
     return (s || '').toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
         .replace(/[^a-z0-9]+/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
@@ -4075,11 +4227,7 @@ def _follow_betfair_search_results(
             });
             // Primary: match-shaped href AND positive fuzzy score.
             let cands = scored.filter((it) => it.hrefLooksLikeMatch && it.score > 0);
-            // Fallback A: match-shaped href AND text contains ' v ' separator.
-            if (cands.length === 0) {
-                cands = scored.filter((it) => it.hrefLooksLikeMatch && it.hasVs);
-            }
-            // Fallback B: positive score AND text contains ' v ' separator.
+            // Fallback: positive score AND text contains ' v ' separator.
             if (cands.length === 0) {
                 cands = scored.filter((it) => it.score > 0 && it.hasVs);
             }
