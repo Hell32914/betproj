@@ -2146,7 +2146,7 @@ def _find_black_live_match_candidate(
                 candidate: pick ? pick.row : null,
                 reason: pick ? 'candidate-found' : (noResults ? 'no-results' : 'no-candidate'),
                 noResults,
-                rootText: rootText.split('\n').map((line) => line.trim()).filter(Boolean).slice(0, 12).join(' | ').slice(0, 700),
+                rootText: rootText.split('\\n').map((line) => line.trim()).filter(Boolean).slice(0, 12).join(' | ').slice(0, 700),
                 candidates: candidates.slice(0, 8).map((item) => ({
                     text: item.text.slice(0, 220),
                     score: item.metrics.score,
