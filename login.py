@@ -4418,6 +4418,7 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
             const want = arguments[0];           // 'over' or 'under'
             const lineStr = arguments[1];        // '1.5'
             const labelText = arguments[2];      // 'over 1.5 goals'
+            const marketText = arguments[3];     // 'over/under 1.5 goals'
             function visible(el) {
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
@@ -4426,12 +4427,106 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
                 return cs.visibility !== 'hidden' && cs.display !== 'none';
             }
             function txt(el) { return ((el.innerText || el.textContent || '')).trim(); }
+            function normalizedTxt(el) { return txt(el).toLowerCase().replace(/\s+/g, ' ').trim(); }
             function parseRgb(s) {
                 const m = (s || '').match(/rgba?\(([^)]+)\)/);
                 if (!m) return null;
                 const parts = m[1].split(',').map((x) => parseFloat(x.trim()));
                 return { r: parts[0]||0, g: parts[1]||0, b: parts[2]||0 };
             }
+            function numericCells(root) {
+                let cells = Array.from(root.querySelectorAll("button, [role='button'], a, td, div, span"))
+                    .filter(visible)
+                    .filter((el) => {
+                        const t = txt(el);
+                        if (!t || t.length > 50) return false;
+                        return /^\d+(\.\d+)?\b/.test(t);
+                    });
+                return cells.filter((cell) => {
+                    return !cells.some((other) => other !== cell && cell.contains(other));
+                });
+            }
+            function scoreBackCell(cell) {
+                const cs = window.getComputedStyle(cell);
+                const bg = parseRgb(cs.backgroundColor) || { r: 255, g: 255, b: 255 };
+                const cls = (cell.className && cell.className.toString
+                    ? cell.className.toString().toLowerCase() : '');
+                const aria = ((cell.getAttribute('aria-label') || '') + ' '
+                    + (cell.getAttribute('title') || '')).toLowerCase();
+                let score = 0;
+                if (cls.indexOf('back') !== -1) score += 60;
+                if (cls.indexOf('lay') !== -1) score -= 60;
+                if (aria.indexOf('back') !== -1) score += 30;
+                if (aria.indexOf('lay') !== -1) score -= 30;
+                let p = cell.parentElement;
+                for (let j = 0; j < 5 && p; j++) {
+                    const pc = (p.className && p.className.toString
+                        ? p.className.toString().toLowerCase() : '');
+                    if (pc.indexOf('back') !== -1) { score += 25; break; }
+                    if (pc.indexOf('lay') !== -1) { score -= 25; break; }
+                    p = p.parentElement;
+                }
+                if (bg.b > bg.r + 5) score += 30;
+                if (bg.r > bg.b + 5) score -= 30;
+                return { cell, score, rect: cell.getBoundingClientRect(), priceText: txt(cell), bg, cls };
+            }
+            function clickCell(cell) {
+                cell.scrollIntoView({ block: 'center', inline: 'center' });
+                try { cell.click(); }
+                catch (e) {
+                    const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                    cell.dispatchEvent(evt);
+                }
+            }
+            function pickBackCell(cells) {
+                const scored = cells.map(scoreBackCell);
+                const backs = scored.filter((s) => s.score > 0);
+                backs.sort((a, b) => b.rect.right - a.rect.right);
+                return backs[0] || null;
+            }
+            function clickLegacyExchangeMarket() {
+                const headers = Array.from(document.querySelectorAll('*'))
+                    .filter(visible)
+                    .map((el) => ({ el, text: normalizedTxt(el), rect: el.getBoundingClientRect() }))
+                    .filter((item) => item.rect.x > 120)
+                    .filter((item) => item.text === marketText || item.text.indexOf(marketText) !== -1)
+                    .sort((a, b) => a.text.length - b.text.length || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+                const debug = [];
+                for (const header of headers.slice(0, 12)) {
+                    let container = header.el;
+                    for (let depth = 0; depth < 8 && container; depth++, container = container.parentElement) {
+                        if (!visible(container)) continue;
+                        const containerText = normalizedTxt(container);
+                        if (containerText.indexOf(marketText) === -1 || containerText.indexOf(labelText) === -1) continue;
+                        const containerRect = container.getBoundingClientRect();
+                        if (containerRect.width < 220 || containerRect.height < 55) continue;
+                        const rows = Array.from(container.querySelectorAll('tr, li, div'))
+                            .filter(visible)
+                            .map((row) => ({ row, text: normalizedTxt(row), rect: row.getBoundingClientRect() }))
+                            .filter((item) => item.text.indexOf(labelText) !== -1)
+                            .filter((item) => item.rect.y >= header.rect.y - 8)
+                            .filter((item) => item.rect.height <= 95 && item.rect.width >= 130)
+                            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height) || a.rect.y - b.rect.y);
+                        for (const row of rows) {
+                            const cells = numericCells(row.row);
+                            if (cells.length < 2) {
+                                debug.push({ row: row.text.slice(0, 120), cells: cells.length });
+                                continue;
+                            }
+                            const pick = pickBackCell(cells);
+                            if (!pick) {
+                                debug.push({ row: row.text.slice(0, 120), cells: cells.map((cell) => txt(cell)).slice(0, 6) });
+                                continue;
+                            }
+                            clickCell(pick.cell);
+                            return { ok: true, priceText: pick.priceText, score: pick.score, bg: pick.bg, cls: pick.cls, method: 'legacy-market-card' };
+                        }
+                    }
+                }
+                return { error: 'legacy market row not found', marketText, labelText, headers: headers.slice(0, 5).map((h) => h.text.slice(0, 120)), debug: debug.slice(0, 5) };
+            }
+            const legacyResult = clickLegacyExchangeMarket();
+            if (legacyResult && legacyResult.ok) return legacyResult;
             // Find the SMALLEST element whose visible text equals (or starts with) the label.
             // Exclude 'first half' / 'half time' / 'second half' rows so we hit the
             // full-match Over/Under market, matching how Black always treats the
@@ -4461,17 +4556,7 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
                     const rowText = (p.innerText || '').toLowerCase();
                     const goalCounts = (rowText.match(/\d+(\.\d+)?\s*goals/g) || []).length;
                     // Find clickable cells with numeric content inside this container.
-                    let cells = Array.from(p.querySelectorAll(
-                        "button, [role='button'], a, td, div"
-                    )).filter(visible).filter((el) => {
-                        const t = txt(el);
-                        if (!t || t.length > 40) return false;
-                        return /^\d+(\.\d+)?\b/.test(t);
-                    });
-                    // Deduplicate ancestor containers — keep only the smallest unique cell.
-                    cells = cells.filter((cell) => {
-                        return !cells.some((other) => other !== cell && cell.contains(other));
-                    });
+                    let cells = numericCells(p);
                     if (cells.length >= 2) {
                         // Make sure container is just this row, not the whole card.
                         if (goalCounts > 1) continue;
@@ -4491,51 +4576,19 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
             // Score each clickable cell — pick the Back (blue) one furthest to the right
             // of the 'Back' group (which is leftmost). Back cells: cls includes 'back',
             // background blue dominates red. Lay cells: cls includes 'lay', red>blue.
-            const scored = chosen.cells.map((cell) => {
-                const cs = window.getComputedStyle(cell);
-                const bg = parseRgb(cs.backgroundColor) || { r: 255, g: 255, b: 255 };
-                const cls = (cell.className && cell.className.toString
-                    ? cell.className.toString().toLowerCase() : '');
-                const aria = ((cell.getAttribute('aria-label') || '') + ' '
-                    + (cell.getAttribute('title') || '')).toLowerCase();
-                let score = 0;
-                if (cls.indexOf('back') !== -1) score += 60;
-                if (cls.indexOf('lay') !== -1) score -= 60;
-                if (aria.indexOf('back') !== -1) score += 30;
-                if (aria.indexOf('lay') !== -1) score -= 30;
-                // Walk up a few ancestors to inherit Back/Lay class if missing on cell.
-                let p = cell.parentElement;
-                for (let j = 0; j < 4 && p; j++) {
-                    const pc = (p.className && p.className.toString
-                        ? p.className.toString().toLowerCase() : '');
-                    if (pc.indexOf('back') !== -1) { score += 25; break; }
-                    if (pc.indexOf('lay') !== -1) { score -= 25; break; }
-                    p = p.parentElement;
-                }
-                // Color comparison.
-                if (bg.b > bg.r + 5) score += 30;
-                if (bg.r > bg.b + 5) score -= 30;
-                const rect = cell.getBoundingClientRect();
-                return { cell, score, rect, priceText: txt(cell), bg, cls };
-            });
+            const scored = chosen.cells.map(scoreBackCell);
             // Among Back-scoring cells, prefer the rightmost (best Back price column).
-            const backs = scored.filter((s) => s.score > 0);
-            backs.sort((a, b) => b.rect.right - a.rect.right);
-            const pick = backs[0];
+            const pick = pickBackCell(chosen.cells);
             if (!pick) {
                 return { error: 'no Back cell could be identified', scored: scored.map((s) => ({ score: s.score, price: s.priceText, cls: s.cls })) };
             }
-            pick.cell.scrollIntoView({ block: 'center', inline: 'center' });
-            try { pick.cell.click(); }
-            catch (e) {
-                const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
-                pick.cell.dispatchEvent(evt);
-            }
+            clickCell(pick.cell);
             return { ok: true, priceText: pick.priceText, score: pick.score, bg: pick.bg, cls: pick.cls };
             """,
             selection,
             line_str,
             label_text,
+            market_text,
         )
         if info and info.get("ok"):
             break
