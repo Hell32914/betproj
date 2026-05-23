@@ -52,6 +52,10 @@ TEAM_SUFFIXES = {
     "fc", "afc", "cf", "sc", "ac", "fk", "bk", "ik", "if", "sv", "jk",
     "club", "football", "team",
 }
+TEAM_SEARCH_ALIASES = {
+    "alaves": ["deportivo alaves", "alavés", "deportivo alavés"],
+    "sao paulo": ["são paulo", "sao paulo fc", "são paulo fc"],
+}
 
 
 def fetch_profile_ids(expected: int = 2) -> list[str]:
@@ -479,11 +483,58 @@ def _team_search_queries(team_name: str | None) -> list[str]:
             add(" ".join(stripped_parts[:2]))
 
     add(normalized)
+    for alias in TEAM_SEARCH_ALIASES.get(normalized, []):
+        add(alias)
     add(team_name)
 
     if len(normalized_parts) >= 2:
         add(" ".join(normalized_parts[:2]))
     return queries
+
+
+def _signal_market_key(signal) -> str:
+    market = (getattr(signal, "market", "") or "").lower()
+    raw_text = (getattr(signal, "raw_text", "") or "").lower()
+    if "second half" in market or "sh goals" in raw_text or "second half" in raw_text:
+        return "second_half_goals"
+    if "next goal" in market or "next goal" in raw_text:
+        return "next_goal"
+    return "full_time_goals"
+
+
+def _black_market_headers(signal) -> list[str]:
+    market_key = _signal_market_key(signal)
+    if market_key == "second_half_goals":
+        return [
+            "2nd half goals",
+            "second half goals",
+            "2nd half total goals",
+            "second half total goals",
+            "2nd half asian total goals",
+            "second half asian total goals",
+        ]
+    return ["asian total goals", "total goals"]
+
+
+def _betfair_market_texts(signal, line_str: str) -> list[str]:
+    market_key = _signal_market_key(signal)
+    if market_key == "second_half_goals":
+        return [
+            "2nd half goals",
+            "second half goals",
+            f"2nd half over/under {line_str} goals",
+            f"second half over/under {line_str} goals",
+        ]
+    return [f"over/under {line_str} goals"]
+
+
+def _signal_market_label(signal) -> str:
+    market_key = _signal_market_key(signal)
+    if market_key == "second_half_goals":
+        return "Second Half Goals"
+    if market_key == "next_goal":
+        return "Next Goal / Full Time Goals"
+    return "Full Time Goals"
 
 
 def _click_text_if_visible(driver: webdriver.Remote, text: str, selector: str = "button,a,[role=button]") -> bool:
@@ -2507,12 +2558,22 @@ def _verify_black_betslip_target(
         )
 
 
-def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, line: Decimal, profile_label: str, prefer_left: bool = False) -> None:
+def _select_black_asian_total_goals(
+    driver: webdriver.Remote,
+    selection: str,
+    line: Decimal,
+    profile_label: str,
+    market_headers: list[str] | None = None,
+    prefer_left: bool = False,
+) -> None:
     line_variants = _decimal_variants(line)
+    target_headers = market_headers or ["asian total goals"]
     result = driver.execute_script(
         """
         const selection = arguments[0].trim().toLowerCase();
         const lineVariants = arguments[1].map((value) => value.toLowerCase());
+        const normalizeHeader = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();
+        const marketHeaders = (arguments[2] || []).map(normalizeHeader);
         const normalizeNumber = (value) => (value || '').toLowerCase().replace(/\\s+/g, '').replace(',', '.');
         const normalizedLineVariants = lineVariants.map(normalizeNumber);
         const isVisible = (element) => {
@@ -2624,8 +2685,8 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
         const collectSectionCandidates = () => {
             const headers = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
                 .filter(isVisible)
-                .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
-                .filter((item) => item.text === 'asian total goals')
+                .map((element) => ({ element, text: normalizeHeader(normalizedTextOf(element)), rawText: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
+                .filter((item) => marketHeaders.includes(item.text))
                 .sort((a, b) => a.rect.y - b.rect.y);
             const containers = [];
             for (const header of headers) {
@@ -2673,24 +2734,32 @@ def _select_black_asian_total_goals(driver: webdriver.Remote, selection: str, li
         const sectionTexts = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
             .filter(isVisible)
             .map((element) => normalizedTextOf(element))
-            .filter((text) => text === 'asian total goals')
-            .slice(0, 5);
+            .filter((text) => text.includes('goal'))
+            .slice(0, 12);
+        const rowSamples = Array.from(document.querySelectorAll('div,section,li,button,[role="button"]'))
+            .filter(isVisible)
+            .map((element) => normalizedTextOf(element))
+            .filter((text) => text.includes('over') && text.includes('under'))
+            .slice(0, 8);
         return {
             ok: false,
-            reason: 'asian-total-goals-row-not-found',
+            reason: 'market-row-not-found',
             selection,
             lineVariants,
+            marketHeaders,
             sections: sectionTexts,
+            rowSamples,
         };
         """,
         selection,
         line_variants,
+        target_headers,
         prefer_left,
     )
     if not result or not result.get("ok"):
-        raise RuntimeError(f"Could not select Asian Total Goals {selection} {line}. Details: {result!r}")
+        raise RuntimeError(f"Could not select {target_headers} {selection} {line}. Details: {result!r}")
     WebDriverWait(driver, 10).until(lambda browser: "betslip" in _visible_text_lower(browser) and "price" in _visible_text_lower(browser))
-    print(f"[{profile_label}] Selected Asian Total Goals {selection} {line}.")
+    print(f"[{profile_label}] Selected Black market {result.get('sectionText')}: {selection} {line}.")
 
 
 def _set_black_betslip_price_and_place(
@@ -3472,17 +3541,24 @@ def place_black_bet(session: dict, signal) -> dict:
         # caller (bot_telethon) can release the bet lock, let queued signals run, and
         # retry this signal later. Doing the retries here would block other bets for ~5
         # minutes.
+        market_headers = _black_market_headers(signal)
+        market_label = _signal_market_label(signal)
         try:
             WebDriverWait(driver, 20).until(
-                lambda browser: "asian total goals" in _visible_text_lower(browser)
+                lambda browser: any(header in _visible_text_lower(browser) for header in market_headers)
             )
             _ensure_black_betslip_safe_to_use(driver, profile_label)
             _select_black_asian_total_goals(
-                driver, signal.selection, signal.line, profile_label, prefer_left=prefer_left
+                driver,
+                signal.selection,
+                signal.line,
+                profile_label,
+                market_headers=market_headers,
+                prefer_left=prefer_left,
             )
         except Exception as exc:
             raise BlackSelectionMissingError(
-                f"Asian Total Goals {signal.selection} {signal.line} not available for "
+                f"{market_label} {signal.selection} {signal.line} not available for "
                 f"{team_name} vs {opponent_name or '?'}: {exc}"
             ) from exc
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
@@ -4411,6 +4487,13 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
             search_el.send_keys(Keys.ENTER)
         except Exception:
             pass
+        time.sleep(1.0)
+        current_url = (driver.current_url or "").lower()
+        if "/search" not in current_url and "search?" not in current_url:
+            driver.execute_script(
+                "window.location.href = '/exchange/plus/search?query=' + encodeURIComponent(arguments[0]);",
+                team_name,
+            )
         try:
             WebDriverWait(driver, 10).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
@@ -4596,15 +4679,20 @@ def _select_betfair_overunder_back(
     if line_value is None:
         raise RuntimeError("Signal has no line value for Betfair Over/Under.")
     line_str = format(Decimal(str(line_value)).normalize(), "f")
+    target_odds = format(Decimal(str(getattr(signal, "odds"))).normalize(), "f")
     label_text = f"{selection} {line_str} goals"
-    market_text = f"over/under {line_str} goals"
+    market_texts = _betfair_market_texts(signal, line_str)
+    market_label = _signal_market_label(signal)
+    allow_label_fallback = _signal_market_key(signal) != "second_half_goals"
 
     # 1) Try to bring the market into the DOM: click the left-sidebar entry if
     # the market section is not already visible.
     try:
         driver.execute_script(
             r"""
-            const marketText = arguments[0];
+            const marketTexts = arguments[0];
+            const normalizeMarket = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+            const marketTextNorms = marketTexts.map(normalizeMarket);
             function visible(el) {
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
@@ -4615,15 +4703,15 @@ def _select_betfair_overunder_back(
             const links = Array.from(document.querySelectorAll("a, button, [role='button'], li"))
                 .filter(visible)
                 .filter((el) => {
-                    const t = (el.innerText || '').trim().toLowerCase();
-                    return t === marketText;
+                    const t = normalizeMarket(el.innerText || '');
+                    return marketTextNorms.some((marketText) => t === marketText || t.includes(marketText));
                 });
             if (links.length > 0) {
                 links[0].scrollIntoView({ block: 'center' });
                 links[0].click();
             }
             """,
-            market_text,
+            market_texts,
         )
     except Exception:
         pass
@@ -4637,7 +4725,10 @@ def _select_betfair_overunder_back(
             const want = arguments[0];           // 'over' or 'under'
             const lineStr = arguments[1];        // '1.5'
             const labelText = arguments[2];      // 'over 1.5 goals'
-            const marketText = arguments[3];     // 'over/under 1.5 goals'
+            const marketTexts = arguments[3];    // e.g. ['over/under 1.5 goals'] or ['2nd half goals']
+            const allowLabelFallback = arguments[4];
+            const normalizeMarket = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+            const marketTextNorms = marketTexts.map(normalizeMarket);
             function visible(el) {
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
@@ -4708,7 +4799,10 @@ def _select_betfair_overunder_back(
                     .filter(visible)
                     .map((el) => ({ el, text: normalizedTxt(el), rect: el.getBoundingClientRect() }))
                     .filter((item) => item.rect.x > 120)
-                    .filter((item) => item.text === marketText || item.text.indexOf(marketText) !== -1)
+                    .filter((item) => {
+                        const text = normalizeMarket(item.text);
+                        return marketTextNorms.some((marketText) => text === marketText || text.indexOf(marketText) !== -1);
+                    })
                     .sort((a, b) => a.text.length - b.text.length || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
                 const debug = [];
                 for (const header of headers.slice(0, 12)) {
@@ -4716,7 +4810,8 @@ def _select_betfair_overunder_back(
                     for (let depth = 0; depth < 8 && container; depth++, container = container.parentElement) {
                         if (!visible(container)) continue;
                         const containerText = normalizedTxt(container);
-                        if (containerText.indexOf(marketText) === -1 || containerText.indexOf(labelText) === -1) continue;
+                        const containerMarketText = normalizeMarket(containerText);
+                        if (!marketTextNorms.some((marketText) => containerMarketText.indexOf(marketText) !== -1) || containerText.indexOf(labelText) === -1) continue;
                         const containerRect = container.getBoundingClientRect();
                         if (containerRect.width < 220 || containerRect.height < 55) continue;
                         const rows = Array.from(container.querySelectorAll('tr, li, div'))
@@ -4742,10 +4837,11 @@ def _select_betfair_overunder_back(
                         }
                     }
                 }
-                return { error: 'legacy market row not found', marketText, labelText, headers: headers.slice(0, 5).map((h) => h.text.slice(0, 120)), debug: debug.slice(0, 5) };
+                return { error: 'legacy market row not found', marketTexts, labelText, headers: headers.slice(0, 5).map((h) => h.text.slice(0, 120)), debug: debug.slice(0, 5) };
             }
             const legacyResult = clickLegacyExchangeMarket();
             if (legacyResult && legacyResult.ok) return legacyResult;
+            if (!allowLabelFallback) return legacyResult;
             // Find the SMALLEST element whose visible text equals (or starts with) the label.
             // Exclude 'first half' / 'half time' / 'second half' rows so we hit the
             // full-match Over/Under market, matching how Black always treats the
@@ -4807,7 +4903,8 @@ def _select_betfair_overunder_back(
             selection,
             line_str,
             label_text,
-            market_text,
+            market_texts,
+            allow_label_fallback,
         )
         if info and info.get("ok"):
             break
@@ -4816,12 +4913,12 @@ def _select_betfair_overunder_back(
     if not info or not info.get("ok"):
         raise RuntimeError(
             f"[{profile_label}] Could not select Betfair Back {selection.title()} "
-            f"{line_str} Goals: {info!r}"
+            f"{line_str} Goals in {market_label}: {info!r}"
         )
     odds_text = info.get("priceText", "")
     print(
-        f"[{profile_label}] Betfair Back selected: {selection.title()} {line_str} "
-        f"Goals at odds {odds_text}"
+        f"[{profile_label}] Betfair Back selected: {market_label} {selection.title()} {line_str} "
+        f"Goals at available odds {odds_text}; target odds {target_odds}"
     )
 
     # 3) Fill in stake and place the bet.
@@ -4845,6 +4942,7 @@ def _select_betfair_overunder_back(
         placed = driver.execute_script(
             r"""
             const stakeVal = arguments[0];
+            const oddsVal = arguments[1];
             function visible(el) {
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
@@ -4852,9 +4950,24 @@ def _select_betfair_overunder_back(
                 const cs = window.getComputedStyle(el);
                 return cs.visibility !== 'hidden' && cs.display !== 'none';
             }
+            function setInputValue(inp, value) {
+                inp.scrollIntoView({ block: 'center' });
+                inp.focus();
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                );
+                if (nativeInputValueSetter && nativeInputValueSetter.set) {
+                    nativeInputValueSetter.set.call(inp, value);
+                } else {
+                    inp.value = value;
+                }
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+            }
             // Find the stake input. Betfair betslip inputs may not carry 'stake' in
             // their attributes — try several strategies in order of confidence.
             let inp = null;
+            let oddsInp = null;
             // Strategy 1: attribute mentions 'stake'.
             const allInputs = Array.from(document.querySelectorAll(
                 "input[type='text'], input[type='number'], input:not([type])"
@@ -4880,9 +4993,16 @@ def _select_betfair_overunder_back(
                     const ins = Array.from(c.querySelectorAll(
                         "input[type='text'], input[type='number'], input:not([type])"
                     )).filter(visible);
-                    if (ins.length >= 2) { inp = ins[1]; break; }
+                    if (ins.length >= 2) { oddsInp = ins[0]; inp = ins[1]; break; }
                     if (ins.length === 1) { inp = ins[0]; break; }
                 }
+            }
+            if (!oddsInp) {
+                oddsInp = allInputs.find((el) => {
+                    if (el === inp) return false;
+                    const v = (el.value || '').trim().replace(',', '.');
+                    return /^\d+(?:\.\d+)?$/.test(v) && v !== stakeVal;
+                }) || null;
             }
             // Strategy 3: among all visible inputs, pick the one whose current value
             // is empty or '0' (not the odds field which holds a non-zero decimal).
@@ -4895,24 +5015,24 @@ def _select_betfair_overunder_back(
             if (!inp) return { error: 'stake input not found',
                 inputCount: allInputs.length,
                 inputValues: allInputs.map((e) => e.value).slice(0, 5) };
-            inp.scrollIntoView({ block: 'center' });
-            inp.focus();
-            // Clear existing value using React/Angular-compatible setter.
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            );
-            if (nativeInputValueSetter && nativeInputValueSetter.set) {
-                nativeInputValueSetter.set.call(inp, stakeVal);
-            } else {
-                inp.value = stakeVal;
+            if (!oddsInp) return { error: 'odds input not found',
+                inputCount: allInputs.length,
+                inputValues: allInputs.map((e) => e.value).slice(0, 8) };
+            setInputValue(oddsInp, oddsVal);
+            setInputValue(inp, stakeVal);
+            const normalized = (value) => (value || '').trim().replace(',', '.');
+            if (normalized(oddsInp.value) !== normalized(oddsVal)) {
+                return { error: 'odds input did not keep target value', oddsValue: oddsInp.value, targetOdds: oddsVal };
             }
-            inp.dispatchEvent(new Event('input', { bubbles: true }));
-            inp.dispatchEvent(new Event('change', { bubbles: true }));
-            return { stakeSet: true };
+            if (normalized(inp.value) !== normalized(stakeVal)) {
+                return { error: 'stake input did not keep target value', stakeValue: inp.value, targetStake: stakeVal };
+            }
+            return { stakeSet: true, oddsSet: true, oddsValue: oddsInp.value, stakeValue: inp.value };
             """,
             stake_str,
+            target_odds,
         )
-        if not (isinstance(placed, dict) and placed.get("stakeSet")):
+        if not (isinstance(placed, dict) and placed.get("stakeSet") and placed.get("oddsSet")):
             print(f"[{profile_label}] Betfair: stake fill result: {placed!r}", flush=True)
         else:
             # Wait for Betfair UI to update button label to "Confirm bet".
@@ -4945,7 +5065,8 @@ def _select_betfair_overunder_back(
                 first_label = confirmed.get("label", "")
                 print(
                     f"[{profile_label}] Betfair: clicked '{first_label}' — "
-                    f"{selection.title()} {line_str} @ {odds_text}, stake {stake_str}"
+                    f"{market_label} {selection.title()} {line_str} @ target {target_odds} "
+                    f"(available {odds_text}), stake {stake_str}"
                 )
                 # If the first button was "Place bet/bets", Betfair shows a
                 # second "Confirm bet" button. Wait and click it.
@@ -4991,8 +5112,10 @@ def _select_betfair_overunder_back(
                 print(f"[{profile_label}] Betfair: confirm click result: {confirmed!r}", flush=True)
 
     return {
-        "betfair_selection": f"{selection.title()} {line_str}",
-        "betfair_odds": odds_text,
+        "betfair_selection": f"{market_label} {selection.title()} {line_str}",
+        "betfair_market": market_label,
+        "betfair_odds": target_odds,
+        "betfair_available_odds": odds_text,
         "betfair_stake": stake_str,
         "betfair_bet_placed": bet_placed,
     }

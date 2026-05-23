@@ -47,7 +47,7 @@ class BettingSignal:
 ODDS_RE = re.compile(
     r"Odds:\s*(?P<odds>\d+(?:[.,]\d+)?)\s+"
     r"(?P<selection>Over|Under)\s+"
-    r"(?P<line>\d+(?:[.,]\d+)?)",
+    r"(?P<line>\d+(?:[.,]\d+)?)(?P<title>[^\r\n]*)",
     re.IGNORECASE,
 )
 TIMER_RE = re.compile(r"Timer:\s*(?P<minute>\d+)'")
@@ -91,6 +91,16 @@ def _split_country_league(league_line: str | None) -> tuple[str | None, str | No
     return None, league_line
 
 
+def _detect_market(title_tail: str) -> str:
+    normalized = re.sub(r"[`*_~]+", "", title_tail or "").lower()
+    normalized = re.sub(r"\s+", " ", normalized)
+    if "sh goals" in normalized or "second half" in normalized or re.search(r"\b2h\b", normalized):
+        return "SECOND HALF GOALS"
+    if "next goal" in normalized:
+        return "NEXT GOAL BEFORE"
+    return "FULL TIME OVER/UNDER"
+
+
 def parse_betting_signal(text: str) -> BettingSignal | None:
     """Return a parsed betting signal, or None when a message is not actionable."""
     odds_match = ODDS_RE.search(text)
@@ -118,12 +128,14 @@ def parse_betting_signal(text: str) -> BettingSignal | None:
     timer_match = TIMER_RE.search(text)
     goals_match = GOALS_RE.search(text)
 
+    market = _detect_market(odds_match.group("title") or "")
+
     return BettingSignal(
         raw_text=text,
         odds=Decimal(odds_match.group("odds").replace(",", ".")),
         selection=odds_match.group("selection").title(),
         line=Decimal(odds_match.group("line").replace(",", ".")),
-        market="FULL TIME OVER/UNDER",
+        market=market,
         expiry="30 min",
         league=league,
         country=country,
