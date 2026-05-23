@@ -702,13 +702,21 @@ def _read_black_betslip_state(driver: webdriver.Remote) -> dict:
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const looksLikeActiveTicket = (text) => {
+            return (text.includes('stake') && text.includes('price') && text.includes('place'))
+                || (text.includes('stake at price') && text.includes('ex. returns'))
+                || text.includes('betslip');
+        };
         const panel = Array.from(document.querySelectorAll('aside,section,div'))
             .filter(isVisible)
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-            .filter((item) => item.rect.x > window.innerWidth * 0.68)
-            .filter((item) => item.rect.width > 180 && item.rect.height > 160)
-            .filter((item) => item.text.includes('betslip'))
-            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0];
+            .filter((item) => item.rect.width > 150 && item.rect.height > 90)
+            .filter((item) => looksLikeActiveTicket(item.text))
+            .sort((a, b) => {
+                const aTicket = a.text.includes('stake') && a.text.includes('price') && a.text.includes('place') ? 0 : 1;
+                const bTicket = b.text.includes('stake') && b.text.includes('price') && b.text.includes('place') ? 0 : 1;
+                return aTicket - bTicket || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height);
+            })[0];
         if (!panel) return { ok: false, reason: 'betslip panel not found', text: document.body?.innerText || '' };
 
         const inputs = Array.from(panel.element.querySelectorAll('input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"],[tabindex]'))
@@ -2528,8 +2536,12 @@ def _verify_black_betslip_target(
         const panels = Array.from(document.querySelectorAll('aside,section,div'))
             .filter(isVisible)
             .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
-            .filter((item) => item.rect.x > window.innerWidth * 0.68)
-            .filter((item) => item.text.includes('betslip'))
+            .filter((item) => item.rect.width > 150 && item.rect.height > 90)
+            .filter((item) => {
+                const text = item.text;
+                return (text.includes('stake') && text.includes('price') && text.includes('place'))
+                    || text.includes('betslip');
+            })
             .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
 
         for (const panel of panels) {
@@ -2758,7 +2770,7 @@ def _select_black_asian_total_goals(
     )
     if not result or not result.get("ok"):
         raise RuntimeError(f"Could not select {target_headers} {selection} {line}. Details: {result!r}")
-    WebDriverWait(driver, 10).until(lambda browser: "betslip" in _visible_text_lower(browser) and "price" in _visible_text_lower(browser))
+    time.sleep(0.8)
     print(f"[{profile_label}] Selected Black market {result.get('sectionText')}: {selection} {line}.")
 
 
@@ -2782,13 +2794,21 @@ def _set_black_betslip_price_and_place(
                 && rect.right > 0;
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+        const looksLikeActiveTicket = (text) => {
+            return (text.includes('stake') && text.includes('price') && text.includes('place'))
+                || (text.includes('stake at price') && text.includes('ex. returns'))
+                || text.includes('betslip');
+        };
         const panel = Array.from(document.querySelectorAll('aside,section,div'))
             .filter(isVisible)
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-            .filter((item) => item.rect.x > window.innerWidth * 0.68)
-            .filter((item) => item.rect.width > 180 && item.rect.height > 160)
-            .filter((item) => item.text.includes('betslip'))
-            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+            .filter((item) => item.rect.width > 150 && item.rect.height > 90)
+            .filter((item) => looksLikeActiveTicket(item.text))
+            .sort((a, b) => {
+                const aTicket = a.text.includes('stake') && a.text.includes('price') && a.text.includes('place') ? 0 : 1;
+                const bTicket = b.text.includes('stake') && b.text.includes('price') && b.text.includes('place') ? 0 : 1;
+                return aTicket - bTicket || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height);
+            })[0];
         if (!panel) {
             return { ok: false, reason: 'betslip panel not found', text: document.body?.innerText || '' };
         }
@@ -2864,11 +2884,35 @@ def _set_black_betslip_price_and_place(
             }
             return pickFallbackInput(usedElements);
         };
+        const pickFieldBoxByLabel = (labelText, usedElements) => {
+            const matchingLabels = labels.filter((item) => item.text === labelText);
+            for (const label of matchingLabels) {
+                const x = label.rect.left + label.rect.width / 2;
+                const yValues = [
+                    label.rect.bottom + 8,
+                    label.rect.bottom + 16,
+                    label.rect.bottom + 24,
+                    label.rect.top + label.rect.height / 2,
+                ];
+                for (const y of yValues) {
+                    const rawTarget = document.elementFromPoint(x, y);
+                    const target = rawTarget?.closest?.('input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"],[tabindex],div,span') || rawTarget;
+                    if (!target || !panel.element.contains(target) || !isVisible(target) || usedElements.has(target)) continue;
+                    const rect = target.getBoundingClientRect();
+                    if (rect.width < 18 || rect.height < 10 || rect.y >= topControlsBottom) continue;
+                    const tag = target.tagName.toLowerCase();
+                    const role = (target.getAttribute('role') || '').toLowerCase();
+                    if (tag === 'button' || role === 'button') continue;
+                    return { element: target, rect, text: textOf(target.parentElement || target), fallback: 'point-under-label' };
+                }
+            }
+            return null;
+        };
 
         const usedInputs = new Set();
-        const stakeItem = pickInputByLabel('stake', usedInputs);
+        const stakeItem = pickInputByLabel('stake', usedInputs) || pickFieldBoxByLabel('stake', usedInputs);
         if (stakeItem) usedInputs.add(stakeItem.element);
-        const priceItem = pickInputByLabel('price', usedInputs);
+        const priceItem = pickInputByLabel('price', usedInputs) || pickFieldBoxByLabel('price', usedInputs);
         const stakeInput = stakeItem?.element || null;
         const priceInput = priceItem?.element || null;
         const placeButton = placeButtonItem?.element || null;
@@ -2894,8 +2938,8 @@ def _set_black_betslip_price_and_place(
                     parentText: item.text.slice(0, 80),
                 })),
                 selected: {
-                    stake: stakeItem ? compactRect(stakeItem.rect) : null,
-                    price: priceItem ? compactRect(priceItem.rect) : null,
+                    stake: stakeItem ? { rect: compactRect(stakeItem.rect), fallback: stakeItem.fallback || '' } : null,
+                    price: priceItem ? { rect: compactRect(priceItem.rect), fallback: priceItem.fallback || '' } : null,
                 },
             },
         };
@@ -2903,15 +2947,23 @@ def _set_black_betslip_price_and_place(
     def normalized_decimal_text(raw_value: str) -> str:
         return format(_money_to_decimal(raw_value).normalize(), "f")
 
-    def locate_controls() -> dict:
-        controls = driver.execute_script(locate_script)
-        if not controls or not controls.get("ok"):
-            page_text = (controls or {}).get("text", "")
-            short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
-            raise RuntimeError(f"Could not prepare Black betslip. Reason: {(controls or {}).get('reason')}. Page: {short_text}")
-        return controls
+    def locate_controls(timeout: float = 0.0) -> dict:
+        deadline = time.monotonic() + max(timeout, 0.0)
+        last_controls = None
+        while True:
+            controls = driver.execute_script(locate_script)
+            if controls and controls.get("ok"):
+                return controls
+            last_controls = controls
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+        controls = last_controls
+        page_text = (controls or {}).get("text", "")
+        short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
+        raise RuntimeError(f"Could not prepare Black betslip. Reason: {(controls or {}).get('reason')}. Page: {short_text}")
 
-    result = locate_controls()
+    result = locate_controls(timeout=8.0)
     if not result or not result.get("ok"):
         page_text = (result or {}).get("text", "")
         short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
@@ -2943,7 +2995,7 @@ def _set_black_betslip_price_and_place(
     if stake_input and stake_text:
         _fill_betslip_input(driver, stake_input, stake_text)
         time.sleep(0.3)
-        result = locate_controls()
+        result = locate_controls(timeout=4.0)
         price_input = result.get("priceInput")
         place_button = result.get("placeButton")
         if not price_input:
