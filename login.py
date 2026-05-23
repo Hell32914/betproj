@@ -1098,7 +1098,7 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
         )
     search_input.send_keys(Keys.ENTER)
 
-    WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
+    search_state = WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
         """
         const requested = arguments[0];
         const queryWords = arguments[1] || [];
@@ -1117,22 +1117,62 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                 && rect.width > 0
                 && rect.height > 0
                 && rect.bottom > 0
-                && rect.right > 0;
+                && rect.right > 0
+                && rect.x < window.innerWidth
+                && rect.y < window.innerHeight;
         };
-        const body = normalize(document.body?.innerText || '');
-        if (body.includes('no results found') || body.includes('no events found')) return true;
         const normalizedRequest = normalize(requested);
-        if (normalizedRequest && body.includes(normalizedRequest)) return true;
-        if (queryWords.some((word) => body.includes(normalize(word)))) return true;
-        const inputValues = Array.from(document.querySelectorAll('input'))
+        const bodyText = document.body?.innerText || '';
+        const body = normalize(bodyText);
+        const noResults = body.includes('no results found') || body.includes('no events found');
+
+        const roots = Array.from(document.querySelectorAll('aside,section,main,div'))
             .filter(isVisible)
-            .map((input) => normalize(input.value || input.getAttribute('value') || ''))
-            .join(' ');
-        return normalizedRequest && inputValues.includes(normalizedRequest);
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: element.innerText || element.textContent || '' }))
+            .filter((item) => item.rect.width > 240 && item.rect.height > 70)
+            .filter((item) => {
+                const text = normalize(item.text);
+                return text.includes('live events')
+                    || text.includes('use ctrl f')
+                    || text.includes('matches')
+                    || text.includes('top events')
+                    || text.includes('select sport');
+            })
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+        const root = roots[0]?.element || document.body;
+        const resultRows = Array.from(root.querySelectorAll('li,a,button,[role="button"],[role="option"],[role="listitem"],article,div'))
+            .filter(isVisible)
+            .map((element) => {
+                const row = element.closest('a,button,li,[role="button"],[role="option"],[role="listitem"],article') || element;
+                const rect = row.getBoundingClientRect();
+                const text = row.innerText || row.textContent || '';
+                return { row, rect, text, normalized: normalize(text) };
+            })
+            .filter((item) => item.text && item.text.length < 500)
+            .filter((item) => item.rect.width > 45 && item.rect.height > 12)
+            .filter((item) => {
+                if (normalizedRequest && item.normalized.includes(normalizedRequest)) return true;
+                return queryWords.some((word) => item.normalized.includes(normalize(word)));
+            })
+            .filter((item, index, array) => array.findIndex((other) => other.row === item.row) === index)
+            .slice(0, 6);
+        if (resultRows.length) {
+            return {
+                ok: true,
+                reason: 'result-row',
+                rows: resultRows.map((item) => item.text.split('\\n').map((line) => line.trim()).filter(Boolean).slice(0, 4).join(' | ').slice(0, 180)),
+            };
+        }
+        if (noResults) {
+            return { ok: false, reason: 'no-results', text: bodyText.split('\\n').map((line) => line.trim()).filter(Boolean).slice(0, 10).join(' | ').slice(0, 500) };
+        }
+        return false;
         """,
         normalized_query,
         query_words,
     ))
+    if not search_state or not search_state.get("ok"):
+        raise RuntimeError(f"Black search returned no visible match rows for {normalized_query!r}. State: {search_state!r}")
     # Give the React result list a brief moment to render fully before consumers
     # start scanning the DOM for the match-card row.
     time.sleep(1.2)
@@ -1940,6 +1980,12 @@ def _black_match_context_matches(
 
 
 def _ensure_black_betslip_safe_to_use(driver: webdriver.Remote, profile_label: str) -> None:
+    try:
+        _activate_black_order_tab(driver, "Betslip", profile_label)
+        time.sleep(0.3)
+    except Exception:
+        pass
+
     state = driver.execute_script(
         """
         const isVisible = (element) => {
@@ -1980,6 +2026,26 @@ def _ensure_black_betslip_safe_to_use(driver: webdriver.Remote, profile_label: s
         const panelText = textOf(panel);
         if (looksLikeEmptyBetslip(panelText) && !looksLikeOccupiedBetslip(panelText)) {
             return { ok: true, reason: 'empty' };
+        }
+
+        const activeInputs = Array.from(panel.querySelectorAll('input'))
+            .filter(isVisible)
+            .filter((element) => !element.disabled && !element.readOnly)
+            .filter((element) => !['checkbox', 'radio', 'hidden'].includes((element.type || '').toLowerCase()));
+        const placeButtons = Array.from(panel.querySelectorAll('button,[role="button"]'))
+            .filter(isVisible)
+            .filter((element) => {
+                const text = textOf(element);
+                return text === 'place' || text.includes('place');
+            })
+            .filter((element) => !element.disabled && element.getAttribute('aria-disabled') !== 'true');
+        const looksLikeSettledOrderPanel = /(reconciled|success|accepted|matched|unplaced|order id|placed at)/.test(panelText)
+            || panelText.includes('profit/loss');
+        if (!activeInputs.length && !placeButtons.length && looksLikeSettledOrderPanel) {
+            return { ok: true, reason: 'settled-order-panel' };
+        }
+        if (!activeInputs.length && !placeButtons.length && !panelText.includes('less than min order')) {
+            return { ok: true, reason: 'no-active-betslip-controls' };
         }
 
         const closeButtons = Array.from(panel.querySelectorAll('button,[role="button"],div,span'))
@@ -4042,7 +4108,9 @@ def open_betfair_match(session: dict, signal) -> dict:
         if not open_result.get("opened"):
             return open_result
         try:
-            sel_result = _select_betfair_overunder_back(driver, signal, profile_label)
+            stake_info = session.get("stake") if isinstance(session.get("stake"), dict) else None
+            fallback_stake = (stake_info or {}).get("stake")
+            sel_result = _select_betfair_overunder_back(driver, signal, profile_label, fallback_stake=fallback_stake)
             open_result.update(sel_result)
         except Exception as exc:
             print(
@@ -4363,7 +4431,12 @@ def _follow_betfair_search_results(
     return None
 
 
-def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_label: str) -> dict:
+def _select_betfair_overunder_back(
+    driver: webdriver.Remote,
+    signal,
+    profile_label: str,
+    fallback_stake: str | None = None,
+) -> dict:
     """Click the Back (blue) odds cell for the Over/Under <line> Goals selection.
 
     Picks blue vs pink by comparing computed background-color (Back is blue, Lay
@@ -4614,7 +4687,11 @@ def _select_betfair_overunder_back(driver: webdriver.Remote, signal, profile_lab
         stake_str = _format_stake_amount(stake_amount)
         print(f"[{profile_label}] Betfair stake: {stake_str} (balance {balance})")
     except Exception as exc:
-        print(f"[{profile_label}] Betfair: could not compute stake: {exc}", flush=True)
+        if fallback_stake:
+            stake_str = str(fallback_stake)
+            print(f"[{profile_label}] Betfair: using cached stake {stake_str}; balance read failed: {exc}", flush=True)
+        else:
+            print(f"[{profile_label}] Betfair: could not compute stake: {exc}", flush=True)
 
     if stake_str:
         # Give the betslip panel time to render after clicking the Back cell.
