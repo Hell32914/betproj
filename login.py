@@ -2683,27 +2683,54 @@ def _set_black_betslip_price_and_place(
             .filter((item) => item.rect.y < topControlsBottom)
             .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
 
-        const findInputByLabel = (labelText, fallbackIndex) => {
-            const labels = Array.from(panel.element.querySelectorAll('label,div,span,p'))
-                .filter(isVisible)
-                .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
-                .filter((item) => item.text === labelText)
-                .filter((item) => item.rect.y < topControlsBottom)
-                .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
-            for (const label of labels) {
+        const compactRect = (rect) => ({
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            w: Math.round(rect.width),
+            h: Math.round(rect.height),
+        });
+        const labels = Array.from(panel.element.querySelectorAll('label,div,span,p'))
+            .filter(isVisible)
+            .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+            .filter((item) => item.rect.y < topControlsBottom)
+            .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+        const rowInputs = inputs
+            .filter((item) => item.rect.y > panelRect.top + 35 && item.rect.y < topControlsBottom)
+            .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+        const pickFallbackInput = (usedElements) => rowInputs.find((item) => !usedElements.has(item.element))
+            || inputs.find((item) => !usedElements.has(item.element))
+            || null;
+        const pickInputByLabel = (labelText, usedElements) => {
+            const matchingLabels = labels.filter((item) => item.text === labelText);
+            for (const label of matchingLabels) {
+                const labelCenterX = label.rect.left + label.rect.width / 2;
                 const candidate = inputs
-                    .filter((item) => item.rect.y >= label.rect.y - 18 && item.rect.y <= label.rect.bottom + 45)
-                    .filter((item) => item.rect.x >= label.rect.x - 40)
-                    .sort((a, b) => Math.abs(a.rect.y - label.rect.y) - Math.abs(b.rect.y - label.rect.y) || Math.abs(a.rect.x - label.rect.x) - Math.abs(b.rect.x - label.rect.x))[0];
-                if (candidate) return candidate.element;
+                    .filter((item) => !usedElements.has(item.element))
+                    .filter((item) => item.rect.y >= label.rect.y - 16 && item.rect.y <= label.rect.bottom + 55)
+                    .map((item) => {
+                        const inputCenterX = item.rect.left + item.rect.width / 2;
+                        const leftOfLabelPenalty = item.rect.right < label.rect.left - 15 ? 500 : 0;
+                        const farBelowPenalty = item.rect.y > label.rect.bottom + 45 ? 120 : 0;
+                        const abovePenalty = item.rect.bottom < label.rect.top - 4 ? 300 : 0;
+                        const score = Math.abs(inputCenterX - labelCenterX)
+                            + Math.abs(item.rect.y - label.rect.bottom) * 0.25
+                            + leftOfLabelPenalty
+                            + farBelowPenalty
+                            + abovePenalty;
+                        return { ...item, score };
+                    })
+                    .sort((a, b) => a.score - b.score || a.rect.x - b.rect.x)[0];
+                if (candidate) return candidate;
             }
-            const rowInputs = inputs.filter((item) => item.rect.y > panelRect.top + 40 && item.rect.y < panelRect.top + 140);
-            if (rowInputs[fallbackIndex]) return rowInputs[fallbackIndex].element;
-            return inputs[fallbackIndex]?.element || null;
+            return pickFallbackInput(usedElements);
         };
 
-        const stakeInput = findInputByLabel('stake', 0);
-        const priceInput = findInputByLabel('price', 1);
+        const usedInputs = new Set();
+        const stakeItem = pickInputByLabel('stake', usedInputs);
+        if (stakeItem) usedInputs.add(stakeItem.element);
+        const priceItem = pickInputByLabel('price', usedInputs);
+        const stakeInput = stakeItem?.element || null;
+        const priceInput = priceItem?.element || null;
         const placeButton = placeButtonItem?.element || null;
         return {
             ok: true,
@@ -2712,6 +2739,22 @@ def _set_black_betslip_price_and_place(
             priceInput,
             placeButton,
             panelText: panel.element.innerText || document.body?.innerText || '',
+            controlDebug: {
+                labels: labels
+                    .filter((item) => ['timeout', 'stake', 'price', 'place'].includes(item.text))
+                    .map((item) => ({ text: item.text, rect: compactRect(item.rect) })),
+                inputs: inputs.map((item) => ({
+                    value: item.element.value || item.element.getAttribute('value') || '',
+                    placeholder: item.element.getAttribute('placeholder') || '',
+                    aria: item.element.getAttribute('aria-label') || '',
+                    rect: compactRect(item.rect),
+                    parentText: item.text.slice(0, 80),
+                })),
+                selected: {
+                    stake: stakeItem ? compactRect(stakeItem.rect) : null,
+                    price: priceItem ? compactRect(priceItem.rect) : null,
+                },
+            },
         };
     """
     def normalized_decimal_text(raw_value: str) -> str:
@@ -2734,13 +2777,25 @@ def _set_black_betslip_price_and_place(
     price_input = result.get("priceInput")
     if not price_input:
         short_text = " | ".join(line.strip() for line in (result.get("panelText", "") or "").splitlines() if line.strip())[:700]
-        raise RuntimeError(f"Could not prepare Black betslip. Reason: price input not found. Page: {short_text}")
+        raise RuntimeError(
+            f"Could not prepare Black betslip. Reason: price input not found. "
+            f"Controls: {result.get('controlDebug')!r}. Page: {short_text}"
+        )
 
     stake_input = result.get("stakeInput")
     place_button = result.get("placeButton")
     if not place_button:
         short_text = " | ".join(line.strip() for line in (result.get("panelText", "") or "").splitlines() if line.strip())[:700]
-        raise RuntimeError(f"Could not click Black Place. Reason: place button not found. Page: {short_text}")
+        raise RuntimeError(
+            f"Could not click Black Place. Reason: place button not found. "
+            f"Controls: {result.get('controlDebug')!r}. Page: {short_text}"
+        )
+    if stake_input and getattr(stake_input, "id", None) == getattr(price_input, "id", None):
+        short_text = " | ".join(line.strip() for line in (result.get("panelText", "") or "").splitlines() if line.strip())[:700]
+        raise RuntimeError(
+            f"Could not prepare Black betslip. Reason: stake and price resolved to the same input. "
+            f"Controls: {result.get('controlDebug')!r}. Page: {short_text}"
+        )
 
     if stake_input and stake_text:
         _fill_betslip_input(driver, stake_input, stake_text)
@@ -2783,6 +2838,11 @@ def _set_black_betslip_price_and_place(
     try:
         ready_state = WebDriverWait(driver, 8).until(betslip_ready)
     except TimeoutException as exc:
+        debug_state = None
+        try:
+            debug_state = driver.execute_script(locate_script)
+        except Exception:
+            debug_state = None
         snapshot = _read_black_betslip_state(driver)
         panel_text = " | ".join(line.strip() for line in (snapshot.get("text", "") or "").splitlines() if line.strip())[:700]
         inputs = snapshot.get("inputs") or []
@@ -2793,7 +2853,8 @@ def _set_black_betslip_price_and_place(
         raise RuntimeError(
             f"Black betslip did not become ready after filling stake/price. "
             f"Target stake={stake_text or 'existing'}, price={price_text}. "
-            f"Inputs: {inputs_text or 'none'}. Panel: {panel_text}"
+            f"Inputs: {inputs_text or 'none'}. Controls: {(debug_state or {}).get('controlDebug')!r}. "
+            f"Panel: {panel_text}"
         ) from exc
     ready_place_button = ready_state.get("placeButton")
     driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", ready_place_button)
