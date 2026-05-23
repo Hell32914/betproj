@@ -325,13 +325,31 @@ def _find_first_clickable(driver: webdriver.Remote, selectors: list[tuple[str, s
         raise RuntimeError(f"Could not find clickable element from selectors: {selectors}") from (last_exc or exc)
 
 
+def _control_value(driver: webdriver.Remote, element) -> str:
+    return driver.execute_script(
+        """
+        const element = arguments[0];
+        const editableSelector = 'input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"],[tabindex]';
+        const target = element.matches?.(editableSelector)
+            ? element
+            : (element.querySelector?.(editableSelector) || (element.contains(document.activeElement) ? document.activeElement : element));
+        if (!target) return '';
+        if ('value' in target) return target.value || target.getAttribute('value') || '';
+        return target.innerText || target.textContent || target.getAttribute('aria-valuetext') || '';
+        """,
+        element,
+    ) or ""
+
+
 def _set_input_value(driver: webdriver.Remote, element, value: str) -> None:
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
     try:
         driver.execute_script(
             """
-            const input = arguments[0];
-            input.focus({ preventScroll: true });
+            const element = arguments[0];
+            const editableSelector = 'input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"],[tabindex]';
+            const input = element.matches?.(editableSelector) ? element : (element.querySelector?.(editableSelector) || element);
+            input.focus?.({ preventScroll: true });
             input.click?.();
             """,
             element,
@@ -346,12 +364,20 @@ def _set_input_value(driver: webdriver.Remote, element, value: str) -> None:
     except Exception:
         driver.execute_script(
             """
-            const input = arguments[0];
+            const element = arguments[0];
             const value = arguments[1];
-            input.focus({ preventScroll: true });
-            const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
-            if (setter) setter.call(input, value);
-            else input.value = value;
+            const editableSelector = 'input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"],[tabindex]';
+            const input = element.matches?.(editableSelector)
+                ? element
+                : (element.querySelector?.(editableSelector) || (element.contains(document.activeElement) ? document.activeElement : element));
+            input.focus?.({ preventScroll: true });
+            if ('value' in input) {
+                const setter = Object.getOwnPropertyDescriptor(input.__proto__, 'value')?.set;
+                if (setter) setter.call(input, value);
+                else input.value = value;
+            } else {
+                input.textContent = value;
+            }
             input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: value }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
             """,
@@ -359,7 +385,7 @@ def _set_input_value(driver: webdriver.Remote, element, value: str) -> None:
             value,
         )
 
-    current_value = element.get_attribute("value") or ""
+    current_value = _control_value(driver, element)
     if current_value == value:
         return
 
@@ -367,14 +393,22 @@ def _set_input_value(driver: webdriver.Remote, element, value: str) -> None:
         """
         const element = arguments[0];
         const value = arguments[1];
-        const setter = Object.getOwnPropertyDescriptor(element.__proto__, 'value')?.set;
-        if (setter) {
-            setter.call(element, value);
+        const editableSelector = 'input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"],[tabindex]';
+        const target = element.matches?.(editableSelector)
+            ? element
+            : (element.querySelector?.(editableSelector) || (element.contains(document.activeElement) ? document.activeElement : element));
+        if ('value' in target) {
+            const setter = Object.getOwnPropertyDescriptor(target.__proto__, 'value')?.set;
+            if (setter) {
+                setter.call(target, value);
+            } else {
+                target.value = value;
+            }
         } else {
-            element.value = value;
+            target.textContent = value;
         }
-        element.dispatchEvent(new Event('input', { bubbles: true }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
+        target.dispatchEvent(new Event('input', { bubbles: true }));
+        target.dispatchEvent(new Event('change', { bubbles: true }));
         """,
         element,
         value,
@@ -626,11 +660,23 @@ def _read_black_betslip_state(driver: webdriver.Remote) -> dict:
             .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0];
         if (!panel) return { ok: false, reason: 'betslip panel not found', text: document.body?.innerText || '' };
 
-        const inputs = Array.from(panel.element.querySelectorAll('input'))
+        const inputs = Array.from(panel.element.querySelectorAll('input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"],[tabindex]'))
             .filter(isVisible)
-            .filter((element) => !element.disabled && !element.readOnly)
+            .filter((element) => !element.disabled && element.getAttribute('aria-disabled') !== 'true')
+            .filter((element) => {
+                const tag = element.tagName.toLowerCase();
+                const role = (element.getAttribute('role') || '').toLowerCase();
+                if ((tag === 'button' || role === 'button')
+                    && !element.matches('input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"]')) {
+                    return false;
+                }
+                return true;
+            })
             .map((element) => ({
+                tag: element.tagName.toLowerCase(),
+                role: element.getAttribute('role') || '',
                 value: element.value || element.getAttribute('value') || '',
+                text: (element.innerText || element.textContent || '').trim(),
                 placeholder: (element.getAttribute('placeholder') || '').trim(),
                 aria: (element.getAttribute('aria-label') || '').trim(),
             }));
@@ -665,16 +711,25 @@ def _fill_betslip_input(driver: webdriver.Remote, element, value: str) -> None:
         element.send_keys(Keys.DELETE)
         element.send_keys(value)
     except Exception:
-        _set_input_value(driver, element, value)
-    else:
-        current_value = (element.get_attribute("value") or "").strip()
-        if current_value != value:
+        try:
+            ActionChains(driver).key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).send_keys(Keys.DELETE).send_keys(value).perform()
+        except Exception:
             _set_input_value(driver, element, value)
+    else:
+        current_value = _control_value(driver, element).strip()
+        if current_value != value:
+            try:
+                ActionChains(driver).key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).send_keys(Keys.DELETE).send_keys(value).perform()
+            except Exception:
+                pass
+            current_value = _control_value(driver, element).strip()
+            if current_value != value:
+                _set_input_value(driver, element, value)
 
     try:
         element.send_keys(Keys.TAB)
     except Exception:
-        driver.execute_script("arguments[0].blur();", element)
+        driver.execute_script("arguments[0].blur?.(); document.activeElement?.blur?.();", element)
 
     time.sleep(0.25)
 
@@ -2676,9 +2731,25 @@ def _set_black_betslip_price_and_place(
             .filter((item) => item.text === 'place' || item.text.includes('place'))
             .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)[0] || null;
         const topControlsBottom = placeButtonItem ? placeButtonItem.rect.bottom + 14 : panelRect.top + 180;
-        const inputs = Array.from(panel.element.querySelectorAll('input'))
+        const editableSelector = 'input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"],[tabindex]';
+        const controlValue = (element) => {
+            if ('value' in element) return element.value || element.getAttribute('value') || '';
+            return element.innerText || element.textContent || element.getAttribute('aria-valuetext') || '';
+        };
+        const controls = Array.from(panel.element.querySelectorAll(editableSelector))
             .filter(isVisible)
-            .filter((element) => !element.disabled && !element.readOnly)
+            .filter((element) => !element.disabled && element.getAttribute('aria-disabled') !== 'true')
+            .filter((element) => {
+                const tag = element.tagName.toLowerCase();
+                const role = (element.getAttribute('role') || '').toLowerCase();
+                const tabIndex = element.getAttribute('tabindex');
+                if (tabIndex !== null && Number(tabIndex) < 0) return false;
+                if ((tag === 'button' || role === 'button')
+                    && !element.matches('input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"]')) {
+                    return false;
+                }
+                return true;
+            })
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element.parentElement || element) }))
             .filter((item) => item.rect.y < topControlsBottom)
             .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
@@ -2694,17 +2765,17 @@ def _set_black_betslip_price_and_place(
             .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
             .filter((item) => item.rect.y < topControlsBottom)
             .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
-        const rowInputs = inputs
+        const rowInputs = controls
             .filter((item) => item.rect.y > panelRect.top + 35 && item.rect.y < topControlsBottom)
             .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
         const pickFallbackInput = (usedElements) => rowInputs.find((item) => !usedElements.has(item.element))
-            || inputs.find((item) => !usedElements.has(item.element))
+            || controls.find((item) => !usedElements.has(item.element))
             || null;
         const pickInputByLabel = (labelText, usedElements) => {
             const matchingLabels = labels.filter((item) => item.text === labelText);
             for (const label of matchingLabels) {
                 const labelCenterX = label.rect.left + label.rect.width / 2;
-                const candidate = inputs
+                const candidate = controls
                     .filter((item) => !usedElements.has(item.element))
                     .filter((item) => item.rect.y >= label.rect.y - 16 && item.rect.y <= label.rect.bottom + 55)
                     .map((item) => {
@@ -2743,10 +2814,13 @@ def _set_black_betslip_price_and_place(
                 labels: labels
                     .filter((item) => ['timeout', 'stake', 'price', 'place'].includes(item.text))
                     .map((item) => ({ text: item.text, rect: compactRect(item.rect) })),
-                inputs: inputs.map((item) => ({
-                    value: item.element.value || item.element.getAttribute('value') || '',
+                inputs: controls.map((item) => ({
+                    tag: item.element.tagName.toLowerCase(),
+                    role: item.element.getAttribute('role') || '',
+                    value: controlValue(item.element),
                     placeholder: item.element.getAttribute('placeholder') || '',
                     aria: item.element.getAttribute('aria-label') || '',
+                    readOnly: !!item.element.readOnly || item.element.getAttribute('readonly') !== null,
                     rect: compactRect(item.rect),
                     parentText: item.text.slice(0, 80),
                 })),
@@ -2799,6 +2873,16 @@ def _set_black_betslip_price_and_place(
 
     if stake_input and stake_text:
         _fill_betslip_input(driver, stake_input, stake_text)
+        time.sleep(0.3)
+        result = locate_controls()
+        price_input = result.get("priceInput")
+        place_button = result.get("placeButton")
+        if not price_input:
+            short_text = " | ".join(line.strip() for line in (result.get("panelText", "") or "").splitlines() if line.strip())[:700]
+            raise RuntimeError(
+                f"Could not prepare Black betslip after filling stake. Reason: price input not found. "
+                f"Controls: {result.get('controlDebug')!r}. Page: {short_text}"
+            )
 
     _fill_betslip_input(driver, price_input, price_text)
 
@@ -2816,7 +2900,7 @@ def _set_black_betslip_price_and_place(
         if not current_price_input or not current_place_button:
             return False
         try:
-            current_price = normalized_decimal_text(current_price_input.get_attribute("value") or "")
+            current_price = normalized_decimal_text(_control_value(browser, current_price_input))
         except Exception:
             return False
         if current_price != normalized_price:
@@ -2826,7 +2910,7 @@ def _set_black_betslip_price_and_place(
             if not current_stake_input:
                 return False
             try:
-                current_stake = normalized_decimal_text(current_stake_input.get_attribute("value") or "")
+                current_stake = normalized_decimal_text(_control_value(browser, current_stake_input))
             except Exception:
                 return False
             if current_stake != normalized_stake:
@@ -2847,7 +2931,8 @@ def _set_black_betslip_price_and_place(
         panel_text = " | ".join(line.strip() for line in (snapshot.get("text", "") or "").splitlines() if line.strip())[:700]
         inputs = snapshot.get("inputs") or []
         inputs_text = "; ".join(
-            f"value={item.get('value', '')!r}, placeholder={item.get('placeholder', '')!r}, aria={item.get('aria', '')!r}"
+            f"tag={item.get('tag', '')!r}, role={item.get('role', '')!r}, value={item.get('value', '')!r}, "
+            f"text={item.get('text', '')!r}, placeholder={item.get('placeholder', '')!r}, aria={item.get('aria', '')!r}"
             for item in inputs[:4]
         )
         raise RuntimeError(
@@ -4933,6 +5018,22 @@ def _read_betfair_balance(driver: webdriver.Remote, profile_label: str) -> Decim
                 return t;
             }
         }
+        const topNodes = nodes
+            .map((n) => ({ text: (n.innerText || n.textContent || '').trim(), rect: n.getBoundingClientRect() }))
+            .filter((item) => item.text && item.rect.top >= 0 && item.rect.top < 120)
+            .filter((item) => item.text.length < 500)
+            .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+        for (const item of topNodes) {
+            const collapsed = item.text.replace(/\s+/g, ' ');
+            const mainMatch = collapsed.match(/\bmain\b\s*[€£$]\s*\d[\d.,]*/i);
+            if (mainMatch) return mainMatch[0];
+        }
+        for (const item of topNodes) {
+            const collapsed = item.text.replace(/\s+/g, ' ');
+            if (/bonus/i.test(collapsed) && !/\bmain\b/i.test(collapsed)) continue;
+            const moneyMatch = collapsed.match(/[€£$]\s*\d[\d.,]*/);
+            if (moneyMatch) return moneyMatch[0];
+        }
         return null;
         """
     )
@@ -5324,6 +5425,17 @@ def run_all_profiles(expected_profiles: int = 2, wait_for_enter: bool = False) -
     for idx, profile_id in enumerate(profile_ids, start=1):
         label = f"Profile-{idx}"
         sessions.append(run_profile(profile_id, label, login_enabled=(idx == 1)))
+
+    primary_session = next((session for session in sessions if session.get("login_enabled")), None)
+    betfair_session = next((session for session in sessions if session.get("betfair")), None)
+    primary_stake = primary_session.get("stake") if primary_session else None
+    if betfair_session and not betfair_session.get("stake") and primary_stake:
+        betfair_session["stake"] = dict(primary_stake)
+        betfair_session["stake"]["source"] = "Profile-1 fallback"
+        print(
+            f"[{betfair_session['profile_label']}] Using Profile-1 cached stake "
+            f"EUR {betfair_session['stake']['stake']} because Betfair balance/default stake refresh failed."
+        )
 
     print(
         "\nAdsPower profiles are ready. Profile-1 -> BetInAsia/Black, "

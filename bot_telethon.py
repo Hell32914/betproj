@@ -95,10 +95,20 @@ async def refresh_stakes(state: RuntimeState) -> None:
                         flush=True,
                     )
                 except Exception as exc:
-                    print(
-                        f"Betfair default stake refresh failed: {exc!r}",
-                        flush=True,
-                    )
+                    if result:
+                        betfair_session["stake"] = dict(result)
+                        betfair_session["stake"]["source"] = "Profile-1 fallback"
+                        state.stakes[betfair_session["profile_label"]] = betfair_session["stake"]
+                        print(
+                            f"Betfair default stake refresh failed: {exc!r}; "
+                            f"using Profile-1 stake EUR {result['stake']} as fallback.",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"Betfair default stake refresh failed: {exc!r}",
+                            flush=True,
+                        )
 
 
 async def refresh_stakes_daily(state: RuntimeState) -> None:
@@ -294,6 +304,20 @@ async def main():
                 if betfair_session is None:
                     await event.reply("Betfair: профиль не готов — пропускаю.")
                     return
+                if not betfair_session.get("stake"):
+                    primary_session = next(
+                        (s for s in state.sessions if s.get("login_enabled") and s.get("stake")),
+                        None,
+                    )
+                    if primary_session and primary_session.get("stake"):
+                        betfair_session["stake"] = dict(primary_session["stake"])
+                        betfair_session["stake"]["source"] = "Profile-1 fallback"
+                        state.stakes[betfair_session["profile_label"]] = betfair_session["stake"]
+                        print(
+                            f"Betfair stake missing; using Profile-1 stake EUR "
+                            f"{betfair_session['stake']['stake']} as fallback.",
+                            flush=True,
+                        )
                 async with state.betfair_lock:
                     loop = asyncio.get_running_loop()
                     try:
