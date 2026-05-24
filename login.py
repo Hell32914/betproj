@@ -50,7 +50,7 @@ STAKE_PERCENT = Decimal(os.getenv("STAKE_PERCENT", "5"))
 EURO_SYMBOL = "\u20ac"
 TEAM_SUFFIXES = {
     "fc", "afc", "cf", "sc", "ac", "fk", "bk", "ik", "if", "sv", "jk",
-    "club", "football", "team",
+    "kf", "club", "football", "team",
 }
 TEAM_SEARCH_ALIASES = {
     "alaves": ["deportivo alaves", "alavés", "deportivo alavés"],
@@ -512,6 +512,8 @@ def _black_market_headers(signal) -> list[str]:
             "second half total goals",
             "2nd half asian total goals",
             "second half asian total goals",
+            "asian total goals",
+            "total goals",
         ]
     return ["asian total goals", "total goals"]
 
@@ -1212,7 +1214,8 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
         )
     search_input.send_keys(Keys.ENTER)
 
-    search_state = WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
+    try:
+        search_state = WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
         """
         const requested = arguments[0];
         const queryWords = arguments[1] || [];
@@ -1284,7 +1287,64 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
         """,
         normalized_query,
         query_words,
-    ))
+        ))
+    except TimeoutException as exc:
+        search_state = driver.execute_script(
+            """
+            const requested = arguments[0];
+            const normalize = (value) => (value || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\\u0300-\\u036f]/g, '')
+                .replace(/[^a-z0-9]+/g, ' ')
+                .replace(/\\s+/g, ' ')
+                .trim();
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0
+                    && rect.x < window.innerWidth
+                    && rect.y < window.innerHeight;
+            };
+            const visibleInputs = Array.from(document.querySelectorAll('input'))
+                .filter(isVisible)
+                .map((input) => ({
+                    value: input.value || input.getAttribute('value') || '',
+                    placeholder: input.getAttribute('placeholder') || '',
+                    aria: input.getAttribute('aria-label') || '',
+                }))
+                .slice(0, 8);
+            const textLines = (document.body?.innerText || '')
+                .split('\n')
+                .map((line) => line.trim())
+                .filter(Boolean)
+                .slice(0, 24);
+            const rowSamples = Array.from(document.querySelectorAll('li,a,button,[role="button"],[role="option"],[role="listitem"],article,div'))
+                .filter(isVisible)
+                .map((element) => (element.innerText || element.textContent || '').trim())
+                .filter((text) => text && text.length < 300)
+                .filter((text, index, array) => array.indexOf(text) === index)
+                .slice(0, 12);
+            return {
+                ok: false,
+                reason: 'search-timeout',
+                requested,
+                normalizedRequested: normalize(requested),
+                inputs: visibleInputs,
+                text: textLines.join(' | ').slice(0, 900),
+                rows: rowSamples,
+            };
+            """,
+            normalized_query,
+        )
+        raise RuntimeError(
+            f"Black search timed out waiting for visible match rows for {normalized_query!r}. State: {search_state!r}"
+        ) from exc
     if not search_state or not search_state.get("ok"):
         raise RuntimeError(f"Black search returned no visible match rows for {normalized_query!r}. State: {search_state!r}")
     # Give the React result list a brief moment to render fully before consumers
@@ -4187,7 +4247,21 @@ def _is_betfair_logged_in(driver: webdriver.Remote) -> bool:
             const pwds = Array.from(document.querySelectorAll("input[type='password']"))
                 .filter(visible);
             // If a visible password field exists, we are NOT logged in.
-            return pwds.length === 0;
+            if (pwds.length > 0) return false;
+            const text = (document.body?.innerText || '').toLowerCase();
+            if (text.includes('log out') || text.includes('logout') || text.includes('my account')) return true;
+            const searchInputs = Array.from(document.querySelectorAll("input[type='search'], input[type='text'], input:not([type])"))
+                .filter(visible)
+                .filter((el) => {
+                    const hint = [
+                        el.getAttribute('placeholder') || '',
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('name') || '',
+                        el.id || '',
+                    ].join(' ').toLowerCase();
+                    return /search|find|team|competition|event|sport|market|команд|соревн|событ|поиск|найти/.test(hint);
+                });
+            return searchInputs.length > 0 && !text.includes('присоединиться сейчас') && !text.includes('join now');
             """
         ))
     except Exception:
@@ -4470,6 +4544,19 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
         except Exception:
             pass
 
+    if not _is_betfair_logged_in(driver):
+        print(f"[{profile_label}] Betfair session is not logged in before search; logging in again.")
+        login_betfair(driver, profile_label)
+        if not _is_betfair_logged_in(driver):
+            return {
+                "profile_label": profile_label,
+                "team": team_name,
+                "opponent": opponent_name,
+                "opened": False,
+                "url": driver.current_url,
+                "error": "Betfair login could not be confirmed before search.",
+            }
+
     deadline = time.time() + 20
     search_el = None
     while time.time() < deadline:
@@ -4478,7 +4565,27 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
             break
         time.sleep(0.5)
     if not search_el:
-        raise RuntimeError(f"[{profile_label}] Betfair search input not found.")
+        print(f"[{profile_label}] Betfair search input not found; reopening exchange home and retrying login/search.", flush=True)
+        driver.get(BETFAIR_LOGIN_URL)
+        _wait_document_ready(driver)
+        time.sleep(1.5)
+        if not _is_betfair_logged_in(driver):
+            login_betfair(driver, profile_label)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            search_el = _find_betfair_search_input(driver)
+            if search_el:
+                break
+            time.sleep(0.5)
+    if not search_el:
+        return {
+            "profile_label": profile_label,
+            "team": team_name,
+            "opponent": opponent_name,
+            "opened": False,
+            "url": driver.current_url,
+            "error": "Betfair search input not found after login/reopen.",
+        }
 
     try:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", search_el)
@@ -4976,6 +5083,7 @@ def _select_betfair_overunder_back(
     # 3) Fill in stake and place the bet.
     stake_str = None
     bet_placed = False
+    accepted_odds_text = target_odds
     try:
         balance = _read_betfair_balance(driver, profile_label)
         stake_amount = _calculate_stake_from_balance(balance)
@@ -5073,8 +5181,10 @@ def _select_betfair_overunder_back(
             setInputValue(oddsInp, oddsVal);
             setInputValue(inp, stakeVal);
             const normalized = (value) => (value || '').trim().replace(',', '.');
-            if (normalized(oddsInp.value) !== normalized(oddsVal)) {
-                return { error: 'odds input did not keep target value', oddsValue: oddsInp.value, targetOdds: oddsVal };
+            const actualOdds = Number(normalized(oddsInp.value));
+            const targetOdds = Number(normalized(oddsVal));
+            if (!Number.isFinite(actualOdds) || actualOdds + 1e-9 < targetOdds) {
+                return { error: 'odds input below target value', oddsValue: oddsInp.value, targetOdds: oddsVal };
             }
             if (normalized(inp.value) !== normalized(stakeVal)) {
                 return { error: 'stake input did not keep target value', stakeValue: inp.value, targetStake: stakeVal };
@@ -5087,6 +5197,7 @@ def _select_betfair_overunder_back(
         if not (isinstance(placed, dict) and placed.get("stakeSet") and placed.get("oddsSet")):
             print(f"[{profile_label}] Betfair: stake fill result: {placed!r}", flush=True)
         else:
+            accepted_odds_text = str(placed.get("oddsValue") or target_odds)
             # Wait for Betfair UI to update button label to "Confirm bet".
             time.sleep(1.2)
             confirmed = driver.execute_script(
@@ -5117,8 +5228,8 @@ def _select_betfair_overunder_back(
                 first_label = confirmed.get("label", "")
                 print(
                     f"[{profile_label}] Betfair: clicked '{first_label}' — "
-                    f"{market_label} {selection.title()} {line_str} @ target {target_odds} "
-                    f"(available {odds_text}), stake {stake_str}"
+                    f"{market_label} {selection.title()} {line_str} @ {accepted_odds_text} "
+                    f"(target {target_odds}, available {odds_text}), stake {stake_str}"
                 )
                 # If the first button was "Place bet/bets", Betfair shows a
                 # second "Confirm bet" button. Wait and click it.
@@ -5166,7 +5277,8 @@ def _select_betfair_overunder_back(
     return {
         "betfair_selection": f"{market_label} {selection.title()} {line_str}",
         "betfair_market": market_label,
-        "betfair_odds": target_odds,
+        "betfair_odds": accepted_odds_text,
+        "betfair_target_odds": target_odds,
         "betfair_available_odds": odds_text,
         "betfair_stake": stake_str,
         "betfair_bet_placed": bet_placed,
