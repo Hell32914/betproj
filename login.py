@@ -1112,38 +1112,141 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
 def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str) -> None:
     normalized_query = query.strip()
     query_words = [word for word in _normalize_team_text(normalized_query).split() if len(word) >= 3]
-    search_input = WebDriverWait(driver, 10).until(lambda browser: browser.execute_script(
-        """
-        const dialogOpen = () => {
-            const text = (document.body?.innerText || '').toLowerCase();
-            return text.includes('live events') || (text.includes('all sports') && text.includes('use ctrl-f'));
-        };
-        if (!dialogOpen()) return null;
-        const isVisible = (element) => {
-            const style = window.getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            return style.display !== 'none'
-                && style.visibility !== 'hidden'
-                && rect.width > 0
-                && rect.height > 0
-                && rect.bottom > 0
-                && rect.right > 0;
-        };
-        const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
 
-        const modalRoots = Array.from(document.querySelectorAll('div,section,aside'))
-            .filter(isVisible)
-            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
-            .filter((item) => item.rect.y < 380)
-            .filter((item) => item.rect.width > 240)
-            .filter((item) => item.text.includes('all sports') || item.text.includes('live events') || item.text.includes('use ctrl-f as hotkey'))
-            .sort((a, b) => (a.rect.y - b.rect.y) || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+    def read_search_state(browser: webdriver.Remote):
+        return browser.execute_script(
+            """
+            const requested = arguments[0];
+            const queryWords = arguments[1] || [];
+            const normalize = (value) => (value || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\\u0300-\\u036f]/g, '')
+                .replace(/[^a-z0-9]+/g, ' ')
+                .replace(/\\s+/g, ' ')
+                .trim();
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0
+                    && rect.x < window.innerWidth
+                    && rect.y < window.innerHeight;
+            };
+            const normalizedRequest = normalize(requested);
+            const bodyText = document.body?.innerText || '';
+            const body = normalize(bodyText);
+            const noResults = body.includes('no results found') || body.includes('no events found');
 
-        for (const root of modalRoots) {
-            const localInputs = Array.from(root.element.querySelectorAll('input'))
+            const roots = Array.from(document.querySelectorAll('aside,section,main,div'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: element.innerText || element.textContent || '' }))
+                .filter((item) => item.rect.width > 240 && item.rect.height > 70)
+                .filter((item) => {
+                    const text = normalize(item.text);
+                    return text.includes('live events')
+                        || text.includes('use ctrl f')
+                        || text.includes('matches')
+                        || text.includes('top events')
+                        || text.includes('select sport');
+                })
+                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+            const root = roots[0]?.element || document.body;
+            const resultRows = Array.from(root.querySelectorAll('li,a,button,[role="button"],[role="option"],[role="listitem"],article,div'))
+                .filter(isVisible)
+                .map((element) => {
+                    const row = element.closest('a,button,li,[role="button"],[role="option"],[role="listitem"],article') || element;
+                    const rect = row.getBoundingClientRect();
+                    const text = row.innerText || row.textContent || '';
+                    return { row, rect, text, normalized: normalize(text) };
+                })
+                .filter((item) => item.text && item.text.length < 500)
+                .filter((item) => item.rect.width > 45 && item.rect.height > 12)
+                .filter((item) => {
+                    if (normalizedRequest && item.normalized.includes(normalizedRequest)) return true;
+                    return queryWords.some((word) => item.normalized.includes(normalize(word)));
+                })
+                .filter((item, index, array) => array.findIndex((other) => other.row === item.row) === index)
+                .slice(0, 6);
+            if (resultRows.length) {
+                return {
+                    ok: true,
+                    reason: 'result-row',
+                    rows: resultRows.map((item) => item.text.split('\\n').map((line) => line.trim()).filter(Boolean).slice(0, 4).join(' | ').slice(0, 180)),
+                };
+            }
+            if (noResults) {
+                return {
+                    ok: false,
+                    reason: 'no-results',
+                    text: bodyText.split('\\n').map((line) => line.trim()).filter(Boolean).slice(0, 10).join(' | ').slice(0, 500),
+                };
+            }
+            return false;
+            """,
+            normalized_query,
+            query_words,
+        )
+
+    search_input = WebDriverWait(driver, 10).until(
+        lambda browser: browser.execute_script(
+            """
+            const dialogOpen = () => {
+                const text = (document.body?.innerText || '').toLowerCase();
+                return text.includes('live events') || (text.includes('all sports') && text.includes('use ctrl-f'));
+            };
+            if (!dialogOpen()) return null;
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0;
+            };
+            const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+
+            const modalRoots = Array.from(document.querySelectorAll('div,section,aside'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                .filter((item) => item.rect.y < 380)
+                .filter((item) => item.rect.width > 240)
+                .filter((item) => item.text.includes('all sports') || item.text.includes('live events') || item.text.includes('use ctrl-f as hotkey'))
+                .sort((a, b) => (a.rect.y - b.rect.y) || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+
+            for (const root of modalRoots) {
+                const localInputs = Array.from(root.element.querySelectorAll('input'))
+                    .filter(isVisible)
+                    .filter((input) => !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()))
+                    .map((input) => {
+                        const marker = [
+                            input.getAttribute('placeholder') || '',
+                            input.getAttribute('aria-label') || '',
+                            input.name || '',
+                            String(input.className || ''),
+                            textOf(input.parentElement || input),
+                        ].join(' ').toLowerCase();
+                        return { input, marker, rect: input.getBoundingClientRect() };
+                    })
+                    .sort((a, b) => {
+                        const aSearch = /search|league|game|team|event/.test(a.marker) ? 0 : 1;
+                        const bSearch = /search|league|game|team|event/.test(b.marker) ? 0 : 1;
+                        return aSearch - bSearch || a.rect.y - b.rect.y || a.rect.x - b.rect.x;
+                    });
+                if (localInputs[0]) return localInputs[0].input;
+            }
+
+            const inputs = Array.from(document.querySelectorAll('input'))
                 .filter(isVisible)
                 .filter((input) => !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()))
                 .map((input) => {
+                    const rect = input.getBoundingClientRect();
                     const marker = [
                         input.getAttribute('placeholder') || '',
                         input.getAttribute('aria-label') || '',
@@ -1151,39 +1254,18 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                         String(input.className || ''),
                         textOf(input.parentElement || input),
                     ].join(' ').toLowerCase();
-                    return { input, marker, rect: input.getBoundingClientRect() };
+                    return { input, rect, marker };
                 })
+                .filter((item) => item.rect.y < 320)
                 .sort((a, b) => {
-                    const aSearch = /search|league|game|team|event/.test(a.marker) ? 0 : 1;
-                    const bSearch = /search|league|game|team|event/.test(b.marker) ? 0 : 1;
-                    return aSearch - bSearch || a.rect.y - b.rect.y || a.rect.x - b.rect.x;
+                    const aSearch = /search|league|game/.test(a.marker) ? 0 : 1;
+                    const bSearch = /search|league|game/.test(b.marker) ? 0 : 1;
+                    return aSearch - bSearch || a.rect.y - b.rect.y;
                 });
-            if (localInputs[0]) return localInputs[0].input;
-        }
-
-        const inputs = Array.from(document.querySelectorAll('input'))
-            .filter(isVisible)
-            .filter((input) => !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()))
-            .map((input) => {
-                const rect = input.getBoundingClientRect();
-                const marker = [
-                    input.getAttribute('placeholder') || '',
-                    input.getAttribute('aria-label') || '',
-                    input.name || '',
-                    String(input.className || ''),
-                    textOf(input.parentElement || input),
-                ].join(' ').toLowerCase();
-                return { input, rect, marker };
-            })
-            .filter((item) => item.rect.y < 320)
-            .sort((a, b) => {
-                const aSearch = /search|league|game/.test(a.marker) ? 0 : 1;
-                const bSearch = /search|league|game/.test(b.marker) ? 0 : 1;
-                return aSearch - bSearch || a.rect.y - b.rect.y;
-            });
-        return inputs.length ? inputs[0].input : null;
-        """
-    ))
+            return inputs.length ? inputs[0].input : null;
+            """
+        )
+    )
     try:
         driver.execute_script(
             """
@@ -1212,143 +1294,105 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
         raise RuntimeError(
             f"Black search input did not keep the requested query. Expected {normalized_query!r}, got {final_value!r}."
         )
-    search_input.send_keys(Keys.ENTER)
 
     try:
-        search_state = WebDriverWait(driver, 15).until(lambda browser: browser.execute_script(
-        """
-        const requested = arguments[0];
-        const queryWords = arguments[1] || [];
-        const normalize = (value) => (value || '')
-            .toLowerCase()
-            .normalize('NFD')
-            .replace(/[\\u0300-\\u036f]/g, '')
-            .replace(/[^a-z0-9]+/g, ' ')
-            .replace(/\\s+/g, ' ')
-            .trim();
-        const isVisible = (element) => {
-            const style = window.getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            return style.display !== 'none'
-                && style.visibility !== 'hidden'
-                && rect.width > 0
-                && rect.height > 0
-                && rect.bottom > 0
-                && rect.right > 0
-                && rect.x < window.innerWidth
-                && rect.y < window.innerHeight;
-        };
-        const normalizedRequest = normalize(requested);
-        const bodyText = document.body?.innerText || '';
-        const body = normalize(bodyText);
-        const noResults = body.includes('no results found') || body.includes('no events found');
-
-        const roots = Array.from(document.querySelectorAll('aside,section,main,div'))
-            .filter(isVisible)
-            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: element.innerText || element.textContent || '' }))
-            .filter((item) => item.rect.width > 240 && item.rect.height > 70)
-            .filter((item) => {
-                const text = normalize(item.text);
-                return text.includes('live events')
-                    || text.includes('use ctrl f')
-                    || text.includes('matches')
-                    || text.includes('top events')
-                    || text.includes('select sport');
-            })
-            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-        const root = roots[0]?.element || document.body;
-        const resultRows = Array.from(root.querySelectorAll('li,a,button,[role="button"],[role="option"],[role="listitem"],article,div'))
-            .filter(isVisible)
-            .map((element) => {
-                const row = element.closest('a,button,li,[role="button"],[role="option"],[role="listitem"],article') || element;
-                const rect = row.getBoundingClientRect();
-                const text = row.innerText || row.textContent || '';
-                return { row, rect, text, normalized: normalize(text) };
-            })
-            .filter((item) => item.text && item.text.length < 500)
-            .filter((item) => item.rect.width > 45 && item.rect.height > 12)
-            .filter((item) => {
-                if (normalizedRequest && item.normalized.includes(normalizedRequest)) return true;
-                return queryWords.some((word) => item.normalized.includes(normalize(word)));
-            })
-            .filter((item, index, array) => array.findIndex((other) => other.row === item.row) === index)
-            .slice(0, 6);
-        if (resultRows.length) {
-            return {
-                ok: true,
-                reason: 'result-row',
-                rows: resultRows.map((item) => item.text.split('\\n').map((line) => line.trim()).filter(Boolean).slice(0, 4).join(' | ').slice(0, 180)),
-            };
-        }
-        if (noResults) {
-            return { ok: false, reason: 'no-results', text: bodyText.split('\\n').map((line) => line.trim()).filter(Boolean).slice(0, 10).join(' | ').slice(0, 500) };
-        }
-        return false;
-        """,
-        normalized_query,
-        query_words,
-        ))
-    except TimeoutException as exc:
-        search_state = driver.execute_script(
+        driver.execute_script(
             """
-            const requested = arguments[0];
-            const normalize = (value) => (value || '')
-                .toLowerCase()
-                .normalize('NFD')
-                .replace(/[\\u0300-\\u036f]/g, '')
-                .replace(/[^a-z0-9]+/g, ' ')
-                .replace(/\\s+/g, ' ')
-                .trim();
-            const isVisible = (element) => {
-                const style = window.getComputedStyle(element);
-                const rect = element.getBoundingClientRect();
-                return style.display !== 'none'
-                    && style.visibility !== 'hidden'
-                    && rect.width > 0
-                    && rect.height > 0
-                    && rect.bottom > 0
-                    && rect.right > 0
-                    && rect.x < window.innerWidth
-                    && rect.y < window.innerHeight;
-            };
-            const visibleInputs = Array.from(document.querySelectorAll('input'))
-                .filter(isVisible)
-                .map((input) => ({
-                    value: input.value || input.getAttribute('value') || '',
-                    placeholder: input.getAttribute('placeholder') || '',
-                    aria: input.getAttribute('aria-label') || '',
-                }))
-                .slice(0, 8);
-            const textLines = (document.body?.innerText || '')
-                .split('\\n')
-                .map((line) => line.trim())
-                .filter(Boolean)
-                .slice(0, 24);
-            const rowSamples = Array.from(document.querySelectorAll('li,a,button,[role="button"],[role="option"],[role="listitem"],article,div'))
-                .filter(isVisible)
-                .map((element) => (element.innerText || element.textContent || '').trim())
-                .filter((text) => text && text.length < 300)
-                .filter((text, index, array) => array.indexOf(text) === index)
-                .slice(0, 12);
-            return {
-                ok: false,
-                reason: 'search-timeout',
-                requested,
-                normalizedRequested: normalize(requested),
-                inputs: visibleInputs,
-                text: textLines.join(' | ').slice(0, 900),
-                rows: rowSamples,
-            };
+            const input = arguments[0];
+            const value = arguments[1];
+            input.focus({ preventScroll: true });
+            input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: value }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
             """,
+            search_input,
             normalized_query,
         )
-        raise RuntimeError(
-            f"Black search timed out waiting for visible match rows for {normalized_query!r}. State: {search_state!r}"
-        ) from exc
+    except Exception:
+        pass
+
+    try:
+        search_state = WebDriverWait(driver, 4).until(read_search_state)
+    except TimeoutException as first_timeout:
+        if _black_search_dialog_open(driver):
+            try:
+                search_input.send_keys(Keys.ENTER)
+            except Exception:
+                try:
+                    driver.execute_script(
+                        """
+                        const input = arguments[0];
+                        input.focus({ preventScroll: true });
+                        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+                        input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+                        """,
+                        search_input,
+                    )
+                except Exception:
+                    pass
+        try:
+            search_state = WebDriverWait(driver, 11).until(read_search_state)
+        except TimeoutException as exc:
+            search_state = driver.execute_script(
+                """
+                const requested = arguments[0];
+                const normalize = (value) => (value || '')
+                    .toLowerCase()
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '')
+                    .replace(/[^a-z0-9]+/g, ' ')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                const isVisible = (element) => {
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.right > 0
+                        && rect.x < window.innerWidth
+                        && rect.y < window.innerHeight;
+                };
+                const visibleInputs = Array.from(document.querySelectorAll('input'))
+                    .filter(isVisible)
+                    .map((input) => ({
+                        value: input.value || input.getAttribute('value') || '',
+                        placeholder: input.getAttribute('placeholder') || '',
+                        aria: input.getAttribute('aria-label') || '',
+                    }))
+                    .slice(0, 8);
+                const textLines = (document.body?.innerText || '')
+                    .split('\\n')
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .slice(0, 24);
+                const rowSamples = Array.from(document.querySelectorAll('li,a,button,[role="button"],[role="option"],[role="listitem"],article,div'))
+                    .filter(isVisible)
+                    .map((element) => (element.innerText || element.textContent || '').trim())
+                    .filter((text) => text && text.length < 300)
+                    .filter((text, index, array) => array.indexOf(text) === index)
+                    .slice(0, 12);
+                const bodyLower = (document.body?.innerText || '').toLowerCase();
+                return {
+                    ok: false,
+                    reason: 'search-timeout',
+                    requested,
+                    normalizedRequested: normalize(requested),
+                    dialogOpen: bodyLower.includes('live events') || (bodyLower.includes('all sports') && bodyLower.includes('use ctrl-f')),
+                    inputs: visibleInputs,
+                    text: textLines.join(' | ').slice(0, 900),
+                    rows: rowSamples,
+                };
+                """,
+                normalized_query,
+            )
+            raise RuntimeError(
+                f"Black search timed out waiting for visible match rows for {normalized_query!r}. State: {search_state!r}"
+            ) from (exc or first_timeout)
+
     if not search_state or not search_state.get("ok"):
         raise RuntimeError(f"Black search returned no visible match rows for {normalized_query!r}. State: {search_state!r}")
-    # Give the React result list a brief moment to render fully before consumers
-    # start scanning the DOM for the match-card row.
     time.sleep(1.2)
     print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
 
