@@ -1320,7 +1320,7 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                 }))
                 .slice(0, 8);
             const textLines = (document.body?.innerText || '')
-                .split('\n')
+                .split('\\n')
                 .map((line) => line.trim())
                 .filter(Boolean)
                 .slice(0, 24);
