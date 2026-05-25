@@ -464,6 +464,11 @@ def _team_search_queries(team_name: str | None) -> list[str]:
         seen.add(key)
         queries.append(value)
 
+    def normalized_parts(value: str | None) -> list[str]:
+        text = _strip_diacritics(value or "").lower().strip()
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return [part for part in text.split() if part]
+
     # Reserve / youth / women markers that some books strip from their listings
     # (e.g. "Defensor Sporting (Res)" appears as just "Defensor Sporting" on Black).
     reserve_markers = {
@@ -474,21 +479,50 @@ def _team_search_queries(team_name: str | None) -> list[str]:
         "w", "women", "fem", "femenino", "feminin", "ladies",
         "youth", "jr", "juniors", "academy",
     }
+    raw_parts = normalized_parts(team_name)
+    raw_normalized = " ".join(raw_parts)
     normalized = _normalize_team_text(team_name)
-    normalized_parts = normalized.split()
-    stripped_parts = [p for p in normalized_parts if p not in reserve_markers]
-    if stripped_parts and stripped_parts != normalized_parts:
+    normalized_core_parts = normalized.split()
+    stripped_parts = [p for p in normalized_core_parts if p not in reserve_markers]
+    if stripped_parts and stripped_parts != normalized_core_parts:
         add(" ".join(stripped_parts))
         if len(stripped_parts) >= 2:
             add(" ".join(stripped_parts[:2]))
+
+    # Keep both forms: Black sometimes keeps prefixes like KF/FK/Club/FC in search
+    # results, while our core normalizer intentionally strips them.
+    add(raw_normalized)
 
     add(normalized)
     for alias in TEAM_SEARCH_ALIASES.get(normalized, []):
         add(alias)
     add(team_name)
 
-    if len(normalized_parts) >= 2:
-        add(" ".join(normalized_parts[:2]))
+    if team_name:
+        without_parenthetical = re.sub(r"\([^)]*\)", " ", _strip_diacritics(team_name).lower())
+        without_parenthetical = re.sub(r"[^a-z0-9]+", " ", without_parenthetical).strip()
+        add(without_parenthetical)
+
+    # Books often swap reserve-team suffixes between roman numerals, digits and B/C.
+    reserve_aliases = {
+        "ii": ["b", "2"],
+        "iii": ["c", "3"],
+        "iv": ["4"],
+        "b": ["ii", "2"],
+        "c": ["iii", "3"],
+        "2": ["ii", "b"],
+        "3": ["iii", "c"],
+        "4": ["iv"],
+    }
+    if raw_parts:
+        tail = raw_parts[-1]
+        for alias in reserve_aliases.get(tail, []):
+            add(" ".join(raw_parts[:-1] + [alias]))
+
+    if len(normalized_core_parts) >= 2:
+        add(" ".join(normalized_core_parts[:2]))
+    if len(raw_parts) >= 2:
+        add(" ".join(raw_parts[:2]))
     return queries
 
 
@@ -1397,9 +1431,29 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
     print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
 
 
-def _search_black_live_events(driver: webdriver.Remote, team_name: str, profile_label: str) -> str:
+def _search_black_live_events(
+    driver: webdriver.Remote,
+    team_name: str,
+    profile_label: str,
+    alternate_team_names: list[str | None] | None = None,
+) -> str:
     last_error = None
-    for query in _team_search_queries(team_name):
+    queries: list[str] = []
+    seen_queries: set[str] = set()
+
+    def add_queries(name: str | None) -> None:
+        for query in _team_search_queries(name):
+            key = query.strip().lower()
+            if not key or key in seen_queries:
+                continue
+            seen_queries.add(key)
+            queries.append(query)
+
+    add_queries(team_name)
+    for alternate_name in alternate_team_names or []:
+        add_queries(alternate_name)
+
+    for query in queries:
         try:
             _fill_black_search(driver, query, profile_label)
             return query
@@ -3680,7 +3734,7 @@ def place_black_bet(session: dict, signal) -> dict:
             pass
         print(f"[{profile_label}] Searching Black by normalized first team: {team_name}")
         _open_black_search(driver, profile_label)
-        used_query = _search_black_live_events(driver, team_name, profile_label)
+        used_query = _search_black_live_events(driver, team_name, profile_label, [opponent_name])
         print(f"[{profile_label}] Using Black search query: {used_query}")
         _open_black_live_match(driver, team_name, opponent_name, profile_label)
         if _black_search_dialog_open(driver):
@@ -4257,6 +4311,30 @@ def keep_black_session_alive(session: dict) -> dict:
         )
         print(f"[{profile_label}] Black keepalive ping sent.")
         return {"status": "alive", "detail": (result or {}).get("url", driver.current_url)}
+    finally:
+        close_driver_bridge(driver)
+
+
+def ensure_black_session_authorized(session: dict) -> dict:
+    profile_label = session.get("profile_label", "Profile-1")
+    driver = None
+    try:
+        driver = connect_to_browser(session["browser_info"], profile_label)
+        current_url = (driver.current_url or "").lower()
+        if BLACK_URL_PART not in current_url:
+            driver.get(BLACK_SPORTSBOOK_URL)
+            _wait_document_ready(driver)
+            time.sleep(2)
+
+        if _ensure_black_session_ready(driver, profile_label):
+            result = keep_black_session_alive(session)
+            return {"status": "alive", "detail": result.get("detail", driver.current_url)}
+
+        print(f"[{profile_label}] Black session is not authorized during health check; re-logging.")
+        login(driver, profile_label)
+        if not _ensure_black_session_ready(driver, profile_label):
+            raise RuntimeError("Black session could not be restored during health check.")
+        return {"status": "relogged", "detail": driver.current_url}
     finally:
         close_driver_bridge(driver)
 
@@ -5633,6 +5711,36 @@ def update_betfair_default_stake(session: dict) -> dict:
         stake = _format_stake_amount(stake_amount)
         _set_betfair_default_stake(driver, stake, profile_label)
         return {"balance": str(balance), "stake": stake, "percent": str(STAKE_PERCENT)}
+    finally:
+        close_driver_bridge(driver)
+
+
+def ensure_betfair_session_authorized(session: dict) -> dict:
+    profile_label = session.get("profile_label", "Profile-2")
+    driver = None
+    try:
+        driver = connect_to_browser(session["browser_info"], profile_label)
+        if BETFAIR_URL_PART not in (driver.current_url or "").lower():
+            driver.get(BETFAIR_LOGIN_URL)
+            _wait_document_ready(driver)
+            time.sleep(1.5)
+
+        if _is_betfair_logged_in(driver):
+            try:
+                balance = _read_betfair_balance(driver, profile_label)
+                return {"status": "alive", "detail": f"{driver.current_url} | balance EUR {balance}"}
+            except Exception:
+                return {"status": "alive", "detail": driver.current_url}
+
+        print(f"[{profile_label}] Betfair session is not authorized during health check; re-logging.")
+        login_betfair(driver, profile_label)
+        if not _is_betfair_logged_in(driver):
+            raise RuntimeError("Betfair session could not be restored during health check.")
+        try:
+            balance = _read_betfair_balance(driver, profile_label)
+            return {"status": "relogged", "detail": f"{driver.current_url} | balance EUR {balance}"}
+        except Exception:
+            return {"status": "relogged", "detail": driver.current_url}
     finally:
         close_driver_bridge(driver)
 

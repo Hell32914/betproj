@@ -22,6 +22,8 @@ from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 from login import (
     BlackSelectionMissingError,
     check_black_order_by_id,
+    ensure_betfair_session_authorized,
+    ensure_black_session_authorized,
     keep_black_session_alive,
     open_betfair_match,
     place_black_bet,
@@ -43,6 +45,7 @@ API_HASH = os.getenv("TG_API_HASH")
 GROUP_ID = int(os.getenv("TG_GR_ID"))
 ADSPOWER_PROFILE_COUNT = int(os.getenv("ADSPOWER_PROFILE_COUNT", "2"))
 BLACK_KEEPALIVE_SECONDS = 20 * 60
+SESSION_AUTH_CHECK_SECONDS = 15 * 60
 
 
 class RuntimeState:
@@ -137,6 +140,43 @@ async def keep_black_session_active(state: RuntimeState) -> None:
                 print(f"Black keepalive failed: {exc}", flush=True)
 
 
+async def keep_sessions_authorized(state: RuntimeState) -> None:
+    await state.ready.wait()
+    while True:
+        await asyncio.sleep(SESSION_AUTH_CHECK_SECONDS)
+        if not state.sessions:
+            continue
+
+        loop = asyncio.get_running_loop()
+        primary_session = next((session for session in state.sessions if session.get("login_enabled")), state.sessions[0])
+        async with state.bet_lock:
+            try:
+                result = await loop.run_in_executor(
+                    None, lambda: ensure_black_session_authorized(primary_session)
+                )
+                print(
+                    f"Black auth-check completed: {result.get('status')}.",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"Black auth-check failed: {exc}", flush=True)
+
+        betfair_session = next((session for session in state.sessions if session.get("betfair")), None)
+        if betfair_session is None:
+            continue
+        async with state.betfair_lock:
+            try:
+                result = await loop.run_in_executor(
+                    None, lambda: ensure_betfair_session_authorized(betfair_session)
+                )
+                print(
+                    f"Betfair auth-check completed: {result.get('status')}.",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"Betfair auth-check failed: {exc}", flush=True)
+
+
 async def start_adspower_after_listener_ready(state: RuntimeState) -> None:
     print("Telegram listener is ready. Starting or connecting AdsPower profiles...", flush=True)
     loop = asyncio.get_running_loop()
@@ -224,6 +264,10 @@ def _sanitize_telegram_detail(detail: str, limit: int = 220) -> str:
     compact = " | ".join(part.strip() for part in "".join(cleaned).splitlines() if part.strip())
     compact = " ".join(compact.split())
     return compact[:limit]
+
+
+def _telethon_retry_delay(consecutive_failures: int) -> int:
+    return min(60, max(5, consecutive_failures * 5))
 
 
 def _format_teams_vs_label(teams: str) -> str:
@@ -460,19 +504,27 @@ async def main():
         adspower_task = asyncio.create_task(start_adspower_after_listener_ready(state))
         adspower_task.add_done_callback(report_adspower_task_result)
         asyncio.create_task(refresh_stakes_daily(state))
-        asyncio.create_task(keep_black_session_active(state))
+        asyncio.create_task(keep_sessions_authorized(state))
 
         # Telethon can crash on TypeNotFoundError when Telegram introduces a new TL
         # object the installed Telethon doesn't know yet (the stored difference contains
         # an unknown constructor id). Clear the cached error and resume listening so the
         # bot stays online instead of exiting. If this keeps happening, upgrade Telethon:
         #     .venv\Scripts\python.exe -m pip install -U telethon
+        consecutive_reconnect_failures = 0
         while True:
             try:
                 if hasattr(client, "_updates_error"):
                     client._updates_error = None
                 if not client.is_connected():
                     try:
+                        # After transport-level failures (for example WinError 5 / aborted
+                        # local socket), Telethon can keep stale sender state around. Always
+                        # tear it down before attempting a fresh connect.
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
                         await client.connect()
                     except AuthKeyDuplicatedError as exc:
                         print(
@@ -484,20 +536,34 @@ async def main():
                         )
                         return
                     except Exception as conn_exc:
+                        consecutive_reconnect_failures += 1
+                        delay = _telethon_retry_delay(consecutive_reconnect_failures)
                         print(
-                            f"Telethon reconnect failed: {conn_exc!r}; retrying in 5s.",
+                            f"Telethon reconnect failed #{consecutive_reconnect_failures}: "
+                            f"{conn_exc!r}; retrying in {delay}s.",
                             flush=True,
                         )
-                        await asyncio.sleep(5)
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(delay)
                         continue
                     if not await client.is_user_authorized():
+                        consecutive_reconnect_failures += 1
+                        delay = _telethon_retry_delay(consecutive_reconnect_failures)
                         print(
                             "Telethon session is not authorized after reconnect; "
                             "delete the .session file and re-login.",
                             flush=True,
                         )
-                        await asyncio.sleep(30)
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(max(delay, 30))
                         continue
+                    consecutive_reconnect_failures = 0
                     print("Telethon reconnected; resuming listener.", flush=True)
                 await client.run_until_disconnected()
                 break
@@ -522,12 +588,17 @@ async def main():
                     pass
                 return
             except Exception as exc:
-                print(f"Telethon listener crashed: {exc!r}; restarting in 5s.", flush=True)
+                consecutive_reconnect_failures += 1
+                delay = _telethon_retry_delay(consecutive_reconnect_failures)
+                print(
+                    f"Telethon listener crashed: {exc!r}; restarting in {delay}s.",
+                    flush=True,
+                )
                 try:
                     await client.disconnect()
                 except Exception:
                     pass
-                await asyncio.sleep(5)
+                await asyncio.sleep(delay)
                 continue
 
 
