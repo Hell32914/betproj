@@ -3876,7 +3876,6 @@ def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label
             if (!element || seen.has(element) || !isVisible(element)) return;
             const rect = element.getBoundingClientRect();
             const text = textOf(element);
-            if (rect.y < 140 || rect.height > 90 || rect.width > 520) return;
             if (text === 'default stake' || text.includes('default stake')) {
                 seen.add(element);
                 labels.push(element);
@@ -3893,9 +3892,14 @@ def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label
         Array.from(document.querySelectorAll('label,p,span,div')).forEach(addLabel);
 
         labels.sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y);
+        const editableInputs = () => Array.from(document.querySelectorAll('input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"]'))
+            .filter((element) => isVisible(element) && !element.disabled && !element.readOnly)
+            .filter((element) => !['checkbox', 'radio', 'hidden'].includes((element.type || '').toLowerCase()));
         for (const label of labels) {
             const labelRect = label.getBoundingClientRect();
-            const inputs = Array.from(document.querySelectorAll('input'))
+            const scopedRoot = [label, label.parentElement, label.closest('label,section,div,form,li')]
+                .find((element) => element && element.querySelectorAll);
+            const inputs = Array.from((scopedRoot || document).querySelectorAll('input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"]'))
                 .filter((element) => isVisible(element) && !element.disabled && !element.readOnly)
                 .filter((element) => !['checkbox', 'radio', 'hidden'].includes((element.type || '').toLowerCase()))
                 .map((element) => ({ element, rect: element.getBoundingClientRect() }))
@@ -3922,6 +3926,37 @@ def _set_black_default_stake(driver: webdriver.Remote, stake: str, profile_label
             input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
             input.blur();
             return { ok: input.value === stake, value: input.value, label: textOf(label) };
+        }
+        const fallbackInput = editableInputs()
+            .map((element) => {
+                let score = 1000;
+                let node = element;
+                for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+                    const text = textOf(node);
+                    if (text.includes('default stake')) {
+                        score = depth;
+                        break;
+                    }
+                }
+                return { element, score };
+            })
+            .filter((item) => item.score < 1000)
+            .sort((a, b) => a.score - b.score)[0]?.element;
+        if (fallbackInput) {
+            fallbackInput.scrollIntoView({ block: 'center', inline: 'center' });
+            fallbackInput.focus({ preventScroll: true });
+            const setter = Object.getOwnPropertyDescriptor(fallbackInput.__proto__, 'value')?.set;
+            if (setter) {
+                setter.call(fallbackInput, stake);
+            } else {
+                fallbackInput.value = stake;
+            }
+            fallbackInput.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: stake }));
+            fallbackInput.dispatchEvent(new Event('change', { bubbles: true }));
+            fallbackInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+            fallbackInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+            fallbackInput.blur();
+            return { ok: fallbackInput.value === stake, value: fallbackInput.value, label: 'fallback default stake container' };
         }
         return { ok: false, value: '', label: '', labels: labels.map((label) => textOf(label)).slice(0, 5) };
         """,
@@ -5494,7 +5529,22 @@ def _set_betfair_default_stake(driver: webdriver.Remote, stake: str, profile_lab
     _open_betfair_settings_panel(driver, profile_label)
 
     # Click the "Betting" tab.
-    clicked_betting = False
+    clicked_betting = bool(driver.execute_script(
+        r"""
+        function visible(el) {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const cs = window.getComputedStyle(el);
+            return cs.visibility !== 'hidden' && cs.display !== 'none';
+        }
+        const panelText = Array.from(document.querySelectorAll('div,section,aside,form'))
+            .filter(visible)
+            .map((el) => (el.innerText || '').trim().toLowerCase())
+            .find((text) => text.includes('default stake') && (text.includes('edit') || text.includes('set')));
+        return !!panelText;
+        """
+    ))
     end = time.time() + 8
     while time.time() < end and not clicked_betting:
         clicked_betting = bool(driver.execute_script(
@@ -5510,11 +5560,13 @@ def _set_betfair_default_stake(driver: webdriver.Remote, stake: str, profile_lab
                 "a, button, [role='button'], [role='tab'], li, div, span"
             )).filter(visible).filter((el) => {
                 const t = (el.innerText || '').trim().toLowerCase();
-                return t === 'betting' && t.length < 20;
+                return (t === 'betting' || t.startsWith('betting') || t.includes('betting settings'))
+                    && t.length < 40;
             });
             if (cands.length === 0) return false;
-            cands[0].scrollIntoView({ block: 'center' });
-            cands[0].click();
+            const pick = cands[0].closest("a, button, [role='button'], [role='tab']") || cands[0];
+            pick.scrollIntoView({ block: 'center' });
+            pick.click();
             return true;
             """
         ))
