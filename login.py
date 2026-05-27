@@ -4999,7 +4999,43 @@ def _select_betfair_overunder_back(
     label_text = f"{selection} {line_str} goals"
     market_texts = _betfair_market_texts(signal, line_str)
     market_label = _signal_market_label(signal)
-    allow_label_fallback = _signal_market_key(signal) != "second_half_goals"
+    market_key = _signal_market_key(signal)
+    allow_label_fallback = True
+    preferred_tabs = ["half time", "2nd half"] if market_key == "second_half_goals" else []
+
+    if preferred_tabs:
+        try:
+            driver.execute_script(
+                r"""
+                const preferredTabs = arguments[0].map((value) => (value || '').toLowerCase().trim());
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
+                }
+                const candidates = Array.from(document.querySelectorAll("a, button, [role='button'], [role='tab'], li, div, span"))
+                    .filter(visible)
+                    .map((el) => ({
+                        el,
+                        text: (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' '),
+                        rect: el.getBoundingClientRect(),
+                    }))
+                    .filter((item) => item.text && item.text.length <= 40)
+                    .filter((item) => preferredTabs.some((tab) => item.text === tab || item.text.startsWith(tab)));
+                if (candidates.length > 0) {
+                    candidates.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+                    const pick = candidates[0].el.closest("a, button, [role='button'], [role='tab']") || candidates[0].el;
+                    pick.scrollIntoView({ block: 'center', inline: 'center' });
+                    pick.click();
+                }
+                """,
+                preferred_tabs,
+            )
+            time.sleep(0.7)
+        except Exception:
+            pass
 
     # 1) Try to bring the market into the DOM: click the left-sidebar entry if
     # the market section is not already visible.
@@ -5043,6 +5079,7 @@ def _select_betfair_overunder_back(
             const labelText = arguments[2];      // 'over 1.5 goals'
             const marketTexts = arguments[3];    // e.g. ['over/under 1.5 goals'] or ['2nd half goals']
             const allowLabelFallback = arguments[4];
+            const marketKey = arguments[5];
             const normalizeMarket = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
             const marketTextNorms = marketTexts.map(normalizeMarket);
             const normalizedLine = (lineStr || '').toLowerCase().replace(',', '.').trim();
@@ -5176,11 +5213,11 @@ def _select_betfair_overunder_back(
                     const t = txt(el).toLowerCase();
                     if (!t || t.length > 200) return false;
                     if (!rowMatchesSelection(t)) return false;
-                    if (t.indexOf('half') !== -1) return false;
+                    if (marketKey !== 'second_half_goals' && t.indexOf('half') !== -1) return false;
                     return true;
                 });
             if (labels.length === 0) {
-                return { error: 'label not found', labelText };
+                return { error: 'label not found', labelText, marketKey };
             }
             // Prefer leaf-most label (shortest text containing it).
             labels.sort((a, b) => txt(a).length - txt(b).length);
@@ -5229,6 +5266,7 @@ def _select_betfair_overunder_back(
             label_text,
             market_texts,
             allow_label_fallback,
+            market_key,
         )
         if info and info.get("ok"):
             break
