@@ -5045,6 +5045,13 @@ def _select_betfair_overunder_back(
             const allowLabelFallback = arguments[4];
             const normalizeMarket = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
             const marketTextNorms = marketTexts.map(normalizeMarket);
+            const normalizedLine = (lineStr || '').toLowerCase().replace(',', '.').trim();
+            const rowMatchesSelection = (text) => {
+                const normalized = (text || '').toLowerCase().replace(/\s+/g, ' ').replace(',', '.').trim();
+                if (!normalized || normalized.indexOf(want) === -1) return false;
+                if (normalized.indexOf(labelText) !== -1) return true;
+                return normalized.indexOf(normalizedLine) !== -1;
+            };
             function visible(el) {
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
@@ -5127,13 +5134,14 @@ def _select_betfair_overunder_back(
                         if (!visible(container)) continue;
                         const containerText = normalizedTxt(container);
                         const containerMarketText = normalizeMarket(containerText);
-                        if (!marketTextNorms.some((marketText) => containerMarketText.indexOf(marketText) !== -1) || containerText.indexOf(labelText) === -1) continue;
+                        if (!marketTextNorms.some((marketText) => containerMarketText.indexOf(marketText) !== -1)) continue;
+                        if (!rowMatchesSelection(containerText)) continue;
                         const containerRect = container.getBoundingClientRect();
                         if (containerRect.width < 220 || containerRect.height < 55) continue;
                         const rows = Array.from(container.querySelectorAll('tr, li, div'))
                             .filter(visible)
                             .map((row) => ({ row, text: normalizedTxt(row), rect: row.getBoundingClientRect() }))
-                            .filter((item) => item.text.indexOf(labelText) !== -1)
+                            .filter((item) => rowMatchesSelection(item.text))
                             .filter((item) => item.rect.y >= header.rect.y - 8)
                             .filter((item) => item.rect.height <= 95 && item.rect.width >= 130)
                             .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height) || a.rect.y - b.rect.y);
@@ -5167,7 +5175,7 @@ def _select_betfair_overunder_back(
                 .filter((el) => {
                     const t = txt(el).toLowerCase();
                     if (!t || t.length > 200) return false;
-                    if (t.indexOf(labelText) === -1) return false;
+                    if (!rowMatchesSelection(t)) return false;
                     if (t.indexOf('half') !== -1) return false;
                     return true;
                 });
