@@ -1606,6 +1606,78 @@ class BlackSelectionMissingError(RuntimeError):
     """Raised when the requested Asian Total Goals selection never shows up on the match page after retries."""
 
 
+def _read_black_orders_max_id(driver: webdriver.Remote, profile_label: str) -> int | None:
+    try:
+        result = driver.execute_script(
+            """
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0;
+            };
+            const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+            const textOf = (element) => normalize(element.innerText || element.textContent || '');
+            const hasOrdersHeaders = (text) => {
+                const lower = (text || '').toLowerCase();
+                return lower.includes('selection')
+                    && lower.includes('status')
+                    && (lower.includes('stake') || lower.includes('profit/loss') || lower.includes('price'));
+            };
+
+            const containers = Array.from(document.querySelectorAll('table,div,section,main,article'))
+                .filter(isVisible)
+                .map((element) => ({
+                    element,
+                    rect: element.getBoundingClientRect(),
+                    text: textOf(element),
+                }))
+                .filter((item) => item.rect.width > 260 && item.rect.height > 120)
+                .filter((item) => hasOrdersHeaders(item.text))
+                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+
+            const textPool = [];
+            for (const container of containers) {
+                const rowCandidates = Array.from(container.element.querySelectorAll('tr,[role="row"],div,section,article,li'))
+                    .filter(isVisible)
+                    .map((element) => ({
+                        text: textOf(element),
+                        rect: element.getBoundingClientRect(),
+                    }))
+                    .filter((item) => item.text && item.rect.height > 22 && item.rect.width > Math.min(container.rect.width * 0.45, 220))
+                    .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+                for (const row of rowCandidates) {
+                    if (!row.text) continue;
+                    if (hasOrdersHeaders(row.text)) continue;
+                    textPool.push(row.text);
+                }
+                if (textPool.length) break;
+            }
+
+            const sources = textPool.length ? textPool : containers.map((item) => item.text);
+            let max = 0;
+            for (const source of sources) {
+                const matches = source.match(/\\b\\d{6,14}\\b/g) || [];
+                for (const value of matches) {
+                    const num = parseInt(value, 10);
+                    if (Number.isFinite(num) && num > max) max = num;
+                }
+            }
+            return max || null;
+            """
+        )
+    except Exception as exc:
+        print(f"[{profile_label}] Could not read Black orders max id: {exc}", flush=True)
+        return None
+    if isinstance(result, (int, float)) and result:
+        return int(result)
+    return None
+
+
 def _snapshot_black_max_order_id(driver: webdriver.Remote, profile_label: str) -> int | None:
     """Open the Black top Orders view and return the largest order id currently shown.
 
@@ -1616,37 +1688,8 @@ def _snapshot_black_max_order_id(driver: webdriver.Remote, profile_label: str) -
     if not _open_black_top_orders(driver, profile_label):
         return None
     time.sleep(1.5)
-    try:
-        result = driver.execute_script(
-            """
-            const isVisible = (element) => {
-                const style = window.getComputedStyle(element);
-                const rect = element.getBoundingClientRect();
-                return style.display !== 'none'
-                    && style.visibility !== 'hidden'
-                    && rect.width > 0
-                    && rect.height > 0;
-            };
-            const text = Array.from(document.querySelectorAll('table,div,section,main'))
-                .filter(isVisible)
-                .map((element) => (element.innerText || element.textContent || ''))
-                .filter((value) => /selection/i.test(value) && /status/i.test(value) && /stake/i.test(value))
-                .sort((a, b) => b.length - a.length)[0] || '';
-            const matches = text.match(/\\b\\d{8,14}\\b/g) || [];
-            if (!matches.length) return null;
-            let max = 0;
-            for (const value of matches) {
-                const num = parseInt(value, 10);
-                if (Number.isFinite(num) && num > max) max = num;
-            }
-            return max || null;
-            """
-        )
-    except Exception as exc:
-        print(f"[{profile_label}] Could not snapshot Black max order id: {exc}", flush=True)
-        return None
-    if isinstance(result, (int, float)) and result:
-        snapshot = int(result)
+    snapshot = _read_black_orders_max_id(driver, profile_label)
+    if snapshot:
         print(f"[{profile_label}] Black pre-bet max order id snapshot: {snapshot}", flush=True)
         return snapshot
     return None
@@ -1667,36 +1710,8 @@ def _capture_new_black_order_id(
     deadline = time.monotonic() + timeout
     last_seen = None
     while time.monotonic() < deadline:
-        try:
-            result = driver.execute_script(
-                """
-                const isVisible = (element) => {
-                    const style = window.getComputedStyle(element);
-                    const rect = element.getBoundingClientRect();
-                    return style.display !== 'none'
-                        && style.visibility !== 'hidden'
-                        && rect.width > 0
-                        && rect.height > 0;
-                };
-                const text = Array.from(document.querySelectorAll('table,div,section,main'))
-                    .filter(isVisible)
-                    .map((element) => (element.innerText || element.textContent || ''))
-                    .filter((value) => /selection/i.test(value) && /status/i.test(value) && /stake/i.test(value))
-                    .sort((a, b) => b.length - a.length)[0] || '';
-                const matches = text.match(/\\b\\d{8,14}\\b/g) || [];
-                let max = 0;
-                for (const value of matches) {
-                    const num = parseInt(value, 10);
-                    if (Number.isFinite(num) && num > max) max = num;
-                }
-                return max || null;
-                """
-            )
-        except Exception as exc:
-            print(f"[{profile_label}] Could not read Black orders max id: {exc}", flush=True)
-            result = None
-        if isinstance(result, (int, float)) and result:
-            current_max = int(result)
+        current_max = _read_black_orders_max_id(driver, profile_label)
+        if current_max:
             last_seen = current_max
             if not min_order_id or current_max > int(min_order_id):
                 print(
