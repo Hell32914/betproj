@@ -831,8 +831,7 @@ def _fill_betslip_input(driver: webdriver.Remote, element, value: str) -> None:
 
 def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
     def search_dialog_open(browser: webdriver.Remote) -> bool:
-        text = _visible_text_lower(browser)
-        return "live events" in text or ("all sports" in text and "use ctrl-f" in text)
+        return _black_search_dialog_open(browser)
 
     def open_search_with_shortcut(browser: webdriver.Remote) -> bool:
         shortcut_attempts = [
@@ -940,8 +939,31 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
     result = driver.execute_script(
         """
         const dialogAlreadyOpen = () => {
-            const text = (document.body?.innerText || '').toLowerCase();
-            return text.includes('live events') || (text.includes('all sports') && text.includes('use ctrl-f'));
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0
+                    && rect.x < window.innerWidth
+                    && rect.y < window.innerHeight;
+            };
+            const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+            return Array.from(document.querySelectorAll('div,section,aside'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                .filter((item) => item.rect.y < 420 && item.rect.width > 240 && item.rect.height > 120)
+                .some((item) => {
+                    const hasVisibleInput = Array.from(item.element.querySelectorAll('input'))
+                        .some((input) => isVisible(input) && !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()));
+                    if (!hasVisibleInput) return false;
+                    return item.text.includes('live events')
+                        || item.text.includes('use ctrl-f')
+                        || item.text.includes('use ctrl f');
+                });
         };
         const textOf = (element) => (element.innerText || element.textContent || '').trim();
         if (dialogAlreadyOpen()) return true;
@@ -1176,19 +1198,30 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
             const body = normalize(bodyText);
             const noResults = body.includes('no results found') || body.includes('no events found');
 
+            const hasVisibleSearchInput = (root) => Array.from(root.querySelectorAll('input'))
+                .some((input) => isVisible(input) && !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()));
+
             const roots = Array.from(document.querySelectorAll('aside,section,main,div'))
                 .filter(isVisible)
-                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: element.innerText || element.textContent || '' }))
+                .map((element) => ({
+                    element,
+                    rect: element.getBoundingClientRect(),
+                    text: element.innerText || element.textContent || '',
+                    hasInput: hasVisibleSearchInput(element),
+                }))
+                .filter((item) => item.rect.y < 460)
                 .filter((item) => item.rect.width > 240 && item.rect.height > 70)
                 .filter((item) => {
                     const text = normalize(item.text);
-                    return text.includes('live events')
-                        || text.includes('use ctrl f')
-                        || text.includes('matches')
-                        || text.includes('top events')
-                        || text.includes('select sport');
+                    const modalMarker = text.includes('live events') || text.includes('use ctrl f');
+                    const searchRoot = item.hasInput && (modalMarker || text.includes('all sports'));
+                    return searchRoot;
                 })
-                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+                .sort((a, b) => {
+                    const aModal = normalize(a.text).includes('live events') || normalize(a.text).includes('use ctrl f') ? 0 : 1;
+                    const bModal = normalize(b.text).includes('live events') || normalize(b.text).includes('use ctrl f') ? 0 : 1;
+                    return aModal - bModal || (a.hasInput === b.hasInput ? 0 : (a.hasInput ? -1 : 1)) || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height);
+                });
             const root = roots[0]?.element || document.body;
             const resultRows = Array.from(root.querySelectorAll('li,a,button,[role="button"],[role="option"],[role="listitem"],article,div'))
                 .filter(isVisible)
@@ -1230,8 +1263,29 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
         lambda browser: browser.execute_script(
             """
             const dialogOpen = () => {
-                const text = (document.body?.innerText || '').toLowerCase();
-                return text.includes('live events') || (text.includes('all sports') && text.includes('use ctrl-f'));
+                const isVisible = (element) => {
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.right > 0;
+                };
+                const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+                return Array.from(document.querySelectorAll('div,section,aside'))
+                    .filter(isVisible)
+                    .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                    .filter((item) => item.rect.y < 420 && item.rect.width > 240 && item.rect.height > 120)
+                    .some((item) => {
+                        const hasVisibleInput = Array.from(item.element.querySelectorAll('input'))
+                            .some((input) => isVisible(input) && !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()));
+                        if (!hasVisibleInput) return false;
+                        return item.text.includes('live events')
+                            || item.text.includes('use ctrl-f')
+                            || item.text.includes('use ctrl f');
+                    });
             };
             if (!dialogOpen()) return null;
             const isVisible = (element) => {
@@ -1413,7 +1467,18 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                     reason: 'search-timeout',
                     requested,
                     normalizedRequested: normalize(requested),
-                    dialogOpen: bodyLower.includes('live events') || (bodyLower.includes('all sports') && bodyLower.includes('use ctrl-f')),
+                    dialogOpen: Array.from(document.querySelectorAll('div,section,aside'))
+                        .filter(isVisible)
+                        .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').toLowerCase().replace(/\\s+/g, ' ') }))
+                        .filter((item) => item.rect.y < 420 && item.rect.width > 240 && item.rect.height > 120)
+                        .some((item) => {
+                            const hasVisibleInput = Array.from(item.element.querySelectorAll('input'))
+                                .some((input) => isVisible(input) && !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()));
+                            if (!hasVisibleInput) return false;
+                            return item.text.includes('live events')
+                                || item.text.includes('use ctrl-f')
+                                || item.text.includes('use ctrl f');
+                        }),
                     inputs: visibleInputs,
                     text: textLines.join(' | ').slice(0, 900),
                     rows: rowSamples,
@@ -2180,8 +2245,39 @@ def _open_black_orders_view(driver: webdriver.Remote, profile_label: str) -> boo
 
 
 def _black_search_dialog_open(driver: webdriver.Remote) -> bool:
-    text = _visible_text_lower(driver)
-    return "live events" in text or ("all sports" in text and "use ctrl-f" in text)
+    try:
+        return bool(driver.execute_script(
+            """
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0
+                    && rect.x < window.innerWidth
+                    && rect.y < window.innerHeight;
+            };
+            const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+            return Array.from(document.querySelectorAll('div,section,aside'))
+                .filter(isVisible)
+                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
+                .filter((item) => item.rect.y < 420 && item.rect.width > 240 && item.rect.height > 120)
+                .some((item) => {
+                    const hasVisibleInput = Array.from(item.element.querySelectorAll('input'))
+                        .some((input) => isVisible(input) && !['checkbox', 'radio', 'hidden'].includes((input.type || '').toLowerCase()));
+                    if (!hasVisibleInput) return false;
+                    return item.text.includes('live events')
+                        || item.text.includes('use ctrl-f')
+                        || item.text.includes('use ctrl f');
+                });
+            """
+        ))
+    except Exception:
+        text = _visible_text_lower(driver)
+        return "live events" in text
 
 
 def _black_current_match_page_open(driver: webdriver.Remote) -> bool:
@@ -4308,6 +4404,48 @@ def _ensure_black_session_ready(driver: webdriver.Remote, profile_label: str) ->
     return False
 
 
+def _ping_black_session(driver: webdriver.Remote, profile_label: str) -> dict:
+    result = driver.execute_script(
+        """
+        const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0;
+        };
+        const dispatchMove = (target, x, y) => {
+            if (!target) return false;
+            const events = ['pointerover', 'mouseover', 'pointermove', 'mousemove'];
+            for (const name of events) {
+                const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
+                target.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
+            }
+            return true;
+        };
+        const candidates = Array.from(document.querySelectorAll('main,section,div,button,a,[role="button"]'))
+            .filter(isVisible)
+            .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim().toLowerCase() }))
+            .filter((item) => item.rect.y > 70 && item.rect.x < window.innerWidth * 0.85)
+            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+        const target = candidates[0]?.element || document.body;
+        const rect = (target.getBoundingClientRect && target.getBoundingClientRect()) || { x: 100, y: 100, width: 50, height: 50 };
+        const x = rect.x + Math.max(10, Math.min(rect.width / 2, 80));
+        const y = rect.y + Math.max(10, Math.min(rect.height / 2, 80));
+        target.scrollIntoView?.({ block: 'center', inline: 'center' });
+        dispatchMove(target, x, y);
+        window.dispatchEvent(new Event('focus'));
+        document.dispatchEvent(new Event('visibilitychange'));
+        return { ok: true, url: window.location.href, text: (target.innerText || target.textContent || '').trim().slice(0, 120) };
+        """
+    )
+    print(f"[{profile_label}] Black keepalive ping sent.")
+    return {"status": "alive", "detail": (result or {}).get("url", driver.current_url)}
+
+
 def keep_black_session_alive(session: dict) -> dict:
     profile_label = session.get("profile_label", "Profile-1")
     driver = None
@@ -4322,45 +4460,7 @@ def keep_black_session_alive(session: dict) -> dict:
         if not _ensure_black_session_ready(driver, profile_label):
             raise RuntimeError("Black session is no longer active.")
 
-        result = driver.execute_script(
-            """
-            const isVisible = (element) => {
-                const style = window.getComputedStyle(element);
-                const rect = element.getBoundingClientRect();
-                return style.display !== 'none'
-                    && style.visibility !== 'hidden'
-                    && rect.width > 0
-                    && rect.height > 0
-                    && rect.bottom > 0
-                    && rect.right > 0;
-            };
-            const dispatchMove = (target, x, y) => {
-                if (!target) return false;
-                const events = ['pointerover', 'mouseover', 'pointermove', 'mousemove'];
-                for (const name of events) {
-                    const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
-                    target.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
-                }
-                return true;
-            };
-            const candidates = Array.from(document.querySelectorAll('main,section,div,button,a,[role="button"]'))
-                .filter(isVisible)
-                .map((element) => ({ element, rect: element.getBoundingClientRect(), text: (element.innerText || element.textContent || '').trim().toLowerCase() }))
-                .filter((item) => item.rect.y > 70 && item.rect.x < window.innerWidth * 0.85)
-                .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-            const target = candidates[0]?.element || document.body;
-            const rect = (target.getBoundingClientRect && target.getBoundingClientRect()) || { x: 100, y: 100, width: 50, height: 50 };
-            const x = rect.x + Math.max(10, Math.min(rect.width / 2, 80));
-            const y = rect.y + Math.max(10, Math.min(rect.height / 2, 80));
-            target.scrollIntoView?.({ block: 'center', inline: 'center' });
-            dispatchMove(target, x, y);
-            window.dispatchEvent(new Event('focus'));
-            document.dispatchEvent(new Event('visibilitychange'));
-            return { ok: true, url: window.location.href, text: (target.innerText || target.textContent || '').trim().slice(0, 120) };
-            """
-        )
-        print(f"[{profile_label}] Black keepalive ping sent.")
-        return {"status": "alive", "detail": (result or {}).get("url", driver.current_url)}
+        return _ping_black_session(driver, profile_label)
     finally:
         close_driver_bridge(driver)
 
@@ -4377,8 +4477,7 @@ def ensure_black_session_authorized(session: dict) -> dict:
             time.sleep(2)
 
         if _ensure_black_session_ready(driver, profile_label):
-            result = keep_black_session_alive(session)
-            return {"status": "alive", "detail": result.get("detail", driver.current_url)}
+            return _ping_black_session(driver, profile_label)
 
         print(f"[{profile_label}] Black session is not authorized during health check; re-logging.")
         login(driver, profile_label)
@@ -5317,101 +5416,120 @@ def _select_betfair_overunder_back(
     if stake_str:
         # Give the betslip panel time to render after clicking the Back cell.
         time.sleep(1.5)
-        placed = driver.execute_script(
-            r"""
-            const stakeVal = arguments[0];
-            const oddsVal = arguments[1];
-            function visible(el) {
-                if (!el) return false;
-                const r = el.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) return false;
-                const cs = window.getComputedStyle(el);
-                return cs.visibility !== 'hidden' && cs.display !== 'none';
-            }
-            function setInputValue(inp, value) {
-                inp.scrollIntoView({ block: 'center' });
-                inp.focus();
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                );
-                if (nativeInputValueSetter && nativeInputValueSetter.set) {
-                    nativeInputValueSetter.set.call(inp, value);
-                } else {
-                    inp.value = value;
+        placed = None
+        fill_deadline = time.monotonic() + 8
+        while True:
+            placed = driver.execute_script(
+                r"""
+                const stakeVal = arguments[0];
+                const oddsVal = arguments[1];
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
                 }
-                inp.dispatchEvent(new Event('input', { bubbles: true }));
-                inp.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            // Find the stake input. Betfair betslip inputs may not carry 'stake' in
-            // their attributes — try several strategies in order of confidence.
-            let inp = null;
-            let oddsInp = null;
-            // Strategy 1: attribute mentions 'stake'.
-            const allInputs = Array.from(document.querySelectorAll(
-                "input[type='text'], input[type='number'], input:not([type])"
-            )).filter(visible);
-            inp = allInputs.find((el) => {
-                const ph = (el.getAttribute('placeholder') || '').toLowerCase();
-                const nm = (el.getAttribute('name') || '').toLowerCase();
-                const id = (el.getAttribute('id') || '').toLowerCase();
-                const cls = (el.className && el.className.toString ? el.className.toString().toLowerCase() : '');
-                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-                return ph.indexOf('stake') !== -1 || nm.indexOf('stake') !== -1
-                    || id.indexOf('stake') !== -1 || cls.indexOf('stake') !== -1
-                    || aria.indexOf('stake') !== -1;
-            }) || null;
-            // Strategy 2: find a betslip/betEntry container and take the second
-            // visible input inside it (first = odds, second = stake).
-            if (!inp) {
-                const containers = Array.from(document.querySelectorAll(
-                    "[class*='betslip' i], [class*='bet-slip' i], [class*='betEntry' i],"
-                    + "[class*='bet-entry' i], [aria-label*='betslip' i], [data-test*='betslip' i]"
-                )).filter(visible);
-                for (const c of containers) {
-                    const ins = Array.from(c.querySelectorAll(
-                        "input[type='text'], input[type='number'], input:not([type])"
-                    )).filter(visible);
-                    if (ins.length >= 2) { oddsInp = ins[0]; inp = ins[1]; break; }
-                    if (ins.length === 1) { inp = ins[0]; break; }
+                function setInputValue(inp, value) {
+                    inp.scrollIntoView({ block: 'center' });
+                    inp.focus();
+                    const tag = (inp.tagName || '').toLowerCase();
+                    if (tag === 'input' || tag === 'textarea') {
+                        const proto = tag === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(proto, 'value');
+                        if (nativeInputValueSetter && nativeInputValueSetter.set) {
+                            nativeInputValueSetter.set.call(inp, value);
+                        } else {
+                            inp.value = value;
+                        }
+                    } else {
+                        inp.textContent = value;
+                    }
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
                 }
-            }
-            if (!oddsInp) {
-                oddsInp = allInputs.find((el) => {
-                    if (el === inp) return false;
-                    const v = (el.value || '').trim().replace(',', '.');
-                    return /^\d+(?:\.\d+)?$/.test(v) && v !== stakeVal;
-                }) || null;
-            }
-            // Strategy 3: among all visible inputs, pick the one whose current value
-            // is empty or '0' (not the odds field which holds a non-zero decimal).
-            if (!inp && allInputs.length > 0) {
+                function controlValue(el) {
+                    if (!el) return '';
+                    if (typeof el.value === 'string') return el.value;
+                    return (el.textContent || el.innerText || '').trim();
+                }
+                // Find the stake input. Betfair betslip inputs may not carry 'stake' in
+                // their attributes — try several strategies in order of confidence.
+                let inp = null;
+                let oddsInp = null;
+                const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea";
+                const allInputs = Array.from(document.querySelectorAll(selector)).filter(visible);
                 inp = allInputs.find((el) => {
-                    const v = (el.value || '').trim();
-                    return v === '' || v === '0';
-                }) || allInputs[allInputs.length - 1];
-            }
-            if (!inp) return { error: 'stake input not found',
-                inputCount: allInputs.length,
-                inputValues: allInputs.map((e) => e.value).slice(0, 5) };
-            if (!oddsInp) return { error: 'odds input not found',
-                inputCount: allInputs.length,
-                inputValues: allInputs.map((e) => e.value).slice(0, 8) };
-            setInputValue(oddsInp, oddsVal);
-            setInputValue(inp, stakeVal);
-            const normalized = (value) => (value || '').trim().replace(',', '.');
-            const actualOdds = Number(normalized(oddsInp.value));
-            const targetOdds = Number(normalized(oddsVal));
-            if (!Number.isFinite(actualOdds) || actualOdds + 1e-9 < targetOdds) {
-                return { error: 'odds input below target value', oddsValue: oddsInp.value, targetOdds: oddsVal };
-            }
-            if (normalized(inp.value) !== normalized(stakeVal)) {
-                return { error: 'stake input did not keep target value', stakeValue: inp.value, targetStake: stakeVal };
-            }
-            return { stakeSet: true, oddsSet: true, oddsValue: oddsInp.value, stakeValue: inp.value };
-            """,
-            stake_str,
-            target_odds,
-        )
+                    const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                    const nm = (el.getAttribute('name') || '').toLowerCase();
+                    const id = (el.getAttribute('id') || '').toLowerCase();
+                    const cls = (el.className && el.className.toString ? el.className.toString().toLowerCase() : '');
+                    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                    return ph.indexOf('stake') !== -1 || nm.indexOf('stake') !== -1
+                        || id.indexOf('stake') !== -1 || cls.indexOf('stake') !== -1
+                        || aria.indexOf('stake') !== -1;
+                }) || null;
+                if (!inp) {
+                    const containers = Array.from(document.querySelectorAll(
+                        "[class*='betslip' i], [class*='bet-slip' i], [class*='betEntry' i],"
+                        + "[class*='bet-entry' i], [aria-label*='betslip' i], [data-test*='betslip' i]"
+                    )).filter(visible);
+                    for (const c of containers) {
+                        const ins = Array.from(c.querySelectorAll(selector)).filter(visible);
+                        if (ins.length >= 2) { oddsInp = ins[0]; inp = ins[1]; break; }
+                        if (ins.length === 1) { inp = ins[0]; break; }
+                    }
+                }
+                if (!oddsInp) {
+                    oddsInp = allInputs.find((el) => {
+                        if (el === inp) return false;
+                        const v = controlValue(el).trim().replace(',', '.');
+                        return /^\d+(?:\.\d+)?$/.test(v) && v !== stakeVal;
+                    }) || null;
+                }
+                if (!inp && allInputs.length > 0) {
+                    inp = allInputs.find((el) => {
+                        const v = controlValue(el).trim();
+                        return v === '' || v === '0';
+                    }) || allInputs[allInputs.length - 1];
+                }
+                if (!inp) return {
+                    error: 'stake input not found',
+                    inputCount: allInputs.length,
+                    inputValues: allInputs.map((e) => controlValue(e)).slice(0, 5),
+                    inputTypes: allInputs.map((e) => (e.getAttribute('type') || e.tagName || '').toLowerCase()).slice(0, 5),
+                };
+                if (!oddsInp) return {
+                    error: 'odds input not found',
+                    inputCount: allInputs.length,
+                    inputValues: allInputs.map((e) => controlValue(e)).slice(0, 8),
+                    inputTypes: allInputs.map((e) => (e.getAttribute('type') || e.tagName || '').toLowerCase()).slice(0, 8),
+                };
+                setInputValue(oddsInp, oddsVal);
+                setInputValue(inp, stakeVal);
+                const normalized = (value) => (value || '').trim().replace(',', '.');
+                const actualOdds = Number(normalized(controlValue(oddsInp)));
+                const targetOdds = Number(normalized(oddsVal));
+                if (!Number.isFinite(actualOdds) || actualOdds + 1e-9 < targetOdds) {
+                    return { error: 'odds input below target value', oddsValue: controlValue(oddsInp), targetOdds: oddsVal };
+                }
+                if (normalized(controlValue(inp)) !== normalized(stakeVal)) {
+                    return { error: 'stake input did not keep target value', stakeValue: controlValue(inp), targetStake: stakeVal };
+                }
+                return { stakeSet: true, oddsSet: true, oddsValue: controlValue(oddsInp), stakeValue: controlValue(inp) };
+                """,
+                stake_str,
+                target_odds,
+            )
+            waiting_for_inputs = (
+                isinstance(placed, dict)
+                and placed.get("error") in {"stake input not found", "odds input not found"}
+                and not int(placed.get("inputCount") or 0)
+                and time.monotonic() < fill_deadline
+            )
+            if not waiting_for_inputs:
+                break
+            time.sleep(0.6)
         if not (isinstance(placed, dict) and placed.get("stakeSet") and placed.get("oddsSet")):
             print(f"[{profile_label}] Betfair: stake fill result: {placed!r}", flush=True)
         else:
