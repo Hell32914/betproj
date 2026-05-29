@@ -526,6 +526,28 @@ def _team_search_queries(team_name: str | None) -> list[str]:
     return queries
 
 
+def _normalized_team_aliases(team_name: str | None) -> list[str]:
+    aliases: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str | None) -> None:
+        normalized = _normalize_team_text(candidate)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            aliases.append(normalized)
+
+        raw = _strip_diacritics(candidate or "").lower().strip()
+        raw = re.sub(r"[^a-z0-9]+", " ", raw)
+        raw = " ".join(raw.split())
+        if raw and raw not in seen:
+            seen.add(raw)
+            aliases.append(raw)
+
+    for query in _team_search_queries(team_name):
+        add(query)
+    return aliases
+
+
 def _signal_market_key(signal) -> str:
     market = (getattr(signal, "market", "") or "").lower()
     raw_text = (getattr(signal, "raw_text", "") or "").lower()
@@ -558,10 +580,23 @@ def _betfair_market_texts(signal, line_str: str) -> list[str]:
         return [
             "2nd half goals",
             "second half goals",
+            "2nd half total goals",
+            "second half total goals",
+            "2nd half over under goals",
+            "second half over under goals",
             f"2nd half over/under {line_str} goals",
             f"second half over/under {line_str} goals",
         ]
-    return [f"over/under {line_str} goals"]
+    return [
+        f"over/under {line_str} goals",
+        f"goals over/under {line_str}",
+        f"goal line {line_str}",
+        "goals over/under",
+        "over under goals",
+        "total goals",
+        "alternative total goals",
+        "goal lines",
+    ]
 
 
 def _signal_market_label(signal) -> str:
@@ -1693,6 +1728,7 @@ def _read_black_orders_max_id(driver: webdriver.Remote, profile_label: str) -> i
                     && lower.includes('status')
                     && (lower.includes('stake') || lower.includes('profit/loss') || lower.includes('price'));
             };
+            const statusRegex = /\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done|Success|Unplaced)\b/i;
 
             const containers = Array.from(document.querySelectorAll('table,div,section,main,article'))
                 .filter(isVisible)
@@ -1705,25 +1741,33 @@ def _read_black_orders_max_id(driver: webdriver.Remote, profile_label: str) -> i
                 .filter((item) => hasOrdersHeaders(item.text))
                 .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
 
-            const textPool = [];
-            for (const container of containers) {
-                const rowCandidates = Array.from(container.element.querySelectorAll('tr,[role="row"],div,section,article,li'))
+            const collectCandidateTexts = (root) => {
+                const candidates = Array.from(root.querySelectorAll('tr,[role="row"],li,div,section,article,td,span'))
                     .filter(isVisible)
                     .map((element) => ({
                         text: textOf(element),
                         rect: element.getBoundingClientRect(),
                     }))
-                    .filter((item) => item.text && item.rect.height > 22 && item.rect.width > Math.min(container.rect.width * 0.45, 220))
-                    .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
-                for (const row of rowCandidates) {
-                    if (!row.text) continue;
-                    if (hasOrdersHeaders(row.text)) continue;
-                    textPool.push(row.text);
-                }
-                if (textPool.length) break;
+                    .filter((item) => item.text && /\\b\\d{6,14}\\b/.test(item.text))
+                    .filter((item) => item.text.length <= 320)
+                    .filter((item) => !hasOrdersHeaders(item.text))
+                    .filter((item) => /\u20ac/.test(item.text) || statusRegex.test(item.text) || item.text.toLowerCase().includes('order id'))
+                    .sort((a, b) => a.text.length - b.text.length || a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+                return candidates.map((item) => item.text);
+            };
+
+            let sources = [];
+            for (const container of containers) {
+                sources = collectCandidateTexts(container.element);
+                if (sources.length) break;
+            }
+            if (!sources.length) {
+                sources = containers.map((item) => item.text).filter(Boolean);
+            }
+            if (!sources.length) {
+                sources = [textOf(document.body)].filter(Boolean);
             }
 
-            const sources = textPool.length ? textPool : containers.map((item) => item.text);
             let max = 0;
             for (const source of sources) {
                 const matches = source.match(/\\b\\d{6,14}\\b/g) || [];
@@ -4709,6 +4753,30 @@ def _find_betfair_search_input(driver: webdriver.Remote):
     )
 
 
+def _ensure_betfair_search_input(driver: webdriver.Remote, profile_label: str):
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        search_el = _find_betfair_search_input(driver)
+        if search_el:
+            return search_el
+        time.sleep(0.5)
+
+    print(f"[{profile_label}] Betfair search input not found; reopening exchange home and retrying login/search.", flush=True)
+    driver.get(BETFAIR_LOGIN_URL)
+    _wait_document_ready(driver)
+    time.sleep(1.5)
+    if not _is_betfair_logged_in(driver):
+        login_betfair(driver, profile_label)
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        search_el = _find_betfair_search_input(driver)
+        if search_el:
+            return search_el
+        time.sleep(0.5)
+    return None
+
+
 def open_betfair_match(session: dict, signal) -> dict:
     """Open the match on Betfair for the signal, then click the Back cell of
     the matching Over/Under <line> Goals market.
@@ -4792,6 +4860,18 @@ function fuzzyTeamScore(candidateNorm, teamNorm, oppNorm) {
     if (oppNorm && t.indexOf(oppNorm) !== -1) score += 80;
     return score;
 }
+function fuzzyAliasScore(candidateNorm, teamNorms, oppNorms) {
+    const teams = Array.isArray(teamNorms) && teamNorms.length ? teamNorms : [''];
+    const opponents = Array.isArray(oppNorms) && oppNorms.length ? oppNorms : [''];
+    let best = 0;
+    for (const teamNorm of teams) {
+        for (const oppNorm of opponents) {
+            const score = fuzzyTeamScore(candidateNorm, teamNorm, oppNorm);
+            if (score > best) best = score;
+        }
+    }
+    return best;
+}
 """
 
 
@@ -4828,26 +4908,7 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                 "error": "Betfair login could not be confirmed before search.",
             }
 
-    deadline = time.time() + 20
-    search_el = None
-    while time.time() < deadline:
-        search_el = _find_betfair_search_input(driver)
-        if search_el:
-            break
-        time.sleep(0.5)
-    if not search_el:
-        print(f"[{profile_label}] Betfair search input not found; reopening exchange home and retrying login/search.", flush=True)
-        driver.get(BETFAIR_LOGIN_URL)
-        _wait_document_ready(driver)
-        time.sleep(1.5)
-        if not _is_betfair_logged_in(driver):
-            login_betfair(driver, profile_label)
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            search_el = _find_betfair_search_input(driver)
-            if search_el:
-                break
-            time.sleep(0.5)
+    search_el = _ensure_betfair_search_input(driver, profile_label)
     if not search_el:
         return {
             "profile_label": profile_label,
@@ -4858,102 +4919,150 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
             "error": "Betfair search input not found after login/reopen.",
         }
 
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", search_el)
-    except Exception:
-        pass
-    try:
-        search_el.click()
-    except Exception:
-        try:
-            driver.execute_script("arguments[0].focus();", search_el)
-        except Exception:
-            pass
-    try:
-        search_el.send_keys(Keys.CONTROL, "a")
-        search_el.send_keys(Keys.DELETE)
-    except Exception:
-        pass
-    try:
-        search_el.clear()
-    except Exception:
-        pass
+    team_norms = _normalized_team_aliases(team_name)
+    opponent_norms = _normalized_team_aliases(opponent_name) if opponent_name else []
 
-    print(f"[{profile_label}] Betfair search: typing team '{team_name}'")
-    search_el.send_keys(team_name)
+    search_queries: list[str] = []
+    seen_queries: set[str] = set()
 
-    opponent_norm = _normalize_team_text(opponent_name) if opponent_name else ""
-    team_norm = _normalize_team_text(team_name)
-    end = time.time() + 12
+    def add_search_query(candidate: str | None) -> None:
+        value = " ".join((candidate or "").split()).strip()
+        if not value:
+            return
+        key = value.lower()
+        if key in seen_queries:
+            return
+        seen_queries.add(key)
+        search_queries.append(value)
+
+    for query in _team_search_queries(team_name):
+        add_search_query(query)
+    if opponent_name:
+        opponent_queries = _team_search_queries(opponent_name)
+        if search_queries and opponent_queries:
+            add_search_query(f"{search_queries[0]} {opponent_queries[0]}")
+            add_search_query(f"{search_queries[0]} vs {opponent_queries[0]}")
+
     clicked_label = None
-    while time.time() < end:
-        clicked_label = driver.execute_script(
-            _BETFAIR_FUZZY_HELPERS + r"""
-            const teamNorm = arguments[0];
-            const oppNorm = arguments[1];
-            const items = Array.from(document.querySelectorAll(
-                "a, li, [role='option'], [role='listitem'], [role='menuitem']"
-            )).filter(visible).map((el) => {
-                const text = (el.innerText || el.textContent || '').trim();
-                return { el, text, n: norm(text), score: fuzzyTeamScore(norm(text), teamNorm, oppNorm) };
-            }).filter((it) => it.text && it.text.length < 250 && it.score > 0);
-            if (items.length === 0) return null;
-            items.sort((a, b) => b.score - a.score);
-            const pick = items[0];
-            pick.el.scrollIntoView({block: 'center'});
-            pick.el.click();
-            return pick.text.slice(0, 200);
-            """,
-            team_norm,
-            opponent_norm,
-        )
-        if clicked_label:
+    for search_query in search_queries or [team_name]:
+        search_el = _find_betfair_search_input(driver) or _ensure_betfair_search_input(driver, profile_label)
+        if not search_el:
             break
-        time.sleep(0.5)
 
-    if not clicked_label:
-        print(f"[{profile_label}] No Betfair autocomplete result; submitting search via Enter.")
         try:
-            search_el.send_keys(Keys.ENTER)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", search_el)
         except Exception:
             pass
-        time.sleep(1.0)
-        current_url = (driver.current_url or "").lower()
-        if "/search" not in current_url and "search?" not in current_url:
-            driver.execute_script(
-                "window.location.href = '/exchange/plus/search?query=' + encodeURIComponent(arguments[0]);",
-                team_name,
-            )
         try:
-            WebDriverWait(driver, 10).until(
+            search_el.click()
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].focus();", search_el)
+            except Exception:
+                pass
+        try:
+            search_el.send_keys(Keys.CONTROL, "a")
+            search_el.send_keys(Keys.DELETE)
+        except Exception:
+            pass
+        try:
+            search_el.clear()
+        except Exception:
+            pass
+
+        print(f"[{profile_label}] Betfair search: typing query '{search_query}'")
+        search_el.send_keys(search_query)
+
+        end = time.time() + 8
+        clicked_label = None
+        while time.time() < end:
+            clicked_label = driver.execute_script(
+                _BETFAIR_FUZZY_HELPERS + r"""
+                const teamNorms = arguments[0] || [];
+                const oppNorms = arguments[1] || [];
+                const items = Array.from(document.querySelectorAll(
+                    "a, li, [role='option'], [role='listitem'], [role='menuitem'], [role='link'], [role='button']"
+                )).filter(visible).map((el) => {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    const score = fuzzyAliasScore(norm(text), teamNorms, oppNorms);
+                    return { el, text, n: norm(text), score };
+                }).filter((it) => it.text && it.text.length < 250 && it.score > 0);
+                if (items.length === 0) return null;
+                items.sort((a, b) => b.score - a.score || a.text.length - b.text.length);
+                const pick = items[0];
+                pick.el.scrollIntoView({block: 'center'});
+                pick.el.click();
+                return pick.text.slice(0, 200);
+                """,
+                team_norms,
+                opponent_norms,
+            )
+            if clicked_label:
+                break
+            time.sleep(0.5)
+
+        if not clicked_label:
+            print(f"[{profile_label}] No Betfair autocomplete result for '{search_query}'; submitting search via Enter.")
+            try:
+                search_el.send_keys(Keys.ENTER)
+            except Exception:
+                pass
+            time.sleep(1.0)
+            current_url = (driver.current_url or "").lower()
+            if "/search" not in current_url and "search?" not in current_url:
+                driver.execute_script(
+                    "window.location.href = '/exchange/plus/search?query=' + encodeURIComponent(arguments[0]);",
+                    search_query,
+                )
+            try:
+                WebDriverWait(driver, 10).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
+                pass
+
+        if not _is_betfair_logged_in(driver):
+            print(
+                f"[{profile_label}] Betfair search for '{search_query}' landed on a logged-out page; logging in again.",
+                flush=True,
+            )
+            login_betfair(driver, profile_label)
+            continue
+
+        followed = _follow_betfair_search_results(driver, team_norms, opponent_norms, profile_label)
+        if followed:
+            clicked_label = followed
+
+        try:
+            WebDriverWait(driver, 15).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
         except Exception:
             pass
 
-    # If autocomplete navigated us — or the Enter fallback landed us — on a
-    # Betfair Search Results page, click the result row that matches our team.
-    followed = _follow_betfair_search_results(driver, team_norm, opponent_norm, profile_label)
-    if followed:
-        clicked_label = followed
+        if clicked_label:
+            print(f"[{profile_label}] Betfair opened result: {clicked_label!r}")
+            return {
+                "profile_label": profile_label,
+                "team": team_name,
+                "opponent": opponent_name,
+                "opened": True,
+                "label": clicked_label,
+                "url": driver.current_url,
+            }
 
-    try:
-        WebDriverWait(driver, 15).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
-    except Exception:
-        pass
-
-    if clicked_label:
-        print(f"[{profile_label}] Betfair opened result: {clicked_label!r}")
-        return {
-            "profile_label": profile_label,
-            "team": team_name,
-            "opponent": opponent_name,
-            "opened": True,
-            "label": clicked_label,
-            "url": driver.current_url,
-        }
+        current_url = (driver.current_url or "").lower()
+        if "/search" not in current_url and "search?" not in current_url and BETFAIR_URL_PART in current_url:
+            inferred_label = f"{team_name} v {opponent_name}" if opponent_name else team_name
+            print(f"[{profile_label}] Betfair left search after query '{search_query}', using current match page.")
+            return {
+                "profile_label": profile_label,
+                "team": team_name,
+                "opponent": opponent_name,
+                "opened": True,
+                "label": inferred_label,
+                "url": driver.current_url,
+            }
     return {
         "profile_label": profile_label,
         "team": team_name,
@@ -4964,7 +5073,7 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
 
 
 def _follow_betfair_search_results(
-    driver: webdriver.Remote, team_norm: str, opponent_norm: str, profile_label: str
+    driver: webdriver.Remote, team_norms: list[str], opponent_norms: list[str], profile_label: str
 ):
     """If we are on a Betfair Search Results listing, click the matching match link.
 
@@ -4992,32 +5101,64 @@ def _follow_betfair_search_results(
             return None
         result = driver.execute_script(
             _BETFAIR_FUZZY_HELPERS + r"""
-            const teamNorm = arguments[0];
-            const oppNorm = arguments[1];
-            // Result links: every anchor on the page. We DON'T require visible()
-            // because Betfair sometimes renders anchors as inline within a flex
-            // row whose bounding rect collapses; we filter via href shape and
-            // text content instead.
-            const all = Array.from(document.querySelectorAll("a"));
-            const scored = all.map((a) => {
-                const text = (a.innerText || a.textContent || '').trim();
-                const href = a.getAttribute('href') || '';
+            const teamNorms = arguments[0] || [];
+            const oppNorms = arguments[1] || [];
+            const hasInterestingText = (text) => {
+                const lowered = (text || '').toLowerCase();
+                return /\bv\b|\bvs\b/.test(lowered) || /football|soccer|goals|match/.test(lowered);
+            };
+            const pickHref = (element) => {
+                if (!element) return '';
+                const direct = element.matches && element.matches('a[href]') ? element : null;
+                const nested = element.querySelector ? element.querySelector('a[href]') : null;
+                const parent = element.closest ? element.closest('a[href]') : null;
+                const target = direct || nested || parent;
+                return target ? (target.getAttribute('href') || '') : '';
+            };
+            const pickClickTarget = (element) => {
+                if (!element) return null;
+                return element.closest?.("a, button, [role='link'], [role='button']")
+                    || element.querySelector?.("a, button, [role='link'], [role='button']")
+                    || element;
+            };
+            const all = Array.from(document.querySelectorAll(
+                "a, button, [role='link'], [role='button'], [role='option'], li, article, div"
+            )).filter(visible);
+            const scored = all.map((element) => {
+                const text = (element.innerText || element.textContent || '').trim();
+                const href = pickHref(element);
                 const n = norm(text);
-                const score = fuzzyTeamScore(n, teamNorm, oppNorm);
+                const score = fuzzyAliasScore(n, teamNorms, oppNorms);
+                const rect = element.getBoundingClientRect();
                 // Match-page links on Betfair Exchange look like
                 // /exchange/plus/.../<slug>-betting-<id> — event IDs are 6+ digits.
                 // Competition/league pages use short IDs (1-4 digits), so we exclude them.
                 const hrefLooksLikeMatch = /-betting-\d{6,}/i.test(href)
                     || /[?&]eventId=\d+/i.test(href);
                 // Text contains a ' v ' separator (e.g. 'Team A v Team B').
-                const hasVs = /\bv\b/i.test(text);
-                return { el: a, text, n, href, score, hrefLooksLikeMatch, hasVs };
+                const hasVs = /\bv\b/i.test(text) || /\bvs\b/i.test(text);
+                return {
+                    el: element,
+                    clickEl: pickClickTarget(element),
+                    text,
+                    n,
+                    href,
+                    score,
+                    hrefLooksLikeMatch,
+                    hasVs,
+                    interestingText: hasInterestingText(text),
+                    area: rect.width * rect.height,
+                };
             });
             // Primary: match-shaped href AND positive fuzzy score.
-            let cands = scored.filter((it) => it.hrefLooksLikeMatch && it.score > 0);
+            let cands = scored.filter((it) => it.text && it.text.length < 220)
+                .filter((it) => it.area > 0 && it.area < window.innerWidth * window.innerHeight * 0.85)
+                .filter((it) => it.hrefLooksLikeMatch || it.hasVs || it.interestingText)
+                .filter((it) => it.score > 0);
             // Fallback: positive score AND text contains ' v ' separator.
             if (cands.length === 0) {
-                cands = scored.filter((it) => it.score > 0 && it.hasVs);
+                cands = scored.filter((it) => it.text && it.text.length < 220)
+                    .filter((it) => it.score > 0 && (it.hasVs || it.hrefLooksLikeMatch));
             }
             if (cands.length === 0) {
                 // Return debug snapshot for the caller to log.
@@ -5027,18 +5168,18 @@ def _follow_betfair_search_results(
                     textSample: scored.slice(0, 10).map((s) => s.text.slice(0, 60)).filter((t) => t),
                 };
             }
-            cands.sort((a, b) => b.score - a.score);
+            cands.sort((a, b) => b.score - a.score || (a.hrefLooksLikeMatch === b.hrefLooksLikeMatch ? 0 : (a.hrefLooksLikeMatch ? -1 : 1)) || a.text.length - b.text.length || a.area - b.area);
             const pick = cands[0];
-            try { pick.el.scrollIntoView({ block: 'center' }); } catch (e) {}
+            try { pick.clickEl.scrollIntoView({ block: 'center' }); } catch (e) {}
             let clicked = false;
             try {
-                pick.el.click();
+                pick.clickEl.click();
                 clicked = true;
             } catch (e) {}
             if (!clicked) {
                 try {
                     const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
-                    pick.el.dispatchEvent(evt);
+                    pick.clickEl.dispatchEvent(evt);
                     clicked = true;
                 } catch (e) {}
             }
@@ -5058,8 +5199,8 @@ def _follow_betfair_search_results(
             }
             return { ok: true, text: (pick.text || pick.href).slice(0, 200), href: pick.href };
             """,
-            team_norm,
-            opponent_norm,
+            team_norms,
+            opponent_norms,
         )
         if isinstance(result, dict) and result.get("ok"):
             clicked = result.get("text") or result.get("href")
