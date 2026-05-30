@@ -2324,6 +2324,36 @@ def _black_search_dialog_open(driver: webdriver.Remote) -> bool:
         return "live events" in text
 
 
+def _dismiss_black_search_dialog(driver: webdriver.Remote, profile_label: str) -> bool:
+    if not _black_search_dialog_open(driver):
+        return True
+
+    try:
+        driver.execute_script(
+            """
+            const events = [
+                new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }),
+                new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', bubbles: true }),
+            ];
+            for (const event of events) document.dispatchEvent(event);
+            for (const event of events) document.body?.dispatchEvent(event);
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    except Exception:
+        pass
+
+    time.sleep(0.6)
+    dismissed = not _black_search_dialog_open(driver)
+    if dismissed:
+        print(f"[{profile_label}] Dismissed Black search dialog.")
+    return dismissed
+
+
 def _black_current_match_page_open(driver: webdriver.Remote) -> bool:
     current_url = (driver.current_url or "").lower()
     return "/sportsbook/football/" in current_url and not _black_search_dialog_open(driver)
@@ -2334,6 +2364,9 @@ def _black_match_context_matches(
     home_team: str,
     away_team: str | None,
 ) -> bool:
+    if _black_search_dialog_open(driver):
+        return False
+
     home_variants = _team_search_queries(home_team)
     away_variants = _team_search_queries(away_team)
     return bool(driver.execute_script(
@@ -3892,6 +3925,8 @@ def place_black_bet(session: dict, signal) -> dict:
         used_query = _search_black_live_events(driver, team_name, profile_label, [opponent_name])
         print(f"[{profile_label}] Using Black search query: {used_query}")
         _open_black_live_match(driver, team_name, opponent_name, profile_label)
+        if _black_search_dialog_open(driver):
+            _dismiss_black_search_dialog(driver, profile_label)
         if _black_search_dialog_open(driver):
             raise RuntimeError(f"[{profile_label}] Black search dialog is still open after match click; aborting before bet selection.")
         if not _black_match_context_matches(driver, team_name, opponent_name) and not _black_current_match_page_open(driver):
