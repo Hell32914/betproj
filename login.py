@@ -868,6 +868,13 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
     def search_dialog_open(browser: webdriver.Remote) -> bool:
         return _black_search_dialog_open(browser)
 
+    current_url = (driver.current_url or "").lower()
+    if "/orders" in current_url:
+        driver.get(BLACK_SPORTSBOOK_URL)
+        _wait_document_ready(driver)
+        time.sleep(2)
+        print(f"[{profile_label}] Returned Black to sportsbook before opening match search.")
+
     def open_search_with_shortcut(browser: webdriver.Remote) -> bool:
         shortcut_attempts = [
             lambda: ActionChains(browser).key_down(Keys.CONTROL).send_keys("f").key_up(Keys.CONTROL).perform(),
