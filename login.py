@@ -861,6 +861,34 @@ def _fill_betslip_input(driver: webdriver.Remote, element, value: str) -> None:
     except Exception:
         driver.execute_script("arguments[0].blur?.(); document.activeElement?.blur?.();", element)
 
+    try:
+        driver.execute_script(
+            """
+            const element = arguments[0];
+            const value = arguments[1];
+            const editableSelector = 'input,textarea,[contenteditable="true"],[role="textbox"],[role="spinbutton"],[tabindex]';
+            const target = element.matches?.(editableSelector)
+                ? element
+                : (element.querySelector?.(editableSelector) || (element.contains(document.activeElement) ? document.activeElement : element));
+            if (!target) return;
+            target.focus?.({ preventScroll: true });
+            if ('value' in target && target.value !== value) {
+                const setter = Object.getOwnPropertyDescriptor(target.__proto__, 'value')?.set;
+                if (setter) setter.call(target, value);
+                else target.value = value;
+            } else if (!('value' in target) && (target.textContent || '').trim() !== value) {
+                target.textContent = value;
+            }
+            target.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: value }));
+            target.dispatchEvent(new Event('change', { bubbles: true }));
+            target.dispatchEvent(new Event('blur', { bubbles: true }));
+            """,
+            element,
+            value,
+        )
+    except Exception:
+        pass
+
     time.sleep(0.25)
 
 
@@ -1700,7 +1728,7 @@ def _normalize_black_order_status(raw_status: str) -> str:
     normalized = (raw_status or '').strip().lower()
     if normalized in {'reconciled', 'accepted', 'matched', 'confirmed', 'done', 'success'}:
         return 'accepted'
-    if normalized in {'failed', 'rejected', 'declined'}:
+    if normalized in {'failed', 'rejected', 'declined', 'unplaced'}:
         return 'rejected'
     if normalized in {'cancelled', 'canceled', 'void'}:
         return 'cancelled'
@@ -2096,13 +2124,24 @@ def _read_black_order_by_id(
                 .map((element) => ({ element, rect: element.getBoundingClientRect(), text: normalize(textOf(element)).toLowerCase() }))
                 .filter((item) => item.text.includes('selection') && item.text.includes('status') && item.text.includes('stake'))
                 .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-            const table = tables[0];
-            if (!table) return null;
-            const statusRegex = /\\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done)\\b/i;
-            const candidates = Array.from(table.element.querySelectorAll('tr,[role="row"],div,section,article'))
-                .filter(isVisible)
-                .map((element) => ({ element, text: normalize(textOf(element)) }))
-                .filter((item) => item.text.includes(targetId));
+            const statusRegex = /\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done|Success|Unplaced)\b/i;
+            const roots = tables.length
+                ? tables.slice(0, 3).map((item) => item.element)
+                : [document.querySelector('main') || document.body].filter(Boolean);
+            const seen = new Set();
+            let candidates = [];
+            for (const root of roots) {
+                for (const element of Array.from(root.querySelectorAll('tr,[role="row"],li,div,section,article,td,span'))) {
+                    if (!isVisible(element) || seen.has(element)) continue;
+                    seen.add(element);
+                    const text = normalize(textOf(element));
+                    if (text.includes(targetId)) candidates.push({ element, text });
+                }
+            }
+            if (!candidates.length && document.body) {
+                const bodyText = normalize(textOf(document.body));
+                if (bodyText.includes(targetId)) candidates = [{ element: document.body, text: bodyText }];
+            }
             if (!candidates.length) return { ok: false, reason: 'order-id-not-found' };
             // We want the SMALLEST container that includes the order id, a € amount, AND a
             // status keyword — that is the full row for this order. Fallbacks: smallest
@@ -2836,7 +2875,8 @@ def _verify_black_betslip_target(
     selection_lower = selection.strip().lower()
     home_variants = _team_search_queries(home_team)
     away_variants = _team_search_queries(away_team)
-    verified = WebDriverWait(driver, 8).until(lambda browser: browser.execute_script(
+    try:
+        verified = WebDriverWait(driver, 8).until(lambda browser: browser.execute_script(
         """
         const selection = arguments[0].trim().toLowerCase();
         const lineVariants = arguments[1].map((value) => value.toLowerCase());
@@ -2904,8 +2944,12 @@ def _verify_black_betslip_target(
             const hasSelection = text.includes(selection);
             const hasHome = teamPresent(normalizedText, homeVariants, homeWords, false);
             const hasAway = teamPresent(normalizedText, awayVariants, awayWords, true);
-            if (hasLine && hasSelection && hasHome && hasAway) {
-                return { ok: true, text: text.slice(0, 300) };
+            if (hasLine && hasSelection) {
+                return {
+                    ok: true,
+                    teamsInTicket: hasHome && hasAway,
+                    text: text.slice(0, 300),
+                };
             }
         }
         return null;
@@ -2914,13 +2958,30 @@ def _verify_black_betslip_target(
         line_variants,
         home_variants,
         away_variants,
-    ))
+        ))
+    except TimeoutException as exc:
+        page_text = _visible_page_text(driver)
+        short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
+        raise RuntimeError(
+            f"[{profile_label}] Black betslip verification failed for {selection} {line}. Page: {short_text}"
+        ) from exc
     if not verified:
         page_text = _visible_page_text(driver)
         short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:700]
         raise RuntimeError(
             f"[{profile_label}] Black betslip verification failed for {selection} {line}. Page: {short_text}"
         )
+    if verified.get("teamsInTicket"):
+        return
+    if _black_match_context_matches(driver, home_team or "", away_team) or _black_current_match_page_open(driver):
+        print(
+            f"[{profile_label}] Black betslip verified by selection/line; team names are on the match page, not inside the ticket."
+        )
+        return
+    raise RuntimeError(
+        f"[{profile_label}] Black betslip has {selection} {line}, but match context is not confirmed. "
+        f"Ticket: {verified.get('text', '')}"
+    )
 
 
 def _select_black_asian_total_goals(
@@ -3269,12 +3330,18 @@ def _set_black_betslip_price_and_place(
         const stakeInput = stakeItem?.element || null;
         const priceInput = priceItem?.element || null;
         const placeButton = placeButtonItem?.element || null;
+        const placeDisabled = !placeButton
+            || !!placeButton.disabled
+            || placeButton.getAttribute('disabled') !== null
+            || placeButton.getAttribute('aria-disabled') === 'true'
+            || /disabled/.test(String(placeButton.className || '').toLowerCase());
         return {
             ok: true,
             panel: panel.element,
             stakeInput,
             priceInput,
             placeButton,
+            placeDisabled,
             panelText: panel.element.innerText || document.body?.innerText || '',
             controlDebug: {
                 labels: labels
@@ -3389,7 +3456,7 @@ def _set_black_betslip_price_and_place(
                 return False
             if current_stake != normalized_stake:
                 return False
-        if not current_place_button.is_enabled() or current_place_button.get_attribute("aria-disabled") == "true":
+        if state.get("placeDisabled"):
             return False
         return state
 
@@ -4630,86 +4697,102 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
 
     Idempotent: returns immediately when the account is already authenticated.
     """
-    if BETFAIR_URL_PART not in (driver.current_url or "").lower():
-        print(f"[{profile_label}] Navigating to Betfair: {BETFAIR_LOGIN_URL}")
-        driver.get(BETFAIR_LOGIN_URL)
-
-    # Allow the page to settle.
-    try:
-        WebDriverWait(driver, 20).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
-    except Exception:
-        pass
-
-    if _is_betfair_logged_in(driver):
-        print(f"[{profile_label}] Betfair already logged in; skipping form fill.")
-        return
-
     if not BETFAIR_USERNAME or not BETFAIR_PASSWORD:
         raise RuntimeError(
             "Missing BETFAIR_USERNAME / BETFAIR_PASSWORD; cannot log into Betfair."
         )
 
-    # Locate the login form robustly: pick the <form> that contains a password
-    # field (top-bar login form). Works regardless of UI language.
-    deadline = time.time() + 30
-    user_el = pwd_el = btn_el = None
-    while time.time() < deadline:
+    def wait_ready(timeout: int = 20) -> None:
         try:
-            elems = driver.execute_script(
-                r"""
-                function visible(el) {
-                    if (!el) return false;
-                    const r = el.getBoundingClientRect();
-                    if (r.width === 0 || r.height === 0) return false;
-                    const cs = window.getComputedStyle(el);
-                    return cs.visibility !== 'hidden' && cs.display !== 'none';
-                }
-                const pwds = Array.from(document.querySelectorAll("input[type='password']"))
-                    .filter(visible);
-                if (pwds.length === 0) return null;
-                const pwd = pwds[0];
-                const form = pwd.closest('form') || pwd.parentElement;
-                // Find a visible text/email input within the same form, preferring
-                // ones that come BEFORE the password input.
-                let candidates = [];
-                if (form) {
-                    candidates = Array.from(form.querySelectorAll(
-                        "input[type='text'], input[type='email'], input:not([type])"
-                    )).filter(visible);
-                }
-                // Fall back to nearest text input in the document if needed.
-                if (candidates.length === 0) {
-                    candidates = Array.from(document.querySelectorAll(
-                        "input[type='text'], input[type='email']"
-                    )).filter(visible);
-                }
-                const user = candidates[0] || null;
-                let btn = null;
-                if (form) {
-                    btn = form.querySelector(
-                        "button[type='submit'], input[type='submit'], button#login_now_button, input#login_now_button"
-                    );
-                    if (!btn) {
-                        const btns = Array.from(form.querySelectorAll('button')).filter(visible);
-                        btn = btns[btns.length - 1] || null;
-                    }
-                }
-                return [user, pwd, btn];
-                """
+            WebDriverWait(driver, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
             )
         except Exception:
-            elems = None
-        if elems and elems[0] and elems[1]:
-            user_el, pwd_el, btn_el = elems[0], elems[1], elems[2]
+            pass
+
+    def locate_login_fields(timeout: float):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                elems = driver.execute_script(
+                    r"""
+                    function visible(el) {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) return false;
+                        const cs = window.getComputedStyle(el);
+                        return cs.visibility !== 'hidden' && cs.display !== 'none';
+                    }
+                    const pwds = Array.from(document.querySelectorAll("input[type='password']"))
+                        .filter(visible);
+                    if (pwds.length === 0) return null;
+                    const pwd = pwds[0];
+                    const form = pwd.closest('form') || pwd.parentElement;
+                    let candidates = [];
+                    if (form) {
+                        candidates = Array.from(form.querySelectorAll(
+                            "input[type='text'], input[type='email'], input:not([type])"
+                        )).filter(visible);
+                    }
+                    if (candidates.length === 0) {
+                        candidates = Array.from(document.querySelectorAll(
+                            "input[type='text'], input[type='email']"
+                        )).filter(visible);
+                    }
+                    const user = candidates[0] || null;
+                    let btn = null;
+                    if (form) {
+                        btn = form.querySelector(
+                            "button[type='submit'], input[type='submit'], button#login_now_button, input#login_now_button"
+                        );
+                        if (!btn) {
+                            const btns = Array.from(form.querySelectorAll('button')).filter(visible);
+                            btn = btns[btns.length - 1] || null;
+                        }
+                    }
+                    return [user, pwd, btn];
+                    """
+                )
+            except Exception:
+                elems = None
+            if elems and elems[0] and elems[1]:
+                return elems[0], elems[1], elems[2]
+            time.sleep(0.5)
+        return None, None, None
+
+    if BETFAIR_URL_PART not in (driver.current_url or "").lower():
+        print(f"[{profile_label}] Navigating to Betfair: {BETFAIR_LOGIN_URL}")
+        driver.get(BETFAIR_LOGIN_URL)
+    wait_ready()
+
+    if _is_betfair_logged_in(driver):
+        print(f"[{profile_label}] Betfair already logged in; skipping form fill.")
+        return
+
+    user_el = pwd_el = btn_el = None
+    for attempt_name, reopen_home, timeout in (
+        ("current page", False, 8),
+        ("exchange home", True, 25),
+    ):
+        if reopen_home:
+            print(f"[{profile_label}] Betfair login form not visible on current page; reopening Exchange home.")
+            driver.get(BETFAIR_LOGIN_URL)
+            wait_ready()
+            time.sleep(1.0)
+            if _is_betfair_logged_in(driver):
+                print(f"[{profile_label}] Betfair already logged in after reopening Exchange home.")
+                return
+        user_el, pwd_el, btn_el = locate_login_fields(timeout)
+        if user_el and pwd_el:
             break
-        time.sleep(0.5)
 
     if not user_el or not pwd_el:
+        page_text = _visible_page_text(driver)
+        short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:500]
         raise RuntimeError(
             f"[{profile_label}] Betfair login form not found "
-            f"(username={bool(user_el)}, password={bool(pwd_el)})."
+            f"(username={bool(user_el)}, password={bool(pwd_el)}, url={driver.current_url}). "
+            f"Page: {short_text}"
         )
 
     try:
@@ -5438,12 +5521,21 @@ def _select_betfair_overunder_back(
                 return { cell, score, rect: cell.getBoundingClientRect(), priceText: txt(cell), bg, cls };
             }
             function clickCell(cell) {
-                cell.scrollIntoView({ block: 'center', inline: 'center' });
-                try { cell.click(); }
-                catch (e) {
-                    const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
-                    cell.dispatchEvent(evt);
+                const target = cell.closest?.("button, [role='button'], a") || cell;
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+                const rect = target.getBoundingClientRect();
+                const x = rect.left + rect.width / 2;
+                const y = rect.top + rect.height / 2;
+                const liveTarget = document.elementFromPoint(x, y) || target;
+                for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    const EventCtor = name.startsWith('pointer') ? (window.PointerEvent || MouseEvent) : MouseEvent;
+                    try {
+                        liveTarget.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
+                    } catch (e) {
+                        liveTarget.dispatchEvent(new MouseEvent(name.replace('pointer', 'mouse'), { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+                    }
                 }
+                try { target.click?.(); } catch (e) {}
             }
             function pickBackCell(cells) {
                 const scored = cells.map(scoreBackCell);
@@ -5584,6 +5676,7 @@ def _select_betfair_overunder_back(
     stake_str = None
     bet_placed = False
     accepted_odds_text = target_odds
+    last_betfair_error = None
     try:
         balance = _read_betfair_balance(driver, profile_label)
         stake_amount = _calculate_stake_from_balance(balance)
@@ -5595,6 +5688,7 @@ def _select_betfair_overunder_back(
             print(f"[{profile_label}] Betfair: using cached stake {stake_str}; balance read failed: {exc}", flush=True)
         else:
             print(f"[{profile_label}] Betfair: could not compute stake: {exc}", flush=True)
+            last_betfair_error = str(exc)
 
     if stake_str:
         # Give the betslip panel time to render after clicking the Back cell.
@@ -5630,6 +5724,7 @@ def _select_betfair_overunder_back(
                     }
                     inp.dispatchEvent(new Event('input', { bubbles: true }));
                     inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    inp.dispatchEvent(new Event('blur', { bubbles: true }));
                 }
                 function controlValue(el) {
                     if (!el) return '';
@@ -5715,6 +5810,7 @@ def _select_betfair_overunder_back(
             time.sleep(0.6)
         if not (isinstance(placed, dict) and placed.get("stakeSet") and placed.get("oddsSet")):
             print(f"[{profile_label}] Betfair: stake fill result: {placed!r}", flush=True)
+            last_betfair_error = f"stake/odds fill failed: {placed!r}"
         else:
             accepted_odds_text = str(placed.get("oddsValue") or target_odds)
             # Wait for Betfair UI to update button label to "Confirm bet".
@@ -5784,6 +5880,7 @@ def _select_betfair_overunder_back(
                         )
                         bet_placed = True
                     else:
+                        last_betfair_error = f"confirm bet button not found/clicked: {confirmed2!r}"
                         print(
                             f"[{profile_label}] Betfair: confirm-2 result: {confirmed2!r}",
                             flush=True,
@@ -5791,7 +5888,16 @@ def _select_betfair_overunder_back(
                 else:
                     bet_placed = True
             else:
+                last_betfair_error = f"place/confirm button not found/clicked: {confirmed!r}"
                 print(f"[{profile_label}] Betfair: confirm click result: {confirmed!r}", flush=True)
+    else:
+        last_betfair_error = last_betfair_error or "stake value is unavailable"
+
+    if not bet_placed:
+        raise RuntimeError(
+            f"[{profile_label}] Betfair bet was not placed after selecting {market_label} "
+            f"{selection.title()} {line_str}: {last_betfair_error or 'unknown error'}"
+        )
 
     return {
         "betfair_selection": f"{market_label} {selection.title()} {line_str}",
