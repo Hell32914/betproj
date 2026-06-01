@@ -5451,6 +5451,120 @@ def _select_betfair_overunder_back(
     # 2) Poll for a row whose label text equals 'Over <line> Goals' / 'Under <line> Goals'
     end = time.time() + 30
     info = None
+
+    def read_betfair_betslip_state(timeout: float = 0.0) -> dict:
+        deadline = time.monotonic() + max(timeout, 0.0)
+        last_state = None
+        while True:
+            last_state = driver.execute_script(
+                r"""
+                const selection = (arguments[0] || '').toLowerCase().trim();
+                const lineStr = (arguments[1] || '').toLowerCase().replace(',', '.').trim();
+                const labelText = (arguments[2] || '').toLowerCase().trim();
+                const marketTexts = (arguments[3] || []).map((value) => (value || '').toLowerCase().trim());
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
+                }
+                function txt(el) {
+                    return ((el.innerText || el.textContent || '')).trim();
+                }
+                function normalize(value) {
+                    return (value || '').toLowerCase().replace(/\s+/g, ' ').replace(/,/g, '.').trim();
+                }
+                const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea";
+                const rightPanels = Array.from(document.querySelectorAll('aside, section, div, form'))
+                    .filter(visible)
+                    .map((el) => ({
+                        el,
+                        rect: el.getBoundingClientRect(),
+                        text: txt(el),
+                    }))
+                    .filter((item) => item.rect.x > window.innerWidth * 0.58)
+                    .filter((item) => item.rect.width > 160 && item.rect.height > 110)
+                    .sort((a, b) => a.rect.x - b.rect.x || b.rect.height - a.rect.height);
+
+                const panelStates = rightPanels.map((item) => {
+                    const normalizedText = normalize(item.text);
+                    const inputs = Array.from(item.el.querySelectorAll(selector)).filter(visible);
+                    const buttons = Array.from(item.el.querySelectorAll("button, [role='button'], input[type='submit']"))
+                        .filter(visible)
+                        .map((el) => normalize(txt(el) || el.value || ''));
+                    const empty = normalizedText.includes('you have no bets on this market')
+                        || normalizedText.includes('click on the odds to add selections to the betslip')
+                        || normalizedText.includes('no bets on this market');
+                    const hasActionButton = buttons.some((text) => text === 'confirm bet' || text === 'confirm bets'
+                        || text === 'place bet' || text === 'place bets'
+                        || text.startsWith('confirm bet') || text.startsWith('place bet'));
+                    const hasSelectionText = (!!labelText && normalizedText.includes(labelText))
+                        || (!!selection && !!lineStr && normalizedText.includes(selection) && normalizedText.includes(lineStr))
+                        || marketTexts.some((marketText) => marketText && normalizedText.includes(normalize(marketText)));
+                    const betslipLike = normalizedText.includes('place bets')
+                        || normalizedText.includes('open bets')
+                        || normalizedText.includes('betslip')
+                        || hasActionButton
+                        || inputs.length > 0;
+                    return {
+                        ready: (inputs.length > 0 || hasActionButton) && !empty,
+                        empty,
+                        betslipLike,
+                        hasSelectionText,
+                        hasActionButton,
+                        inputCount: inputs.length,
+                        buttonTexts: buttons.slice(0, 6),
+                        panelText: item.text.replace(/\s+/g, ' ').slice(0, 280),
+                        x: Math.round(item.rect.x),
+                        y: Math.round(item.rect.y),
+                        w: Math.round(item.rect.width),
+                        h: Math.round(item.rect.height),
+                    };
+                });
+
+                panelStates.sort((a, b) => {
+                    const aReady = a.ready ? 0 : 1;
+                    const bReady = b.ready ? 0 : 1;
+                    return aReady - bReady
+                        || (b.inputCount - a.inputCount)
+                        || ((b.hasActionButton ? 1 : 0) - (a.hasActionButton ? 1 : 0))
+                        || ((b.hasSelectionText ? 1 : 0) - (a.hasSelectionText ? 1 : 0))
+                        || ((b.betslipLike ? 1 : 0) - (a.betslipLike ? 1 : 0));
+                });
+
+                if (panelStates.length > 0) return panelStates[0];
+                return {
+                    ready: false,
+                    empty: false,
+                    betslipLike: false,
+                    hasSelectionText: false,
+                    hasActionButton: false,
+                    inputCount: 0,
+                    buttonTexts: [],
+                    panelText: '',
+                };
+                """,
+                selection,
+                line_str,
+                label_text,
+                market_texts,
+            ) or {
+                "ready": False,
+                "empty": False,
+                "betslipLike": False,
+                "hasSelectionText": False,
+                "hasActionButton": False,
+                "inputCount": 0,
+                "buttonTexts": [],
+                "panelText": "",
+            }
+            if last_state.get("ready"):
+                return last_state
+            if time.monotonic() >= deadline:
+                return last_state
+            time.sleep(0.25)
+
     while time.time() < end:
         info = driver.execute_script(
             r"""
@@ -5521,21 +5635,51 @@ def _select_betfair_overunder_back(
                 return { cell, score, rect: cell.getBoundingClientRect(), priceText: txt(cell), bg, cls };
             }
             function clickCell(cell) {
-                const target = cell.closest?.("button, [role='button'], a") || cell;
-                target.scrollIntoView({ block: 'center', inline: 'center' });
-                const rect = target.getBoundingClientRect();
-                const x = rect.left + rect.width / 2;
-                const y = rect.top + rect.height / 2;
-                const liveTarget = document.elementFromPoint(x, y) || target;
-                for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                    const EventCtor = name.startsWith('pointer') ? (window.PointerEvent || MouseEvent) : MouseEvent;
-                    try {
-                        liveTarget.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
-                    } catch (e) {
-                        liveTarget.dispatchEvent(new MouseEvent(name.replace('pointer', 'mouse'), { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+                const targets = [];
+                const pushUnique = (element) => {
+                    if (!element || targets.includes(element) || !visible(element)) return;
+                    targets.push(element);
+                };
+                pushUnique(cell);
+                pushUnique(cell.closest?.("td, button, [role='button'], a, [role='link']"));
+                let parent = cell.parentElement;
+                for (let depth = 0; depth < 6 && parent; depth += 1, parent = parent.parentElement) {
+                    const marker = [
+                        parent.className && parent.className.toString ? parent.className.toString() : '',
+                        parent.getAttribute('role') || '',
+                        parent.getAttribute('data-test') || '',
+                        parent.getAttribute('data-testid') || '',
+                        parent.getAttribute('aria-label') || '',
+                        parent.getAttribute('title') || '',
+                    ].join(' ').toLowerCase();
+                    const tag = (parent.tagName || '').toLowerCase();
+                    if (tag === 'td' || tag === 'button' || tag === 'a' || /back|lay|price|runner|bet|selection|odds/.test(marker)) {
+                        pushUnique(parent);
                     }
                 }
-                try { target.click?.(); } catch (e) {}
+                const clickSummaries = [];
+                for (const target of targets.slice(0, 8)) {
+                    target.scrollIntoView({ block: 'center', inline: 'center' });
+                    const rect = target.getBoundingClientRect();
+                    const x = rect.left + rect.width / 2;
+                    const y = rect.top + rect.height / 2;
+                    const liveTarget = document.elementFromPoint(x, y) || target;
+                    for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                        const EventCtor = name.startsWith('pointer') ? (window.PointerEvent || MouseEvent) : MouseEvent;
+                        try {
+                            liveTarget.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
+                        } catch (e) {
+                            liveTarget.dispatchEvent(new MouseEvent(name.replace('pointer', 'mouse'), { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+                        }
+                    }
+                    try { target.click?.(); } catch (e) {}
+                    clickSummaries.push({
+                        tag: (target.tagName || '').toLowerCase(),
+                        text: txt(target).slice(0, 40),
+                        cls: (target.className && target.className.toString ? target.className.toString() : '').slice(0, 80),
+                    });
+                }
+                return clickSummaries;
             }
             function pickBackCell(cells) {
                 const scored = cells.map(scoreBackCell);
@@ -5582,8 +5726,8 @@ def _select_betfair_overunder_back(
                                 debug.push({ row: row.text.slice(0, 120), cells: cells.map((cell) => txt(cell)).slice(0, 6) });
                                 continue;
                             }
-                            clickCell(pick.cell);
-                            return { ok: true, priceText: pick.priceText, score: pick.score, bg: pick.bg, cls: pick.cls, method: 'legacy-market-card' };
+                            const clickTargets = clickCell(pick.cell);
+                            return { ok: true, priceText: pick.priceText, score: pick.score, bg: pick.bg, cls: pick.cls, method: 'legacy-market-card', clickTargets };
                         }
                     }
                 }
@@ -5647,8 +5791,8 @@ def _select_betfair_overunder_back(
             if (!pick) {
                 return { error: 'no Back cell could be identified', scored: scored.map((s) => ({ score: s.score, price: s.priceText, cls: s.cls })) };
             }
-            clickCell(pick.cell);
-            return { ok: true, priceText: pick.priceText, score: pick.score, bg: pick.bg, cls: pick.cls };
+            const clickTargets = clickCell(pick.cell);
+            return { ok: true, priceText: pick.priceText, score: pick.score, bg: pick.bg, cls: pick.cls, clickTargets };
             """,
             selection,
             line_str,
@@ -5658,7 +5802,15 @@ def _select_betfair_overunder_back(
             market_key,
         )
         if info and info.get("ok"):
-            break
+            betslip_state = read_betfair_betslip_state(timeout=2.5)
+            if betslip_state.get("ready"):
+                info["betslipState"] = betslip_state
+                break
+            info = {
+                **info,
+                "error": "betslip did not open after odds click",
+                "betslipState": betslip_state,
+            }
         time.sleep(0.6)
 
     if not info or not info.get("ok"):
