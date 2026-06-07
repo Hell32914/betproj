@@ -5246,14 +5246,36 @@ def _follow_betfair_search_results(
                     || element.querySelector?.("a, button, [role='link'], [role='button']")
                     || element;
             };
+            const labelFrom = (element) => {
+                if (!element) return '';
+                const direct = (element.matches?.('a[href], button, [role="link"], [role="button"]') ? element : null);
+                const nested = element.querySelector?.('a[href], button, [role="link"], [role="button"]') || null;
+                const target = direct || nested || null;
+                const texts = [
+                    target ? (target.innerText || target.textContent || '') : '',
+                    element.getAttribute?.('aria-label') || '',
+                    element.getAttribute?.('title') || '',
+                    element.innerText || element.textContent || '',
+                ].map((value) => (value || '').trim()).filter(Boolean);
+                const preferred = texts.find((value) => /\bv\b|\bvs\b/i.test(value) && value.length <= 220)
+                    || texts.find((value) => value.length <= 140)
+                    || texts[0]
+                    || '';
+                return preferred.replace(/\s+/g, ' ').trim();
+            };
             const all = Array.from(document.querySelectorAll(
                 "a, button, [role='link'], [role='button'], [role='option'], li, article, div"
             )).filter(visible);
             const scored = all.map((element) => {
                 const text = (element.innerText || element.textContent || '').trim();
+                const label = labelFrom(element);
                 const href = pickHref(element);
                 const n = norm(text);
-                const score = fuzzyAliasScore(n, teamNorms, oppNorms);
+                const labelNorm = norm(label);
+                const score = Math.max(
+                    fuzzyAliasScore(labelNorm, teamNorms, oppNorms),
+                    fuzzyAliasScore(n, teamNorms, oppNorms)
+                );
                 const rect = element.getBoundingClientRect();
                 // Match-page links on Betfair Exchange look like
                 // /exchange/plus/.../<slug>-betting-<id> — event IDs are 6+ digits.
@@ -5261,39 +5283,50 @@ def _follow_betfair_search_results(
                 const hrefLooksLikeMatch = /-betting-\d{6,}/i.test(href)
                     || /[?&]eventId=\d+/i.test(href);
                 // Text contains a ' v ' separator (e.g. 'Team A v Team B').
-                const hasVs = /\bv\b/i.test(text) || /\bvs\b/i.test(text);
+                const hasVs = /\bv\b/i.test(label || text) || /\bvs\b/i.test(label || text);
                 return {
                     el: element,
                     clickEl: pickClickTarget(element),
                     text,
+                    label,
                     n,
                     href,
                     score,
                     hrefLooksLikeMatch,
                     hasVs,
                     interestingText: hasInterestingText(text),
+                    interestingLabel: hasInterestingText(label),
                     area: rect.width * rect.height,
+                    central: rect.x > 80 && rect.right < window.innerWidth * 0.92 && rect.y > 70,
                 };
             });
             // Primary: match-shaped href AND positive fuzzy score.
-            let cands = scored.filter((it) => it.text && it.text.length < 220)
-                .filter((it) => it.area > 0 && it.area < window.innerWidth * window.innerHeight * 0.85)
-                .filter((it) => it.hrefLooksLikeMatch || it.hasVs || it.interestingText)
+            let cands = scored.filter((it) => (it.label || it.text))
+                .filter((it) => (it.label || '').length < 220 || it.hrefLooksLikeMatch)
+                .filter((it) => it.area > 0 && it.area < window.innerWidth * window.innerHeight * 0.92)
+                .filter((it) => it.central || it.hrefLooksLikeMatch)
+                .filter((it) => it.hrefLooksLikeMatch || it.hasVs || it.interestingLabel || it.interestingText)
                 .filter((it) => it.score > 0);
             // Fallback: positive score AND text contains ' v ' separator.
             if (cands.length === 0) {
-                cands = scored.filter((it) => it.text && it.text.length < 220)
+                cands = scored.filter((it) => (it.label || it.text))
+                    .filter((it) => (it.label || '').length < 260 || it.hrefLooksLikeMatch)
+                    .filter((it) => it.central || it.hrefLooksLikeMatch)
                     .filter((it) => it.score > 0 && (it.hasVs || it.hrefLooksLikeMatch));
             }
             if (cands.length === 0) {
                 // Return debug snapshot for the caller to log.
+                const debugPool = scored
+                    .filter((it) => it.central || it.hrefLooksLikeMatch)
+                    .sort((a, b) => b.score - a.score || a.area - b.area)
+                    .slice(0, 12);
                 return {
                     error: 'no candidate',
-                    hrefSample: scored.slice(0, 10).map((s) => s.href).filter((h) => h),
-                    textSample: scored.slice(0, 10).map((s) => s.text.slice(0, 60)).filter((t) => t),
+                    hrefSample: debugPool.map((s) => s.href).filter((h) => h),
+                    textSample: debugPool.map((s) => (s.label || s.text).slice(0, 100)).filter((t) => t),
                 };
             }
-            cands.sort((a, b) => b.score - a.score || (a.hrefLooksLikeMatch === b.hrefLooksLikeMatch ? 0 : (a.hrefLooksLikeMatch ? -1 : 1)) || a.text.length - b.text.length || a.area - b.area);
+            cands.sort((a, b) => b.score - a.score || (a.hrefLooksLikeMatch === b.hrefLooksLikeMatch ? 0 : (a.hrefLooksLikeMatch ? -1 : 1)) || (a.label || a.text).length - (b.label || b.text).length || a.area - b.area);
             const pick = cands[0];
             try { pick.clickEl.scrollIntoView({ block: 'center' }); } catch (e) {}
             let clicked = false;
@@ -5322,7 +5355,7 @@ def _follow_betfair_search_results(
                     }
                 } catch (e) {}
             }
-            return { ok: true, text: (pick.text || pick.href).slice(0, 200), href: pick.href };
+            return { ok: true, text: (pick.label || pick.text || pick.href).slice(0, 200), href: pick.href };
             """,
             team_norms,
             opponent_norms,
