@@ -2761,16 +2761,12 @@ def _open_black_live_match(
     def match_opened(browser: webdriver.Remote) -> bool:
         return _black_match_context_matches(browser, team_name, opponent_name)
 
-    candidate = _find_black_live_match_candidate(
-        driver, team_variants, opponent_variants, team_name, opponent_name
-    )
-
     click_attempts = [
-        ("native", lambda: candidate.click()),
-        ("actions", lambda: ActionChains(driver).move_to_element(candidate).pause(0.1).click(candidate).perform()),
+        ("native", lambda candidate: candidate.click()),
+        ("actions", lambda candidate: ActionChains(driver).move_to_element(candidate).pause(0.1).click(candidate).perform()),
         (
             "js-center",
-            lambda: driver.execute_script(
+            lambda candidate: driver.execute_script(
                 """
                 const element = arguments[0];
                 const target = element.closest('button,a,[role="button"],li') || element;
@@ -2788,13 +2784,16 @@ def _open_black_live_match(
                 candidate,
             ),
         ),
-        ("enter", lambda: candidate.send_keys(Keys.ENTER)),
+        ("enter", lambda candidate: candidate.send_keys(Keys.ENTER)),
     ]
 
     for attempt_name, attempt in click_attempts:
         try:
+            candidate = _find_black_live_match_candidate(
+                driver, team_variants, opponent_variants, team_name, opponent_name
+            )
             before_url = driver.current_url or ""
-            attempt()
+            attempt(candidate)
             open_reason = WebDriverWait(driver, 6).until(lambda browser: (
                 "context" if match_opened(browser)
                 else "url" if (browser.current_url or "") != before_url and _black_current_match_page_open(browser)
@@ -3115,7 +3114,9 @@ def _select_black_asian_total_goals(
                 .filter((item) => marketHeaders.includes(item.text))
                 .sort((a, b) => a.rect.y - b.rect.y);
             const containers = [];
-            for (const header of headers) {
+            for (let index = 0; index < headers.length; index += 1) {
+                const header = headers[index];
+                const nextHeader = headers[index + 1] || null;
                 let current = header.element;
                 for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
                     if (!current || !isVisible(current)) continue;
@@ -3125,12 +3126,16 @@ def _select_black_asian_total_goals(
                         .map(buildRowCandidate)
                         .filter(Boolean)
                         .filter((item) => item.rect.y >= header.rect.bottom - 8);
-                    if (!rows.length) continue;
+                        
+                    const boundedRows = nextHeader
+                        ? rows.filter((item) => item.rect.y < nextHeader.rect.top - 8)
+                        : rows;
+                    if (!boundedRows.length) continue;
                     containers.push({
                         element: current,
                         rect,
                         headerText: header.text,
-                        rows,
+                        rows: boundedRows,
                     });
                     break;
                 }
