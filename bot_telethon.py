@@ -204,7 +204,8 @@ async def handle_signal(state: RuntimeState, text: str) -> None:
 
     print(
         f"[SIGNAL] {signal.teams or 'unknown match'} | {signal.market} | "
-        f"{signal.selection_label} | odds {signal.odds} | expiry {signal.expiry}",
+        f"{signal.selection_label} | odds {signal.odds} | expiry {signal.expiry}"
+        f"{f' | matched £{signal.matched_amount}' if signal.matched_amount is not None else ''}",
         flush=True,
     )
     await state.ready.wait()

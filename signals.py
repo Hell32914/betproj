@@ -19,6 +19,7 @@ class BettingSignal:
     teams: str | None = None
     timer_minute: int | None = None
     score: str | None = None
+    matched_amount: Decimal | None = None
 
     @property
     def selection_label(self) -> str:
@@ -43,6 +44,10 @@ class BettingSignal:
             return None
         return re.sub(r"[`*_~]+", "", parts[1]).strip() or None
 
+    @property
+    def has_exchange_match(self) -> bool:
+        return self.matched_amount is not None
+
 
 ODDS_RE = re.compile(
     r"Odds:\s*(?P<odds>\d+(?:[.,]\d+)?)\s+"
@@ -52,6 +57,7 @@ ODDS_RE = re.compile(
 )
 TIMER_RE = re.compile(r"Timer:\s*(?P<minute>\d+)'")
 GOALS_RE = re.compile(r"Goals:\s*(?P<home>\d+)\s*-\s*(?P<away>\d+)")
+MATCHED_RE = re.compile(r"Matched\*\*:\s*[£$€]?(?P<amount>\d[\d,]*(?:[.]\d+)?)", re.IGNORECASE)
 RANKING_RE = re.compile(r"\s*\([^)]*\bvs\b[^)]*\)", re.IGNORECASE)
 
 KNOWN_COUNTRIES = [
@@ -127,6 +133,7 @@ def parse_betting_signal(text: str) -> BettingSignal | None:
 
     timer_match = TIMER_RE.search(text)
     goals_match = GOALS_RE.search(text)
+    matched_match = MATCHED_RE.search(text)
 
     market = _detect_market(odds_match.group("title") or "")
 
@@ -143,4 +150,5 @@ def parse_betting_signal(text: str) -> BettingSignal | None:
         teams=teams,
         timer_minute=int(timer_match.group("minute")) if timer_match else None,
         score=f"{goals_match.group('home')}-{goals_match.group('away')}" if goals_match else None,
+        matched_amount=Decimal(matched_match.group("amount").replace(",", "")) if matched_match else None,
     )

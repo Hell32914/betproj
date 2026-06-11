@@ -3999,11 +3999,49 @@ def place_black_bet(session: dict, signal) -> dict:
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
             pass
-        print(f"[{profile_label}] Searching Black by normalized first team: {team_name}")
-        _open_black_search(driver, profile_label)
-        used_query = _search_black_live_events(driver, team_name, profile_label, [opponent_name])
-        print(f"[{profile_label}] Using Black search query: {used_query}")
-        _open_black_live_match(driver, team_name, opponent_name, profile_label)
+        has_exchange_match = bool(getattr(signal, "has_exchange_match", False))
+        if has_exchange_match:
+            matched_amount = getattr(signal, "matched_amount", None)
+            print(
+                f"[{profile_label}] Signal has exchange matched volume"
+                f"{f' £{matched_amount}' if matched_amount is not None else ''}; using extended match search.",
+                flush=True,
+            )
+
+        search_attempt_teams = [team_name]
+        if has_exchange_match and opponent_name:
+            search_attempt_teams.append(opponent_name)
+
+        open_match_error = None
+        for attempt_index, search_team in enumerate(search_attempt_teams, start=1):
+            if attempt_index > 1:
+                driver.get(BLACK_SPORTSBOOK_URL)
+                _wait_document_ready(driver)
+                time.sleep(2)
+                try:
+                    driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                except Exception:
+                    pass
+            print(f"[{profile_label}] Searching Black by normalized team: {search_team}")
+            _open_black_search(driver, profile_label)
+            alternate_names = [name for name in (team_name, opponent_name) if name and name != search_team]
+            used_query = _search_black_live_events(driver, search_team, profile_label, alternate_names)
+            print(f"[{profile_label}] Using Black search query: {used_query}")
+            try:
+                _open_black_live_match(driver, team_name, opponent_name, profile_label)
+                open_match_error = None
+                break
+            except Exception as exc:
+                open_match_error = exc
+                if not has_exchange_match or attempt_index >= len(search_attempt_teams):
+                    raise
+                print(
+                    f"[{profile_label}] Black match search retry {attempt_index}/{len(search_attempt_teams)} failed: {exc}",
+                    flush=True,
+                )
+                _dismiss_black_search_dialog(driver, profile_label)
+        if open_match_error is not None:
+            raise open_match_error
         if _black_search_dialog_open(driver):
             _dismiss_black_search_dialog(driver, profile_label)
         if _black_search_dialog_open(driver):
