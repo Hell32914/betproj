@@ -5662,6 +5662,97 @@ def _select_betfair_overunder_back(
         except Exception:
             return {"clicked": False}
 
+    def _click_betfair_action_button(confirm_only: bool = False) -> dict:
+        """Click Place/Confirm inside the active betslip coupon, not a global nav tab."""
+        try:
+            result = driver.execute_script(
+                r"""
+                const confirmOnly = !!arguments[0];
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
+                }
+                function norm(text) {
+                    return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                }
+                function txt(el) {
+                    return norm(el.innerText || el.textContent || el.value || '');
+                }
+                function isActionText(t) {
+                    if (!t) return false;
+                    if (confirmOnly) return t === 'confirm bet' || t === 'confirm bets' || t.startsWith('confirm bet');
+                    return t === 'confirm bet' || t === 'confirm bets'
+                        || t === 'place bet' || t === 'place bets'
+                        || t.startsWith('confirm bet') || t.startsWith('place bet');
+                }
+                const panels = Array.from(document.querySelectorAll('aside, section, div, form'))
+                    .filter(visible)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const text = txt(el);
+                        const inputs = Array.from(el.querySelectorAll("input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea")).filter(visible);
+                        const buttons = Array.from(el.querySelectorAll("button, [role='button'], input[type='submit'], input[type='button']")).filter(visible)
+                            .map((b) => ({ el: b, text: txt(b), rect: b.getBoundingClientRect() }));
+                        const hasCancel = buttons.some((b) => b.text === 'cancel' || b.text.startsWith('cancel'));
+                        const actionButtons = buttons.filter((b) => isActionText(b.text));
+                        return {
+                            el,
+                            rect,
+                            text,
+                            inputs,
+                            hasCancel,
+                            actionButtons,
+                            score: (rect.x > window.innerWidth * 0.55 ? 3 : 0)
+                                + (rect.y > window.innerHeight * 0.35 ? 2 : 0)
+                                + (inputs.length > 0 ? 2 : 0)
+                                + (hasCancel ? 2 : 0)
+                                + (actionButtons.length > 0 ? 6 : 0),
+                        };
+                    })
+                    .filter((p) => p.rect.width > 150 && p.rect.height > 90)
+                    .filter((p) => p.actionButtons.length > 0)
+                    .sort((a, b) => b.score - a.score || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+                if (!panels.length) {
+                    return { error: confirmOnly ? 'confirm bet button not found' : 'confirm/place button not found' };
+                }
+                const panel = panels[0];
+                panel.actionButtons.sort((a, b) => {
+                    const aPlace = a.text.includes('place') ? 0 : 1;
+                    const bPlace = b.text.includes('place') ? 0 : 1;
+                    return aPlace - bPlace || b.rect.y - a.rect.y || b.rect.x - a.rect.x;
+                });
+                const btn = panel.actionButtons[0].el;
+                btn.scrollIntoView({ block: 'center', inline: 'center' });
+                const r = btn.getBoundingClientRect();
+                const x = r.left + r.width / 2;
+                const y = r.top + r.height / 2;
+                const liveTarget = document.elementFromPoint(x, y) || btn;
+                for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    const EventCtor = name.startsWith('pointer') ? (window.PointerEvent || MouseEvent) : MouseEvent;
+                    try {
+                        liveTarget.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
+                    } catch (e) {
+                        liveTarget.dispatchEvent(new MouseEvent(name.replace('pointer', 'mouse'), { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+                    }
+                }
+                try { btn.click(); } catch (e) {}
+                return {
+                    ok: true,
+                    label: (btn.innerText || btn.value || '').trim(),
+                    panelText: panel.text.slice(0, 180),
+                    hasCancel: panel.hasCancel,
+                    inputCount: panel.inputs.length,
+                };
+                """,
+                confirm_only,
+            )
+            return result if isinstance(result, dict) else {"error": "action button click script returned invalid result"}
+        except Exception as exc:
+            return {"error": f"action button click failed: {exc}"}
+
     def read_betfair_betslip_state(timeout: float = 0.0) -> dict:
         deadline = time.monotonic() + max(timeout, 0.0)
         last_state = None
@@ -6110,6 +6201,10 @@ def _select_betfair_overunder_back(
                 function controlValue(el) {
                     if (!el) return '';
                     if (typeof el.value === 'string') return el.value;
+                    if (el.getAttribute) {
+                        const ariaText = el.getAttribute('aria-valuetext') || el.getAttribute('aria-valuenow') || '';
+                        if (ariaText) return ariaText;
+                    }
                     return (el.textContent || el.innerText || '').trim();
                 }
                 function normalizeNumeric(value) {
@@ -6146,7 +6241,7 @@ def _select_betfair_overunder_back(
                 // their attributes — try several strategies in order of confidence.
                 let inp = null;
                 let oddsInp = null;
-                const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea";
+                const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton'], [tabindex]";
                 const allInputs = Array.from(document.querySelectorAll(selector)).filter(visible);
                 inp = allInputs.find((el) => {
                     const ph = (el.getAttribute('placeholder') || '').toLowerCase();
@@ -6154,9 +6249,10 @@ def _select_betfair_overunder_back(
                     const id = (el.getAttribute('id') || '').toLowerCase();
                     const cls = (el.className && el.className.toString ? el.className.toString().toLowerCase() : '');
                     const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                    const parent = ((el.parentElement && (el.parentElement.innerText || el.parentElement.textContent)) || '').toLowerCase();
                     return ph.indexOf('stake') !== -1 || nm.indexOf('stake') !== -1
                         || id.indexOf('stake') !== -1 || cls.indexOf('stake') !== -1
-                        || aria.indexOf('stake') !== -1;
+                        || aria.indexOf('stake') !== -1 || parent.indexOf('stake') !== -1;
                 }) || null;
                 if (!inp) {
                     const containers = Array.from(document.querySelectorAll(
@@ -6195,7 +6291,11 @@ def _select_betfair_overunder_back(
                     inputTypes: allInputs.map((e) => (e.getAttribute('type') || e.tagName || '').toLowerCase()).slice(0, 8),
                 };
                 const oddsResult = setNumericControl(oddsInp, oddsVal, { allowLeadingZero: false });
-                const stakeResult = setNumericControl(inp, stakeVal, { allowLeadingZero: true });
+                const stakeBefore = controlValue(inp);
+                let stakeResult = { ok: true, value: stakeBefore, used: 'existing' };
+                if (!sameNumericValue(stakeBefore, stakeVal)) {
+                    stakeResult = setNumericControl(inp, stakeVal, { allowLeadingZero: true });
+                }
                 const normalized = (value) => (value || '').trim().replace(',', '.');
                 const actualOdds = Number(normalized(controlValue(oddsInp)));
                 const targetOdds = Number(normalized(oddsVal));
@@ -6210,12 +6310,19 @@ def _select_betfair_overunder_back(
                 if (!sameNumericValue(controlValue(inp), stakeVal)) {
                     return {
                         error: 'stake input did not keep target value',
+                        stakeBefore,
                         stakeValue: controlValue(inp),
                         targetStake: stakeVal,
                         stakeAttempt: stakeResult,
                     };
                 }
-                return { stakeSet: true, oddsSet: true, oddsValue: controlValue(oddsInp), stakeValue: controlValue(inp) };
+                return {
+                    stakeSet: true,
+                    oddsSet: true,
+                    oddsValue: controlValue(oddsInp),
+                    stakeValue: controlValue(inp),
+                    stakeBefore,
+                };
                 """,
                 stake_str,
                 target_odds,
@@ -6237,30 +6344,7 @@ def _select_betfair_overunder_back(
             accepted_odds_text = str(placed.get("oddsValue") or target_odds)
             # Wait for Betfair UI to update button label to "Confirm bet".
             time.sleep(1.2)
-            confirmed = driver.execute_script(
-                r"""
-                function visible(el) {
-                    if (!el) return false;
-                    const r = el.getBoundingClientRect();
-                    if (r.width === 0 || r.height === 0) return false;
-                    const cs = window.getComputedStyle(el);
-                    return cs.visibility !== 'hidden' && cs.display !== 'none';
-                }
-                const btns = Array.from(document.querySelectorAll(
-                    "button, [role='button'], input[type='submit']"
-                )).filter(visible).filter((el) => {
-                    const t = (el.innerText || el.value || '').trim().toLowerCase();
-                    return t === 'confirm bet' || t === 'confirm bets'
-                        || t === 'place bet' || t === 'place bets'
-                        || t.startsWith('confirm bet') || t.startsWith('place bet');
-                });
-                if (btns.length === 0) return { error: 'confirm/place button not found' };
-                const btn = btns[0];
-                btn.scrollIntoView({ block: 'center' });
-                btn.click();
-                return { ok: true, label: (btn.innerText || btn.value || '').trim() };
-                """
-            )
+            confirmed = _click_betfair_action_button(confirm_only=False)
             if isinstance(confirmed, dict) and confirmed.get("ok"):
                 first_label = confirmed.get("label", "")
                 print(
@@ -6272,29 +6356,7 @@ def _select_betfair_overunder_back(
                 # second "Confirm bet" button. Wait and click it.
                 if "place" in first_label.lower():
                     time.sleep(1.2)
-                    confirmed2 = driver.execute_script(
-                        r"""
-                        function visible(el) {
-                            if (!el) return false;
-                            const r = el.getBoundingClientRect();
-                            if (r.width === 0 || r.height === 0) return false;
-                            const cs = window.getComputedStyle(el);
-                            return cs.visibility !== 'hidden' && cs.display !== 'none';
-                        }
-                        const btns = Array.from(document.querySelectorAll(
-                            "button, [role='button'], input[type='submit']"
-                        )).filter(visible).filter((el) => {
-                            const t = (el.innerText || el.value || '').trim().toLowerCase();
-                            return t === 'confirm bet' || t === 'confirm bets'
-                                || t.startsWith('confirm bet');
-                        });
-                        if (btns.length === 0) return { error: 'confirm bet button not found' };
-                        const btn = btns[0];
-                        btn.scrollIntoView({ block: 'center' });
-                        btn.click();
-                        return { ok: true, label: (btn.innerText || btn.value || '').trim() };
-                        """
-                    )
+                    confirmed2 = _click_betfair_action_button(confirm_only=True)
                     if isinstance(confirmed2, dict) and confirmed2.get("ok"):
                         print(
                             f"[{profile_label}] Betfair: confirmed — "
@@ -6376,8 +6438,7 @@ def _read_betfair_balance(driver: webdriver.Remote, profile_label: str) -> Decim
     m = re.search(r"[€£$]\s*([\d.,]+)", text)
     if not m:
         raise RuntimeError(f"[{profile_label}] Betfair balance text has no amount: {text!r}")
-    amount = m.group(1).replace(",", "")
-    return Decimal(amount)
+    return _money_to_decimal(m.group(1))
 
 
 def _open_betfair_settings_panel(driver: webdriver.Remote, profile_label: str) -> None:
