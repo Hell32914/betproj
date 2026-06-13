@@ -4735,6 +4735,78 @@ def _is_betfair_logged_in(driver: webdriver.Remote) -> bool:
         return False
 
 
+def _dismiss_betfair_blocking_overlays(driver: webdriver.Remote, profile_label: str) -> dict:
+    """Best-effort dismissal for Betfair dialogs that block search or betslip input.
+
+    In practice the most damaging one is the visible "Session Expired" modal,
+    which leaves the page looking alive while intercepting all actions.
+    """
+    try:
+        result = driver.execute_script(
+            r"""
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            function normalized(text) {
+                return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            }
+            const keywords = [
+                'session expired', 'you have been logged out', 'logged out',
+                'session has expired', 'your session has expired'
+            ];
+            const buttonKeywords = ['ok', 'okay', 'close', 'dismiss', 'log in', 'login'];
+            const roots = Array.from(document.querySelectorAll("dialog, [role='dialog'], [aria-modal='true'], div, section, aside"))
+                .filter(visible)
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const text = normalized(el.innerText || el.textContent || '');
+                    const style = window.getComputedStyle(el);
+                    const z = Number(style.zIndex || 0) || 0;
+                    const fixedLike = style.position === 'fixed' || style.position === 'sticky';
+                    return { el, rect, text, z, fixedLike };
+                })
+                .filter((item) => item.text)
+                .filter((item) => keywords.some((kw) => item.text.includes(kw)))
+                .filter((item) => item.fixedLike || item.z >= 100 || (item.rect.width >= 240 && item.rect.height >= 80));
+            if (!roots.length) return { found: false };
+            roots.sort((a, b) => b.z - a.z || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+            const root = roots[0];
+            const buttons = Array.from(root.el.querySelectorAll("button, [role='button'], input[type='submit'], input[type='button']"))
+                .filter(visible)
+                .map((el) => ({
+                    el,
+                    text: normalized(el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || ''),
+                }));
+            const pick = buttons.find((item) => buttonKeywords.some((kw) => item.text === kw || item.text.startsWith(kw))) || buttons[0] || null;
+            if (pick && pick.el) {
+                pick.el.scrollIntoView({ block: 'center', inline: 'center' });
+                try { pick.el.click(); } catch (e) {}
+            }
+            return {
+                found: true,
+                text: root.text.slice(0, 220),
+                clicked: pick ? pick.text : null,
+                requiresLogin: root.text.includes('expired') || root.text.includes('logged out'),
+            };
+            """
+        ) or {"found": False}
+    except Exception:
+        return {"found": False}
+
+    if result.get("found"):
+        print(
+            f"[{profile_label}] Dismissed Betfair blocking dialog: "
+            f"{result.get('clicked') or 'no-button'} | {result.get('text')}",
+            flush=True,
+        )
+        time.sleep(0.5)
+    return result
+
+
 def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
     """Log into betfair.com/exchange/plus/ using the top-bar form.
 
@@ -4807,6 +4879,7 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
         print(f"[{profile_label}] Navigating to Betfair: {BETFAIR_LOGIN_URL}")
         driver.get(BETFAIR_LOGIN_URL)
     wait_ready()
+    _dismiss_betfair_blocking_overlays(driver, profile_label)
 
     if _is_betfair_logged_in(driver):
         print(f"[{profile_label}] Betfair already logged in; skipping form fill.")
@@ -4822,6 +4895,7 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
             driver.get(BETFAIR_LOGIN_URL)
             wait_ready()
             time.sleep(1.0)
+            _dismiss_betfair_blocking_overlays(driver, profile_label)
             if _is_betfair_logged_in(driver):
                 print(f"[{profile_label}] Betfair already logged in after reopening Exchange home.")
                 return
@@ -4924,6 +4998,7 @@ def _find_betfair_search_input(driver: webdriver.Remote):
 def _ensure_betfair_search_input(driver: webdriver.Remote, profile_label: str):
     deadline = time.time() + 20
     while time.time() < deadline:
+        _dismiss_betfair_blocking_overlays(driver, profile_label)
         search_el = _find_betfair_search_input(driver)
         if search_el:
             return search_el
@@ -5063,6 +5138,8 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
         except Exception:
             pass
 
+    _dismiss_betfair_blocking_overlays(driver, profile_label)
+
     if not _is_betfair_logged_in(driver):
         print(f"[{profile_label}] Betfair session is not logged in before search; logging in again.")
         login_betfair(driver, profile_label)
@@ -5188,6 +5265,12 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                 )
             except Exception:
                 pass
+
+        overlay_state = _dismiss_betfair_blocking_overlays(driver, profile_label)
+        if overlay_state.get("requiresLogin"):
+            print(f"[{profile_label}] Betfair search for '{search_query}' hit an expired session dialog; logging in again.", flush=True)
+            login_betfair(driver, profile_label)
+            continue
 
         if not _is_betfair_logged_in(driver):
             print(
@@ -5921,6 +6004,7 @@ def _select_betfair_overunder_back(
     if stake_str:
         # Give the betslip panel time to render after clicking the Back cell.
         time.sleep(1.5)
+        _dismiss_betfair_blocking_overlays(driver, profile_label)
         placed = None
         fill_deadline = time.monotonic() + 8
         while True:
@@ -5954,10 +6038,50 @@ def _select_betfair_overunder_back(
                     inp.dispatchEvent(new Event('change', { bubbles: true }));
                     inp.dispatchEvent(new Event('blur', { bubbles: true }));
                 }
+                function clearControl(inp) {
+                    inp.focus();
+                    if (typeof inp.select === 'function') {
+                        try { inp.select(); } catch (e) {}
+                    }
+                    if (typeof inp.setSelectionRange === 'function') {
+                        try { inp.setSelectionRange(0, String(controlValue(inp) || '').length); } catch (e) {}
+                    }
+                    setInputValue(inp, '');
+                }
                 function controlValue(el) {
                     if (!el) return '';
                     if (typeof el.value === 'string') return el.value;
                     return (el.textContent || el.innerText || '').trim();
+                }
+                function normalizeNumeric(value) {
+                    return (value || '').toString().trim().replace(/\s+/g, '').replace(',', '.');
+                }
+                function sameNumericValue(actual, expected) {
+                    const a = normalizeNumeric(actual);
+                    const e = normalizeNumeric(expected);
+                    if (a === e) return true;
+                    const an = Number(a);
+                    const en = Number(e);
+                    return Number.isFinite(an) && Number.isFinite(en) && Math.abs(an - en) < 0.000001;
+                }
+                function setNumericControl(inp, value, options) {
+                    const attempts = [];
+                    const raw = (value || '').toString();
+                    attempts.push(raw);
+                    if (raw.includes('.')) attempts.push(raw.replace('.', ','));
+                    if (options && options.allowLeadingZero && /^[0][\.,]/.test(raw)) attempts.push(raw.replace(/^0([\.,])/, '$1'));
+                    const seen = new Set();
+                    for (const candidate of attempts) {
+                        if (!candidate || seen.has(candidate)) continue;
+                        seen.add(candidate);
+                        clearControl(inp);
+                        setInputValue(inp, candidate);
+                        const current = controlValue(inp);
+                        if (sameNumericValue(current, raw)) {
+                            return { ok: true, value: current, used: candidate };
+                        }
+                    }
+                    return { ok: false, value: controlValue(inp), tried: Array.from(seen) };
                 }
                 // Find the stake input. Betfair betslip inputs may not carry 'stake' in
                 // their attributes — try several strategies in order of confidence.
@@ -6011,16 +6135,26 @@ def _select_betfair_overunder_back(
                     inputValues: allInputs.map((e) => controlValue(e)).slice(0, 8),
                     inputTypes: allInputs.map((e) => (e.getAttribute('type') || e.tagName || '').toLowerCase()).slice(0, 8),
                 };
-                setInputValue(oddsInp, oddsVal);
-                setInputValue(inp, stakeVal);
+                const oddsResult = setNumericControl(oddsInp, oddsVal, { allowLeadingZero: false });
+                const stakeResult = setNumericControl(inp, stakeVal, { allowLeadingZero: true });
                 const normalized = (value) => (value || '').trim().replace(',', '.');
                 const actualOdds = Number(normalized(controlValue(oddsInp)));
                 const targetOdds = Number(normalized(oddsVal));
                 if (!Number.isFinite(actualOdds) || actualOdds + 1e-9 < targetOdds) {
-                    return { error: 'odds input below target value', oddsValue: controlValue(oddsInp), targetOdds: oddsVal };
+                    return {
+                        error: 'odds input below target value',
+                        oddsValue: controlValue(oddsInp),
+                        targetOdds: oddsVal,
+                        oddsAttempt: oddsResult,
+                    };
                 }
-                if (normalized(controlValue(inp)) !== normalized(stakeVal)) {
-                    return { error: 'stake input did not keep target value', stakeValue: controlValue(inp), targetStake: stakeVal };
+                if (!sameNumericValue(controlValue(inp), stakeVal)) {
+                    return {
+                        error: 'stake input did not keep target value',
+                        stakeValue: controlValue(inp),
+                        targetStake: stakeVal,
+                        stakeAttempt: stakeResult,
+                    };
                 }
                 return { stakeSet: true, oddsSet: true, oddsValue: controlValue(oddsInp), stakeValue: controlValue(inp) };
                 """,
