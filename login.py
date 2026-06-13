@@ -5611,6 +5611,57 @@ def _select_betfair_overunder_back(
     end = time.time() + 30
     info = None
 
+    def _activate_betfair_betslip() -> dict:
+        """Best-effort click on betslip controls (Place Bets / Edit) in classic UI."""
+        try:
+            result = driver.execute_script(
+                r"""
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
+                }
+                function norm(text) {
+                    return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                }
+                const labels = ['place bets', 'place bet', 'betslip', 'bet slip', 'edit'];
+                const controls = Array.from(document.querySelectorAll(
+                    "button, a, [role='button'], [role='tab'], [data-test], [data-testid], li, div, span"
+                ))
+                    .filter(visible)
+                    .map((el) => {
+                        const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+                        const marker = norm([
+                            el.getAttribute('data-test') || '',
+                            el.getAttribute('data-testid') || '',
+                            el.className && el.className.toString ? el.className.toString() : '',
+                            el.id || '',
+                            el.getAttribute('role') || '',
+                        ].join(' '));
+                        const rect = el.getBoundingClientRect();
+                        return { el, text, marker, rect };
+                    })
+                    .filter((item) => item.text || item.marker)
+                    .filter((item) => labels.some((label) => item.text === label || item.text.startsWith(label) || item.marker.includes(label)));
+                if (!controls.length) return { clicked: false };
+                controls.sort((a, b) => {
+                    const aScore = (a.rect.y > window.innerHeight * 0.62 ? 2 : 0) + (a.rect.x > window.innerWidth * 0.48 ? 1 : 0);
+                    const bScore = (b.rect.y > window.innerHeight * 0.62 ? 2 : 0) + (b.rect.x > window.innerWidth * 0.48 ? 1 : 0);
+                    return bScore - aScore || b.rect.width * b.rect.height - a.rect.width * a.rect.height;
+                });
+                const pick = controls[0];
+                const target = pick.el.closest("button, a, [role='button'], [role='tab']") || pick.el;
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+                try { target.click(); } catch (e) {}
+                return { clicked: true, label: pick.text || pick.marker, x: Math.round(pick.rect.x), y: Math.round(pick.rect.y) };
+                """
+            )
+            return result if isinstance(result, dict) else {"clicked": False}
+        except Exception:
+            return {"clicked": False}
+
     def read_betfair_betslip_state(timeout: float = 0.0) -> dict:
         deadline = time.monotonic() + max(timeout, 0.0)
         last_state = None
@@ -5965,10 +6016,18 @@ def _select_betfair_overunder_back(
             if betslip_state.get("ready"):
                 info["betslipState"] = betslip_state
                 break
+            activation = _activate_betfair_betslip()
+            if activation.get("clicked"):
+                time.sleep(0.35)
+                betslip_state = read_betfair_betslip_state(timeout=1.2)
+                if betslip_state.get("ready"):
+                    info["betslipState"] = betslip_state
+                    break
             info = {
                 **info,
                 "error": "betslip did not open after odds click",
                 "betslipState": betslip_state,
+                "betslipActivation": activation,
             }
         time.sleep(0.6)
 
@@ -6169,6 +6228,7 @@ def _select_betfair_overunder_back(
             )
             if not waiting_for_inputs:
                 break
+            _activate_betfair_betslip()
             time.sleep(0.6)
         if not (isinstance(placed, dict) and placed.get("stakeSet") and placed.get("oddsSet")):
             print(f"[{profile_label}] Betfair: stake fill result: {placed!r}", flush=True)
