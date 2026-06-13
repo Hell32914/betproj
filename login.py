@@ -2805,6 +2805,90 @@ def _open_black_live_match(
         except Exception:
             continue
 
+    # Some Black live-result rows are visible but not reliably clickable.
+    # In this case, resolve the best matching result href and navigate directly.
+    direct_href = driver.execute_script(
+        """
+        const teamVariants = arguments[0] || [];
+        const opponentVariants = arguments[1] || [];
+        const normalize = (value) => (value || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\\u0300-\\u036f]/g, '')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\\s+/g, ' ')
+            .trim();
+        const wordsFor = (variants) => Array.from(new Set(
+            variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))
+        ));
+        const teamWords = wordsFor(teamVariants);
+        const opponentWords = wordsFor(opponentVariants);
+        const isVisible = (element) => {
+            if (!element) return false;
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && rect.bottom > 0
+                && rect.right > 0
+                && rect.x < window.innerWidth
+                && rect.y < window.innerHeight;
+        };
+        const textOf = (element) => (element.innerText || element.textContent || '').trim();
+        const fuzzyHas = (text, word) => {
+            if (!word) return false;
+            if (text.includes(word)) return true;
+            for (const token of text.split(' ')) {
+                const prefix = Math.min(token.length, word.length, 4);
+                if (prefix >= 4 && token.slice(0, prefix) === word.slice(0, prefix)) return true;
+            }
+            return false;
+        };
+        const hasVariant = (text, variants) => variants.some((value) => {
+            const n = normalize(value);
+            return n && text.includes(n);
+        });
+        const scoreText = (text) => {
+            const n = normalize(text);
+            const teamHits = teamWords.filter((word) => fuzzyHas(n, word)).length;
+            const oppHits = opponentWords.filter((word) => fuzzyHas(n, word)).length;
+            let score = 0;
+            if (hasVariant(n, teamVariants)) score += 100;
+            if (hasVariant(n, opponentVariants)) score += 70;
+            score += teamHits * 30;
+            score += oppHits * 22;
+            if (/\b(v|vs)\b/.test(n)) score += 15;
+            return score;
+        };
+        const links = Array.from(document.querySelectorAll('a[href]'))
+            .filter(isVisible)
+            .map((el) => ({
+                el,
+                href: el.href || '',
+                text: textOf(el),
+                score: scoreText(textOf(el)),
+                rect: el.getBoundingClientRect(),
+            }))
+            .filter((item) => item.href && /\\/sportsbook\\/football\\//i.test(item.href))
+            .filter((item) => item.score >= 45)
+            .sort((a, b) => b.score - a.score || a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+        return links[0] ? links[0].href : null;
+        """,
+        team_variants,
+        opponent_variants,
+    )
+    if direct_href:
+        try:
+            driver.get(direct_href)
+            _wait_document_ready(driver)
+            if _black_match_context_matches(driver, team_name, opponent_name) or _black_current_match_page_open(driver):
+                print(f"[{profile_label}] Opened Black live match for: {team_name} via direct-url fallback.")
+                return
+        except Exception:
+            pass
+
     details = driver.execute_script(
         """
         const teamVariants = arguments[0];
@@ -6152,6 +6236,173 @@ def _select_betfair_overunder_back(
             last_betfair_error = str(exc)
 
     if stake_str:
+        def _normalize_numeric_text(value: str | None) -> str:
+            return (value or "").strip().replace(" ", "").replace(",", ".")
+
+        def _same_numeric_text(actual: str | None, expected: str | None) -> bool:
+            a = _normalize_numeric_text(actual)
+            e = _normalize_numeric_text(expected)
+            if a == e:
+                return True
+            try:
+                return abs(float(a) - float(e)) < 1e-6
+            except Exception:
+                return False
+
+        def _fallback_fill_betfair_inputs_via_send_keys() -> dict:
+            controls = driver.execute_script(
+                r"""
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
+                }
+                function norm(text) {
+                    return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                }
+                function val(el) {
+                    if (!el) return '';
+                    if (typeof el.value === 'string') return el.value;
+                    return (el.textContent || el.innerText || el.getAttribute('aria-valuetext') || '').trim();
+                }
+                const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton'], [tabindex]";
+                const panels = Array.from(document.querySelectorAll('aside, section, div, form'))
+                    .filter(visible)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const text = norm(el.innerText || el.textContent || '');
+                        const inputs = Array.from(el.querySelectorAll(selector)).filter(visible);
+                        const hasCancel = Array.from(el.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']"))
+                            .filter(visible)
+                            .some((b) => norm(b.innerText || b.value || '').includes('cancel'));
+                        return { el, rect, text, inputs, hasCancel };
+                    })
+                    .filter((p) => p.rect.x > window.innerWidth * 0.52)
+                    .filter((p) => p.rect.width > 160 && p.rect.height > 110)
+                    .filter((p) => p.inputs.length > 0)
+                    .sort((a, b) => {
+                        const aScore = (a.hasCancel ? 3 : 0) + (a.text.includes('bet') ? 2 : 0) + a.inputs.length;
+                        const bScore = (b.hasCancel ? 3 : 0) + (b.text.includes('bet') ? 2 : 0) + b.inputs.length;
+                        return bScore - aScore || b.rect.y - a.rect.y;
+                    });
+                if (!panels.length) return { ok: false, reason: 'betslip controls panel not found' };
+                const panel = panels[0];
+                const inputs = panel.inputs;
+                let stakeInput = inputs.find((el) => {
+                    const hint = norm([
+                        el.getAttribute('placeholder') || '',
+                        el.getAttribute('name') || '',
+                        el.getAttribute('id') || '',
+                        el.getAttribute('aria-label') || '',
+                        el.className && el.className.toString ? el.className.toString() : '',
+                        el.parentElement ? (el.parentElement.innerText || el.parentElement.textContent || '') : '',
+                    ].join(' '));
+                    return hint.includes('stake');
+                }) || null;
+                let oddsInput = inputs.find((el) => {
+                    if (el === stakeInput) return false;
+                    const hint = norm([
+                        el.getAttribute('placeholder') || '',
+                        el.getAttribute('name') || '',
+                        el.getAttribute('id') || '',
+                        el.getAttribute('aria-label') || '',
+                        el.className && el.className.toString ? el.className.toString() : '',
+                        el.parentElement ? (el.parentElement.innerText || el.parentElement.textContent || '') : '',
+                    ].join(' '));
+                    return hint.includes('odds') || hint.includes('price');
+                }) || null;
+                if (!stakeInput || !oddsInput) {
+                    const numeric = inputs.filter((el) => /^\d+(?:[\.,]\d+)?$/.test((val(el) || '').trim()));
+                    if (!oddsInput) oddsInput = numeric[0] || inputs[0] || null;
+                    if (!stakeInput) stakeInput = numeric.find((el) => el !== oddsInput) || inputs.find((el) => el !== oddsInput) || null;
+                }
+                if (!stakeInput || !oddsInput) {
+                    return {
+                        ok: false,
+                        reason: 'stake/odds controls unresolved',
+                        inputCount: inputs.length,
+                        values: inputs.map((el) => val(el)).slice(0, 8),
+                    };
+                }
+                return {
+                    ok: true,
+                    stakeInput,
+                    oddsInput,
+                    stakeBefore: val(stakeInput),
+                    oddsBefore: val(oddsInput),
+                };
+                """
+            )
+            if not isinstance(controls, dict) or not controls.get("ok"):
+                return {"ok": False, "error": f"controls not found: {controls!r}"}
+
+            stake_input = controls.get("stakeInput")
+            odds_input = controls.get("oddsInput")
+            if not stake_input or not odds_input:
+                return {"ok": False, "error": f"controls unresolved: {controls!r}"}
+
+            def send_value(element, target_value: str, allow_leading_dot: bool = False) -> str:
+                attempts = [target_value]
+                if "." in target_value:
+                    attempts.append(target_value.replace(".", ","))
+                if allow_leading_dot and target_value.startswith("0."):
+                    attempts.append(target_value[1:])
+                    attempts.append(target_value.replace("0.", "0,"))
+                seen: set[str] = set()
+                for candidate in attempts:
+                    if not candidate or candidate in seen:
+                        continue
+                    seen.add(candidate)
+                    try:
+                        element.click()
+                    except Exception:
+                        pass
+                    try:
+                        element.send_keys(Keys.CONTROL, "a")
+                        element.send_keys(Keys.DELETE)
+                    except Exception:
+                        pass
+                    try:
+                        element.send_keys(candidate)
+                    except Exception:
+                        _set_input_value(driver, element, candidate)
+                    try:
+                        element.send_keys(Keys.TAB)
+                    except Exception:
+                        pass
+                    time.sleep(0.15)
+                    current = _control_value(driver, element)
+                    if _same_numeric_text(current, target_value):
+                        return current
+                return _control_value(driver, element)
+
+            odds_after = send_value(odds_input, target_odds, allow_leading_dot=False)
+            stake_after = controls.get("stakeBefore") or ""
+            if not _same_numeric_text(stake_after, stake_str):
+                stake_after = send_value(stake_input, stake_str, allow_leading_dot=True)
+
+            if not _same_numeric_text(odds_after, target_odds):
+                return {
+                    "ok": False,
+                    "error": "fallback odds mismatch",
+                    "oddsAfter": odds_after,
+                    "targetOdds": target_odds,
+                }
+            if not _same_numeric_text(stake_after, stake_str):
+                return {
+                    "ok": False,
+                    "error": "fallback stake mismatch",
+                    "stakeAfter": stake_after,
+                    "targetStake": stake_str,
+                }
+            return {
+                "ok": True,
+                "oddsValue": odds_after,
+                "stakeValue": stake_after,
+            }
+
         # Give the betslip panel time to render after clicking the Back cell.
         time.sleep(1.5)
         _dismiss_betfair_blocking_overlays(driver, profile_label)
@@ -6337,6 +6588,31 @@ def _select_betfair_overunder_back(
                 break
             _activate_betfair_betslip()
             time.sleep(0.6)
+        needs_fallback_fill = (
+            not (isinstance(placed, dict) and placed.get("stakeSet") and placed.get("oddsSet"))
+            and isinstance(placed, dict)
+            and placed.get("error") in {
+                "stake input did not keep target value",
+                "stake input not found",
+                "odds input not found",
+            }
+        )
+        if needs_fallback_fill:
+            fallback_fill = _fallback_fill_betfair_inputs_via_send_keys()
+            if fallback_fill.get("ok"):
+                placed = {
+                    "stakeSet": True,
+                    "oddsSet": True,
+                    "oddsValue": fallback_fill.get("oddsValue"),
+                    "stakeValue": fallback_fill.get("stakeValue"),
+                    "via": "selenium-send-keys-fallback",
+                }
+            else:
+                placed = {
+                    "error": "fallback fill failed",
+                    "jsResult": placed,
+                    "fallback": fallback_fill,
+                }
         if not (isinstance(placed, dict) and placed.get("stakeSet") and placed.get("oddsSet")):
             print(f"[{profile_label}] Betfair: stake fill result: {placed!r}", flush=True)
             last_betfair_error = f"stake/odds fill failed: {placed!r}"
