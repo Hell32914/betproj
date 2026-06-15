@@ -897,6 +897,18 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         return _black_search_dialog_open(browser)
 
     current_url = (driver.current_url or "").lower()
+    visible_text = _visible_text_lower(driver)
+    login_gate = _has_visible_password_input(driver) or (
+        "log in" in visible_text and "username" in visible_text and "password" in visible_text
+    )
+    if login_gate:
+        print(f"[{profile_label}] Black search detected login gate; restoring Black session.")
+        _login_black(driver, profile_label)
+        driver.get(BLACK_SPORTSBOOK_URL)
+        _wait_document_ready(driver)
+        time.sleep(1.5)
+        current_url = (driver.current_url or "").lower()
+
     if "/orders" in current_url:
         driver.get(BLACK_SPORTSBOOK_URL)
         _wait_document_ready(driver)
@@ -5104,6 +5116,97 @@ def _ensure_betfair_search_input(driver: webdriver.Remote, profile_label: str):
     return None
 
 
+def _is_betfair_event_url(url: str | None) -> bool:
+    lower = (url or "").lower()
+    if BETFAIR_URL_PART not in lower:
+        return False
+    if "/aboutus/" in lower or "/privacy.policy" in lower:
+        return False
+    if "/betting/" in lower:
+        return False
+    if "/exchange/plus/search" in lower:
+        return False
+    if "/exchange/plus/" not in lower:
+        return False
+    if "/football/" not in lower:
+        return False
+    return bool(re.search(r"-betting-\d{6,}", lower) or re.search(r"[?&]eventid=\d+", lower))
+
+
+def _find_betfair_event_href_in_dom(
+    driver: webdriver.Remote,
+    team_norms: list[str],
+    opponent_norms: list[str],
+) -> dict | None:
+    try:
+        result = driver.execute_script(
+            _BETFAIR_FUZZY_HELPERS + r"""
+            const teamNorms = arguments[0] || [];
+            const oppNorms = arguments[1] || [];
+            const isGoodHref = (href) => {
+                const h = (href || '').toLowerCase();
+                if (!h) return false;
+                if (h.indexOf('betfair.com') === -1 && !h.startsWith('/')) return false;
+                if (h.indexOf('/exchange/plus/') === -1) return false;
+                if (h.indexOf('/football/') === -1) return false;
+                if (h.indexOf('/aboutus/') !== -1 || h.indexOf('/privacy.policy') !== -1) return false;
+                if (h.indexOf('/exchange/plus/search') !== -1) return false;
+                if (h.indexOf('/betting/') !== -1) return false;
+                return /-betting-\d{6,}/i.test(h) || /[?&]eventid=\d+/i.test(h);
+            };
+            const links = Array.from(document.querySelectorAll('a[href]'))
+                .filter(visible)
+                .map((a) => {
+                    const href = a.getAttribute('href') || '';
+                    const text = (a.innerText || a.textContent || '').trim();
+                    const candidateText = norm(text + ' ' + href);
+                    return {
+                        href,
+                        text,
+                        score: fuzzyAliasScore(candidateText, teamNorms, oppNorms),
+                    };
+                })
+                .filter((item) => isGoodHref(item.href))
+                .filter((item) => item.score > 0)
+                .sort((a, b) => b.score - a.score || a.text.length - b.text.length);
+            if (!links.length) return null;
+            const pick = links[0];
+            return { href: pick.href, label: (pick.text || pick.href).slice(0, 220), score: pick.score };
+            """,
+            team_norms,
+            opponent_norms,
+        )
+    except Exception:
+        return None
+    if isinstance(result, dict) and result.get("href"):
+        return result
+    return None
+
+
+def _betfair_page_matches_target_event(
+    driver: webdriver.Remote,
+    team_norms: list[str],
+    opponent_norms: list[str],
+) -> bool:
+    current_url = driver.current_url or ""
+    if not _is_betfair_event_url(current_url):
+        return False
+    try:
+        match_score = driver.execute_script(
+            _BETFAIR_FUZZY_HELPERS + r"""
+            const teamNorms = arguments[0] || [];
+            const oppNorms = arguments[1] || [];
+            const text = norm(document.body?.innerText || '');
+            return fuzzyAliasScore(text, teamNorms, oppNorms);
+            """,
+            team_norms,
+            opponent_norms,
+        )
+        return bool(match_score and int(match_score) > 0)
+    except Exception:
+        return True
+
+
 def open_betfair_match(session: dict, signal) -> dict:
     """Open the match on Betfair for the signal, then click the Back cell of
     the matching Over/Under <line> Goals market.
@@ -5375,7 +5478,30 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
         except Exception:
             pass
 
-        if clicked_label:
+        event_ok = _betfair_page_matches_target_event(driver, team_norms, opponent_norms)
+        if not event_ok:
+            candidate = _find_betfair_event_href_in_dom(driver, team_norms, opponent_norms)
+            if candidate and candidate.get("href"):
+                href = candidate.get("href")
+                try:
+                    absolute = driver.execute_script(
+                        "return new URL(arguments[0], window.location.origin).href;",
+                        href,
+                    )
+                except Exception:
+                    absolute = href
+                try:
+                    driver.get(absolute)
+                    WebDriverWait(driver, 12).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                    event_ok = _betfair_page_matches_target_event(driver, team_norms, opponent_norms)
+                    if event_ok and not clicked_label:
+                        clicked_label = candidate.get("label")
+                except Exception:
+                    pass
+
+        if clicked_label and event_ok:
             print(f"[{profile_label}] Betfair opened result: {clicked_label!r}")
             return {
                 "profile_label": profile_label,
@@ -5386,8 +5512,14 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                 "url": driver.current_url,
             }
 
+        if clicked_label and not event_ok:
+            print(
+                f"[{profile_label}] Betfair ignored non-event result: {clicked_label!r} | url={driver.current_url}",
+                flush=True,
+            )
+
         current_url = (driver.current_url or "").lower()
-        if "/search" not in current_url and "search?" not in current_url and BETFAIR_URL_PART in current_url:
+        if "/search" not in current_url and "search?" not in current_url and _betfair_page_matches_target_event(driver, team_norms, opponent_norms):
             inferred_label = f"{team_name} v {opponent_name}" if opponent_name else team_name
             print(f"[{profile_label}] Betfair left search after query '{search_query}', using current match page.")
             return {
@@ -6267,7 +6399,7 @@ def _select_betfair_overunder_back(
                     if (typeof el.value === 'string') return el.value;
                     return (el.textContent || el.innerText || el.getAttribute('aria-valuetext') || '').trim();
                 }
-                const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton'], [tabindex]";
+                const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton']";
                 const panels = Array.from(document.querySelectorAll('aside, section, div, form'))
                     .filter(visible)
                     .map((el) => {
@@ -6492,8 +6624,15 @@ def _select_betfair_overunder_back(
                 // their attributes — try several strategies in order of confidence.
                 let inp = null;
                 let oddsInp = null;
-                const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton'], [tabindex]";
-                const allInputs = Array.from(document.querySelectorAll(selector)).filter(visible);
+                const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton']";
+                let allInputs = Array.from(document.querySelectorAll(selector)).filter(visible);
+                const rightInputs = allInputs.filter((el) => {
+                    const panel = el.closest('aside, section, div, form');
+                    if (!panel || !visible(panel)) return false;
+                    const rect = panel.getBoundingClientRect();
+                    return rect.width > 150 && rect.height > 90 && rect.x > window.innerWidth * 0.52;
+                });
+                if (rightInputs.length > 0) allInputs = rightInputs;
                 inp = allInputs.find((el) => {
                     const ph = (el.getAttribute('placeholder') || '').toLowerCase();
                     const nm = (el.getAttribute('name') || '').toLowerCase();
