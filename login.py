@@ -2497,6 +2497,46 @@ def _black_match_context_matches(
     ))
 
 
+def _black_loose_match_context_matches(
+    driver: webdriver.Remote,
+    home_team: str,
+    away_team: str | None,
+) -> bool:
+    """Fallback guard: accept page context when both teams are present in visible text."""
+    home_variants = _team_search_queries(home_team)
+    away_variants = _team_search_queries(away_team)
+    try:
+        return bool(driver.execute_script(
+            """
+            const homeVariants = arguments[0] || [];
+            const awayVariants = arguments[1] || [];
+            const normalize = (value) => (value || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/[^a-z0-9]+/g, ' ')
+                .replace(/\\s+/g, ' ')
+                .trim();
+            const bodyText = normalize(document.body?.innerText || '');
+            const hasVariant = (variants) => {
+                for (const variant of variants) {
+                    const n = normalize(variant);
+                    if (n && bodyText.includes(n)) return true;
+                }
+                return false;
+            };
+            const homeOk = hasVariant(homeVariants);
+            if (!homeOk) return false;
+            if (!awayVariants.length) return true;
+            return hasVariant(awayVariants);
+            """,
+            home_variants,
+            away_variants,
+        ))
+    except Exception:
+        return False
+
+
 def _ensure_black_betslip_safe_to_use(driver: webdriver.Remote, profile_label: str) -> None:
     try:
         _activate_black_order_tab(driver, "Betslip", profile_label)
@@ -4142,7 +4182,12 @@ def place_black_bet(session: dict, signal) -> dict:
             _dismiss_black_search_dialog(driver, profile_label)
         if _black_search_dialog_open(driver):
             raise RuntimeError(f"[{profile_label}] Black search dialog is still open after match click; aborting before bet selection.")
-        if not _black_match_context_matches(driver, team_name, opponent_name) and not _black_current_match_page_open(driver):
+        context_ok = _black_match_context_matches(driver, team_name, opponent_name)
+        if not context_ok:
+            context_ok = _black_current_match_page_open(driver)
+        if not context_ok:
+            context_ok = _black_loose_match_context_matches(driver, team_name, opponent_name)
+        if not context_ok:
             raise RuntimeError(
                 f"[{profile_label}] Required Black match context not reached for {team_name} vs {opponent_name or '?'}; aborting before bet selection."
             )
@@ -5570,6 +5615,16 @@ def _follow_betfair_search_results(
             _BETFAIR_FUZZY_HELPERS + r"""
             const teamNorms = arguments[0] || [];
             const oppNorms = arguments[1] || [];
+            const isBadHref = (href) => {
+                const h = (href || '').toLowerCase();
+                if (!h) return false;
+                if (h.indexOf('/aboutus/') !== -1) return true;
+                if (h.indexOf('/privacy.policy') !== -1) return true;
+                if (h.indexOf('gamblingcommission.gov.uk') !== -1) return true;
+                if (h.indexOf('/exchange/plus/search') !== -1) return true;
+                if (h.indexOf('/betting/football/s-') !== -1) return true;
+                return false;
+            };
             const hasInterestingText = (text) => {
                 const lowered = (text || '').toLowerCase();
                 return /\bv\b|\bvs\b/.test(lowered) || /football|soccer|goals|match/.test(lowered);
@@ -5634,6 +5689,7 @@ def _follow_betfair_search_results(
                     n,
                     href,
                     score,
+                    badHref: isBadHref(href),
                     hrefLooksLikeMatch,
                     hasVs,
                     interestingText: hasInterestingText(text),
@@ -5647,6 +5703,7 @@ def _follow_betfair_search_results(
                 .filter((it) => (it.label || '').length < 220 || it.hrefLooksLikeMatch)
                 .filter((it) => it.area > 0 && it.area < window.innerWidth * window.innerHeight * 0.92)
                 .filter((it) => it.central || it.hrefLooksLikeMatch)
+                .filter((it) => !it.badHref)
                 .filter((it) => it.hrefLooksLikeMatch || it.hasVs || it.interestingLabel || it.interestingText)
                 .filter((it) => it.score > 0);
             // Fallback: positive score AND text contains ' v ' separator.
@@ -5654,6 +5711,7 @@ def _follow_betfair_search_results(
                 cands = scored.filter((it) => (it.label || it.text))
                     .filter((it) => (it.label || '').length < 260 || it.hrefLooksLikeMatch)
                     .filter((it) => it.central || it.hrefLooksLikeMatch)
+                    .filter((it) => !it.badHref)
                     .filter((it) => it.score > 0 && (it.hasVs || it.hrefLooksLikeMatch));
             }
             if (cands.length === 0) {
@@ -5670,6 +5728,13 @@ def _follow_betfair_search_results(
             }
             cands.sort((a, b) => b.score - a.score || (a.hrefLooksLikeMatch === b.hrefLooksLikeMatch ? 0 : (a.hrefLooksLikeMatch ? -1 : 1)) || (a.label || a.text).length - (b.label || b.text).length || a.area - b.area);
             const pick = cands[0];
+            if (pick.badHref || (pick.href && !pick.hrefLooksLikeMatch)) {
+                return {
+                    error: 'non-event candidate',
+                    hrefSample: [pick.href].filter(Boolean),
+                    textSample: [(pick.label || pick.text || '').slice(0, 120)],
+                };
+            }
             try { pick.clickEl.scrollIntoView({ block: 'center' }); } catch (e) {}
             let clicked = false;
             try {
@@ -6409,14 +6474,20 @@ def _select_betfair_overunder_back(
                         const hasCancel = Array.from(el.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']"))
                             .filter(visible)
                             .some((b) => norm(b.innerText || b.value || '').includes('cancel'));
-                        return { el, rect, text, inputs, hasCancel };
+                        const hasAction = Array.from(el.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']"))
+                            .filter(visible)
+                            .some((b) => {
+                                const t = norm(b.innerText || b.value || '');
+                                return t.includes('place') || t.includes('confirm') || t.includes('edit');
+                            });
+                        const betslipLike = text.includes('betslip') || text.includes('bet slip') || text.includes('place bet') || text.includes('confirm bet');
+                        return { el, rect, text, inputs, hasCancel, hasAction, betslipLike };
                     })
-                    .filter((p) => p.rect.x > window.innerWidth * 0.52)
                     .filter((p) => p.rect.width > 160 && p.rect.height > 110)
                     .filter((p) => p.inputs.length > 0)
                     .sort((a, b) => {
-                        const aScore = (a.hasCancel ? 3 : 0) + (a.text.includes('bet') ? 2 : 0) + a.inputs.length;
-                        const bScore = (b.hasCancel ? 3 : 0) + (b.text.includes('bet') ? 2 : 0) + b.inputs.length;
+                        const aScore = (a.hasCancel ? 4 : 0) + (a.hasAction ? 4 : 0) + (a.betslipLike ? 3 : 0) + (a.rect.x > window.innerWidth * 0.5 ? 2 : 0) + a.inputs.length;
+                        const bScore = (b.hasCancel ? 4 : 0) + (b.hasAction ? 4 : 0) + (b.betslipLike ? 3 : 0) + (b.rect.x > window.innerWidth * 0.5 ? 2 : 0) + b.inputs.length;
                         return bScore - aScore || b.rect.y - a.rect.y;
                     });
                 if (!panels.length) return { ok: false, reason: 'betslip controls panel not found' };
@@ -6539,7 +6610,7 @@ def _select_betfair_overunder_back(
         time.sleep(1.5)
         _dismiss_betfair_blocking_overlays(driver, profile_label)
         placed = None
-        fill_deadline = time.monotonic() + 8
+        fill_deadline = time.monotonic() + 14
         while True:
             placed = driver.execute_script(
                 r"""
@@ -6626,13 +6697,15 @@ def _select_betfair_overunder_back(
                 let oddsInp = null;
                 const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton']";
                 let allInputs = Array.from(document.querySelectorAll(selector)).filter(visible);
-                const rightInputs = allInputs.filter((el) => {
+                const panelInputs = allInputs.filter((el) => {
                     const panel = el.closest('aside, section, div, form');
                     if (!panel || !visible(panel)) return false;
                     const rect = panel.getBoundingClientRect();
-                    return rect.width > 150 && rect.height > 90 && rect.x > window.innerWidth * 0.52;
+                    const pText = (panel.innerText || panel.textContent || '').toLowerCase();
+                    const hasAction = /place\s*bet|confirm\s*bet|cancel|betslip|bet\s*slip|edit/.test(pText);
+                    return rect.width > 150 && rect.height > 90 && (rect.x > window.innerWidth * 0.52 || hasAction);
                 });
-                if (rightInputs.length > 0) allInputs = rightInputs;
+                if (panelInputs.length > 0) allInputs = panelInputs;
                 inp = allInputs.find((el) => {
                     const ph = (el.getAttribute('placeholder') || '').toLowerCase();
                     const nm = (el.getAttribute('name') || '').toLowerCase();
