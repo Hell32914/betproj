@@ -915,6 +915,8 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         time.sleep(2)
         print(f"[{profile_label}] Returned Black to sportsbook before opening match search.")
 
+    _dismiss_black_update_banner(driver, profile_label)
+
     def open_search_with_shortcut(browser: webdriver.Remote) -> bool:
         shortcut_attempts = [
             lambda: ActionChains(browser).key_down(Keys.CONTROL).send_keys("f").key_up(Keys.CONTROL).perform(),
@@ -4721,7 +4723,85 @@ def _login_black(driver: webdriver.Remote, profile_label: str) -> None:
     print(f"[{profile_label}] Black login complete: {driver.current_url}")
 
 
+def _dismiss_black_update_banner(driver: webdriver.Remote, profile_label: str) -> dict:
+    """Best-effort click on transient bottom Update/Refresh banner in Black UI."""
+    try:
+        result = driver.execute_script(
+            """
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && Number(style.opacity || '1') > 0
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0
+                    && rect.x < window.innerWidth
+                    && rect.y < window.innerHeight;
+            };
+            const norm = (value) => (value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+            const isUpdateText = (text) => {
+                const t = norm(text);
+                return t === 'update' || t.startsWith('update ')
+                    || t === 'refresh' || t.startsWith('refresh ')
+                    || t === 'reload' || t.startsWith('reload ');
+            };
+            const candidates = Array.from(document.querySelectorAll("button, a, [role='button'], div, span"))
+                .filter(isVisible)
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+                    const marker = norm([
+                        el.className && el.className.toString ? el.className.toString() : '',
+                        el.getAttribute('data-testid') || '',
+                        el.getAttribute('data-test') || '',
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                    ].join(' '));
+                    return { el, rect, text, marker };
+                })
+                .filter((item) => isUpdateText(item.text) || /update|refresh|reload/.test(item.marker))
+                .filter((item) => item.rect.y > window.innerHeight * 0.55)
+                .sort((a, b) => {
+                    const aTxt = isUpdateText(a.text) ? 0 : 1;
+                    const bTxt = isUpdateText(b.text) ? 0 : 1;
+                    return aTxt - bTxt || b.rect.y - a.rect.y;
+                });
+
+            const pick = candidates[0];
+            if (!pick) return { found: false };
+            const target = pick.el.closest("button, a, [role='button']") || pick.el;
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                const EventCtor = name.startsWith('pointer') ? (window.PointerEvent || MouseEvent) : MouseEvent;
+                try {
+                    target.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, pointerType: 'mouse' }));
+                } catch (error) {
+                    target.dispatchEvent(new MouseEvent(name.replace('pointer', 'mouse'), { bubbles: true, cancelable: true, view: window }));
+                }
+            }
+            try { target.click?.(); } catch (error) {}
+            return {
+                found: true,
+                clicked: pick.text || pick.marker || 'update',
+                x: Math.round(pick.rect.x),
+                y: Math.round(pick.rect.y),
+            };
+            """
+        ) or {"found": False}
+    except Exception:
+        return {"found": False}
+
+    if result.get("found"):
+        print(f"[{profile_label}] Dismissed Black update banner: {result.get('clicked')}")
+        time.sleep(0.25)
+    return result
+
+
 def _ensure_black_session_ready(driver: webdriver.Remote, profile_label: str) -> bool:
+    _dismiss_black_update_banner(driver, profile_label)
     current_url = (driver.current_url or "").lower()
     if BLACK_URL_PART in current_url:
         _wait_document_ready(driver)
@@ -4742,6 +4822,7 @@ def _ensure_black_session_ready(driver: webdriver.Remote, profile_label: str) ->
 
 
 def _ping_black_session(driver: webdriver.Remote, profile_label: str) -> dict:
+    _dismiss_black_update_banner(driver, profile_label)
     result = driver.execute_script(
         """
         const isVisible = (element) => {
