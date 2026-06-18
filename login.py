@@ -2416,7 +2416,7 @@ def _dismiss_black_search_dialog(driver: webdriver.Remote, profile_label: str) -
 
 def _black_current_match_page_open(driver: webdriver.Remote) -> bool:
     current_url = (driver.current_url or "").lower()
-    return "/sportsbook/football/" in current_url and not _black_search_dialog_open(driver)
+    return "/sportsbook/football" in current_url and not _black_search_dialog_open(driver)
 
 
 def _black_match_context_matches(
@@ -2520,17 +2520,37 @@ def _black_loose_match_context_matches(
                 .replace(/\\s+/g, ' ')
                 .trim();
             const bodyText = normalize(document.body?.innerText || '');
-            const hasVariant = (variants) => {
-                for (const variant of variants) {
-                    const n = normalize(variant);
-                    if (n && bodyText.includes(n)) return true;
+            const wordsFor = (variants) => Array.from(new Set(
+                variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))
+            ));
+            const wordMatch = (text, word) => {
+                if (!word) return false;
+                if (text.includes(word)) return true;
+                for (const token of text.split(' ')) {
+                    const prefix = Math.min(token.length, word.length, 4);
+                    if (prefix >= 4 && token.slice(0, prefix) === word.slice(0, prefix)) return true;
                 }
                 return false;
             };
-            const homeOk = hasVariant(homeVariants);
+
+            const hasTeam = (variants, words, allowOneWordFallback) => {
+                if (!variants.length && !words.length) return true;
+                if (variants.some((value) => {
+                    const n = normalize(value);
+                    return n && bodyText.includes(n);
+                })) return true;
+                const hits = words.filter((word) => wordMatch(bodyText, word)).length;
+                if (!words.length) return false;
+                const required = allowOneWordFallback ? 1 : Math.max(1, words.length - 1);
+                return hits >= required;
+            };
+
+            const homeWords = wordsFor(homeVariants);
+            const awayWords = wordsFor(awayVariants);
+            const homeOk = hasTeam(homeVariants, homeWords, false);
             if (!homeOk) return false;
             if (!awayVariants.length) return true;
-            return hasVariant(awayVariants);
+            return hasTeam(awayVariants, awayWords, true);
             """,
             home_variants,
             away_variants,
@@ -4189,6 +4209,17 @@ def place_black_bet(session: dict, signal) -> dict:
             context_ok = _black_current_match_page_open(driver)
         if not context_ok:
             context_ok = _black_loose_match_context_matches(driver, team_name, opponent_name)
+        if not context_ok:
+            try:
+                print(f"[{profile_label}] Black context mismatch, retrying match open before abort.")
+                _open_black_live_match(driver, team_name, opponent_name, profile_label)
+            except Exception as exc:
+                print(f"[{profile_label}] Black context recovery open failed: {exc}", flush=True)
+            context_ok = _black_match_context_matches(driver, team_name, opponent_name)
+            if not context_ok:
+                context_ok = _black_current_match_page_open(driver)
+            if not context_ok:
+                context_ok = _black_loose_match_context_matches(driver, team_name, opponent_name)
         if not context_ok:
             raise RuntimeError(
                 f"[{profile_label}] Required Black match context not reached for {team_name} vs {opponent_name or '?'}; aborting before bet selection."
