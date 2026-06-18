@@ -1605,6 +1605,7 @@ def _search_black_live_events(
     for query in queries:
         try:
             _fill_black_search(driver, query, profile_label)
+            time.sleep(5)
             return query
         except Exception as exc:
             last_error = exc
