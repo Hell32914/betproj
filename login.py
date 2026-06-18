@@ -6021,6 +6021,12 @@ def _select_betfair_overunder_back(
                     return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
                 }
                 const labels = ['place bets', 'place bet', 'betslip', 'bet slip', 'edit'];
+                const clickTarget = (item) => {
+                    const target = item.el.closest("button, a, [role='button'], [role='tab']") || item.el;
+                    target.scrollIntoView({ block: 'center', inline: 'center' });
+                    try { target.click(); } catch (e) {}
+                    return { clicked: true, label: item.text || item.marker, x: Math.round(item.rect.x), y: Math.round(item.rect.y) };
+                };
                 const controls = Array.from(document.querySelectorAll(
                     "button, a, [role='button'], [role='tab'], [data-test], [data-testid], li, div, span"
                 ))
@@ -6040,16 +6046,31 @@ def _select_betfair_overunder_back(
                     .filter((item) => item.text || item.marker)
                     .filter((item) => labels.some((label) => item.text === label || item.text.startsWith(label) || item.marker.includes(label)));
                 if (!controls.length) return { clicked: false };
+
+                const placeBetsTop = controls
+                    .filter((item) => item.text === 'place bets' || item.text.startsWith('place bets'))
+                    .filter((item) => item.rect.x > window.innerWidth * 0.45)
+                    .sort((a, b) => a.rect.y - b.rect.y || b.rect.x - a.rect.x)[0];
+                if (placeBetsTop) return clickTarget(placeBetsTop);
+
                 controls.sort((a, b) => {
-                    const aScore = (a.rect.y > window.innerHeight * 0.62 ? 2 : 0) + (a.rect.x > window.innerWidth * 0.48 ? 1 : 0);
-                    const bScore = (b.rect.y > window.innerHeight * 0.62 ? 2 : 0) + (b.rect.x > window.innerWidth * 0.48 ? 1 : 0);
+                    const scoreFor = (item) => {
+                        let score = 0;
+                        if (item.text === 'place bets') score += 8;
+                        if (item.text.startsWith('place bet')) score += 6;
+                        if (item.text.includes('betslip') || item.text.includes('bet slip')) score += 4;
+                        if (item.text.startsWith('edit')) score += 2;
+                        if (item.rect.x > window.innerWidth * 0.45) score += 3;
+                        if (item.rect.y < window.innerHeight * 0.45) score += 2;
+                        if (item.rect.y > window.innerHeight * 0.55) score += 1;
+                        return score;
+                    };
+                    const aScore = scoreFor(a);
+                    const bScore = scoreFor(b);
                     return bScore - aScore || b.rect.width * b.rect.height - a.rect.width * a.rect.height;
                 });
                 const pick = controls[0];
-                const target = pick.el.closest("button, a, [role='button'], [role='tab']") || pick.el;
-                target.scrollIntoView({ block: 'center', inline: 'center' });
-                try { target.click(); } catch (e) {}
-                return { clicked: true, label: pick.text || pick.marker, x: Math.round(pick.rect.x), y: Math.round(pick.rect.y) };
+                return clickTarget(pick);
                 """
             )
             return result if isinstance(result, dict) else {"clicked": False}
@@ -6577,6 +6598,25 @@ def _select_betfair_overunder_back(
                     if (typeof el.value === 'string') return el.value;
                     return (el.textContent || el.innerText || el.getAttribute('aria-valuetext') || '').trim();
                 }
+                const clickPlaceBets = () => {
+                    const items = Array.from(document.querySelectorAll("button, a, [role='button'], [role='tab'], li, div, span"))
+                        .filter(visible)
+                        .map((el) => ({
+                            el,
+                            text: norm(el.innerText || el.textContent || el.getAttribute('aria-label') || ''),
+                            rect: el.getBoundingClientRect(),
+                        }))
+                        .filter((item) => item.text === 'place bets' || item.text.startsWith('place bets'))
+                        .filter((item) => item.rect.x > window.innerWidth * 0.45)
+                        .sort((a, b) => a.rect.y - b.rect.y || b.rect.x - a.rect.x);
+                    const pick = items[0];
+                    if (!pick) return false;
+                    const target = pick.el.closest("button, a, [role='button'], [role='tab']") || pick.el;
+                    target.scrollIntoView({ block: 'center', inline: 'center' });
+                    try { target.click(); } catch (e) {}
+                    return true;
+                };
+                clickPlaceBets();
                 const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton']";
                 const panels = Array.from(document.querySelectorAll('aside, section, div, form'))
                     .filter(visible)
@@ -6593,19 +6633,26 @@ def _select_betfair_overunder_back(
                                 const t = norm(b.innerText || b.value || '');
                                 return t.includes('place') || t.includes('confirm') || t.includes('edit');
                             });
-                        const betslipLike = text.includes('betslip') || text.includes('bet slip') || text.includes('place bet') || text.includes('confirm bet');
+                        const betslipLike = text.includes('betslip') || text.includes('bet slip') || text.includes('place bet') || text.includes('confirm bet') || text.includes('open bets');
                         return { el, rect, text, inputs, hasCancel, hasAction, betslipLike };
                     })
                     .filter((p) => p.rect.width > 160 && p.rect.height > 110)
-                    .filter((p) => p.inputs.length > 0)
+                    .filter((p) => p.inputs.length > 0 || p.hasAction || p.betslipLike)
                     .sort((a, b) => {
-                        const aScore = (a.hasCancel ? 4 : 0) + (a.hasAction ? 4 : 0) + (a.betslipLike ? 3 : 0) + (a.rect.x > window.innerWidth * 0.5 ? 2 : 0) + a.inputs.length;
-                        const bScore = (b.hasCancel ? 4 : 0) + (b.hasAction ? 4 : 0) + (b.betslipLike ? 3 : 0) + (b.rect.x > window.innerWidth * 0.5 ? 2 : 0) + b.inputs.length;
+                        const aScore = (a.hasCancel ? 4 : 0) + (a.hasAction ? 5 : 0) + (a.betslipLike ? 4 : 0) + (a.rect.x > window.innerWidth * 0.5 ? 2 : 0) + a.inputs.length;
+                        const bScore = (b.hasCancel ? 4 : 0) + (b.hasAction ? 5 : 0) + (b.betslipLike ? 4 : 0) + (b.rect.x > window.innerWidth * 0.5 ? 2 : 0) + b.inputs.length;
                         return bScore - aScore || b.rect.y - a.rect.y;
                     });
                 if (!panels.length) return { ok: false, reason: 'betslip controls panel not found' };
                 const panel = panels[0];
                 const inputs = panel.inputs;
+                if (!inputs.length) {
+                    return {
+                        ok: false,
+                        reason: 'betslip panel found but inputs not ready',
+                        panelText: panel.text.slice(0, 260),
+                    };
+                }
                 let stakeInput = inputs.find((el) => {
                     const hint = norm([
                         el.getAttribute('placeholder') || '',
@@ -6924,6 +6971,11 @@ def _select_betfair_overunder_back(
         )
         if needs_fallback_fill:
             fallback_fill = _fallback_fill_betfair_inputs_via_send_keys()
+            if not fallback_fill.get("ok") and "controls not found" in str(fallback_fill.get("error", "")):
+                activation = _activate_betfair_betslip()
+                if activation.get("clicked"):
+                    time.sleep(0.8)
+                fallback_fill = _fallback_fill_betfair_inputs_via_send_keys()
             if fallback_fill.get("ok"):
                 placed = {
                     "stakeSet": True,
