@@ -1570,9 +1570,19 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                 """,
                 normalized_query,
             )
-            raise RuntimeError(
-                f"Black search timed out waiting for visible match rows for {normalized_query!r}. State: {search_state!r}"
-            ) from (exc or first_timeout)
+            if isinstance(search_state, dict):
+                inputs = search_state.get("inputs") or []
+                query_set = any((str(item.get("value", "")).strip().lower() == normalized_query.lower()) for item in inputs)
+                if search_state.get("dialogOpen") and query_set:
+                    print(
+                        f"[{profile_label}] Black search rows not visible yet for {normalized_query!r}; continuing with typed query.",
+                        flush=True,
+                    )
+                    search_state = {"ok": True, "reason": "search-timeout-soft", "requested": normalized_query}
+            if not search_state or not search_state.get("ok"):
+                raise RuntimeError(
+                    f"Black search timed out waiting for visible match rows for {normalized_query!r}. State: {search_state!r}"
+                ) from (exc or first_timeout)
 
     if not search_state or not search_state.get("ok"):
         raise RuntimeError(f"Black search returned no visible match rows for {normalized_query!r}. State: {search_state!r}")
@@ -3612,13 +3622,24 @@ def _set_black_betslip_price_and_place(
             return False
         if normalized_stake is not None:
             current_stake_input = state.get("stakeInput")
-            if not current_stake_input:
-                return False
-            try:
-                current_stake = normalized_decimal_text(_control_value(browser, current_stake_input))
-            except Exception:
-                return False
-            if current_stake != normalized_stake:
+            stake_ok = False
+            if current_stake_input:
+                try:
+                    current_stake = normalized_decimal_text(_control_value(browser, current_stake_input))
+                    stake_ok = current_stake == normalized_stake
+                except Exception:
+                    stake_ok = False
+            if not stake_ok:
+                debug_inputs = ((state.get("controlDebug") or {}).get("inputs") or [])
+                for item in debug_inputs:
+                    try:
+                        value = normalized_decimal_text(str(item.get("value", "")))
+                    except Exception:
+                        continue
+                    if value == normalized_stake:
+                        stake_ok = True
+                        break
+            if not stake_ok:
                 return False
         if state.get("placeDisabled"):
             return False
@@ -5441,6 +5462,9 @@ function fuzzyTeamScore(candidateNorm, teamNorm, oppNorm) {
     if (teamWords.length === 0 && oppWords.length === 0) return 0;
     // Need at least one hit and at most one missing team word.
     if (teamWords.length && teamHits < Math.max(1, teamWords.length - 1)) return 0;
+    // If opponent is known, require at least one opponent hit to avoid
+    // opening unrelated matches that only share the home-team token.
+    if (oppWords.length && oppHits < 1) return 0;
     score += teamHits * 30;
     score += oppHits * 35;
     // Heavy bonus for exact substring of full normalized team/opp.
@@ -5525,13 +5549,14 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
         seen_queries.add(key)
         search_queries.append(value)
 
-    for query in _team_search_queries(team_name):
-        add_search_query(query)
     if opponent_name:
         opponent_queries = _team_search_queries(opponent_name)
-        if search_queries and opponent_queries:
-            add_search_query(f"{search_queries[0]} {opponent_queries[0]}")
-            add_search_query(f"{search_queries[0]} vs {opponent_queries[0]}")
+        team_queries = _team_search_queries(team_name)
+        if team_queries and opponent_queries:
+            add_search_query(f"{team_queries[0]} {opponent_queries[0]}")
+            add_search_query(f"{team_queries[0]} vs {opponent_queries[0]}")
+    for query in _team_search_queries(team_name):
+        add_search_query(query)
 
     clicked_label = None
     for search_query in search_queries or [team_name]:
@@ -6224,7 +6249,7 @@ def _select_betfair_overunder_back(
                         || hasActionButton
                         || inputs.length > 0;
                     return {
-                        ready: (inputs.length > 0 || hasActionButton) && !empty,
+                        ready: !empty && (inputs.length > 0 || (hasActionButton && hasSelectionText)),
                         empty,
                         betslipLike,
                         hasSelectionText,
