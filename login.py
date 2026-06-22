@@ -5154,9 +5154,9 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
         print(f"[{profile_label}] Navigating to Betfair: {BETFAIR_LOGIN_URL}")
         driver.get(BETFAIR_LOGIN_URL)
     wait_ready()
-    _dismiss_betfair_blocking_overlays(driver, profile_label)
+    overlay_state = _dismiss_betfair_blocking_overlays(driver, profile_label)
 
-    if _is_betfair_logged_in(driver):
+    if _is_betfair_logged_in(driver) and not overlay_state.get("requiresLogin"):
         print(f"[{profile_label}] Betfair already logged in; skipping form fill.")
         return
 
@@ -5170,8 +5170,8 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
             driver.get(BETFAIR_LOGIN_URL)
             wait_ready()
             time.sleep(1.0)
-            _dismiss_betfair_blocking_overlays(driver, profile_label)
-            if _is_betfair_logged_in(driver):
+            overlay_state = _dismiss_betfair_blocking_overlays(driver, profile_label)
+            if _is_betfair_logged_in(driver) and not overlay_state.get("requiresLogin"):
                 print(f"[{profile_label}] Betfair already logged in after reopening Exchange home.")
                 return
         user_el, pwd_el, btn_el = locate_login_fields(timeout)
@@ -5179,6 +5179,13 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
             break
 
     if not user_el or not pwd_el:
+        overlay_state = _dismiss_betfair_blocking_overlays(driver, profile_label)
+        if _is_betfair_logged_in(driver) and not overlay_state.get("requiresLogin"):
+            print(
+                f"[{profile_label}] Betfair login form is not visible, but account state looks authenticated; continuing without form fill.",
+                flush=True,
+            )
+            return
         page_text = _visible_page_text(driver)
         short_text = " | ".join(line.strip() for line in page_text.splitlines() if line.strip())[:500]
         raise RuntimeError(
@@ -5375,8 +5382,35 @@ def _betfair_page_matches_target_event(
             _BETFAIR_FUZZY_HELPERS + r"""
             const teamNorms = arguments[0] || [];
             const oppNorms = arguments[1] || [];
-            const text = norm(document.body?.innerText || '');
-            return fuzzyAliasScore(text, teamNorms, oppNorms);
+            const headingText = Array.from(document.querySelectorAll('h1, h2, [data-test], [data-testid], [role="heading"]'))
+                .filter(visible)
+                .map((el) => (el.innerText || el.textContent || '').trim())
+                .filter((value) => value && value.length <= 180)
+                .slice(0, 20)
+                .join(' ');
+            const focusText = norm([
+                window.location.pathname || '',
+                window.location.search || '',
+                document.title || '',
+                headingText,
+            ].join(' '));
+            const countHits = (candidateNorm, aliasNorm) => {
+                const words = tokens(aliasNorm);
+                if (!words.length) return 0;
+                let hits = 0;
+                for (const w of words) if (wordMatch(candidateNorm, w)) hits++;
+                return hits;
+            };
+            let teamBest = 0;
+            for (const teamNorm of teamNorms) teamBest = Math.max(teamBest, countHits(focusText, teamNorm));
+            if (teamBest < 1) return 0;
+            let oppBest = 0;
+            for (const oppNorm of oppNorms) oppBest = Math.max(oppBest, countHits(focusText, oppNorm));
+            if (oppNorms.length && oppBest < 1) return 0;
+
+            const bodyText = norm((document.body?.innerText || '').slice(0, 25000));
+            const fuzzy = fuzzyAliasScore(bodyText, teamNorms, oppNorms);
+            return teamBest * 60 + oppBest * 80 + Math.min(40, fuzzy);
             """,
             team_norms,
             opponent_norms,
@@ -5753,6 +5787,18 @@ def _follow_betfair_search_results(
             _BETFAIR_FUZZY_HELPERS + r"""
             const teamNorms = arguments[0] || [];
             const oppNorms = arguments[1] || [];
+            const countHits = (candidateNorm, aliases) => {
+                const norms = Array.isArray(aliases) ? aliases : [];
+                let best = 0;
+                for (const aliasNorm of norms) {
+                    const words = tokens(aliasNorm);
+                    if (!words.length) continue;
+                    let hits = 0;
+                    for (const w of words) if (wordMatch(candidateNorm, w)) hits++;
+                    if (hits > best) best = hits;
+                }
+                return best;
+            };
             const isBadHref = (href) => {
                 const h = (href || '').toLowerCase();
                 if (!h) return false;
@@ -5807,10 +5853,13 @@ def _follow_betfair_search_results(
                 const href = pickHref(element);
                 const n = norm(text);
                 const labelNorm = norm(label);
+                const combinedNorm = norm((label || '') + ' ' + (text || '') + ' ' + (href || ''));
                 const score = Math.max(
                     fuzzyAliasScore(labelNorm, teamNorms, oppNorms),
                     fuzzyAliasScore(n, teamNorms, oppNorms)
                 );
+                const teamHits = countHits(combinedNorm, teamNorms);
+                const oppHits = countHits(combinedNorm, oppNorms);
                 const rect = element.getBoundingClientRect();
                 // Match-page links on Betfair Exchange look like
                 // /exchange/plus/.../<slug>-betting-<id> — event IDs are 6+ digits.
@@ -5827,6 +5876,8 @@ def _follow_betfair_search_results(
                     n,
                     href,
                     score,
+                    teamHits,
+                    oppHits,
                     badHref: isBadHref(href),
                     hrefLooksLikeMatch,
                     hasVs,
@@ -5842,6 +5893,8 @@ def _follow_betfair_search_results(
                 .filter((it) => it.area > 0 && it.area < window.innerWidth * window.innerHeight * 0.92)
                 .filter((it) => it.central || it.hrefLooksLikeMatch)
                 .filter((it) => !it.badHref)
+                .filter((it) => it.teamHits > 0)
+                .filter((it) => oppNorms.length === 0 || it.oppHits > 0)
                 .filter((it) => it.hrefLooksLikeMatch || it.hasVs || it.interestingLabel || it.interestingText)
                 .filter((it) => it.score > 0);
             // Fallback: positive score AND text contains ' v ' separator.
@@ -5850,6 +5903,8 @@ def _follow_betfair_search_results(
                     .filter((it) => (it.label || '').length < 260 || it.hrefLooksLikeMatch)
                     .filter((it) => it.central || it.hrefLooksLikeMatch)
                     .filter((it) => !it.badHref)
+                    .filter((it) => it.teamHits > 0)
+                    .filter((it) => oppNorms.length === 0 || it.oppHits > 0)
                     .filter((it) => it.score > 0 && (it.hasVs || it.hrefLooksLikeMatch));
             }
             if (cands.length === 0) {
@@ -6556,6 +6611,7 @@ def _select_betfair_overunder_back(
                     break
             info = {
                 **info,
+                "ok": False,
                 "error": "betslip did not open after odds click",
                 "betslipState": betslip_state,
                 "betslipActivation": activation,
