@@ -3205,36 +3205,49 @@ def _select_black_asian_total_goals(
                 .filter((item) => normalizedLineVariants.includes(normalizeNumber(item.text)))
                 .sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y)[0] || null;
         };
-        const findSelectionLabel = (rowElement, target) => descendants(rowElement, 'button,div,[role="button"],span,p,li')
+        const tokenPresent = (text, token) => (` ${text} `).includes(` ${token} `);
+        const hasOverUnderMarkers = (text) => {
+            return (tokenPresent(text, 'over') && tokenPresent(text, 'under'))
+                || (tokenPresent(text, 'o') && tokenPresent(text, 'u'));
+        };
+        const findSelectionLabel = (rowElement, aliases) => descendants(rowElement, 'button,div,[role="button"],span,p,li')
             .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
-            .filter((item) => item.text === target)
+            .filter((item) => aliases.some((alias) => tokenPresent(item.text, alias)))
             .sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y)[0] || null;
         const findOddsButtons = (rowElement) => descendants(rowElement, 'button,div,[role="button"],span')
             .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
             .filter((item) => oddsPattern.test(item.text))
             .sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y);
-        const pickOddsForSelection = (rowElement) => {
-            const overLabel = findSelectionLabel(rowElement, 'over');
-            const underLabel = findSelectionLabel(rowElement, 'under');
+        const pickOddsForSelection = (rowElement, lineCell, overLabel, underLabel) => {
             const oddsButtons = findOddsButtons(rowElement);
-            if (!overLabel || !underLabel || oddsButtons.length < 2) {
+            if (oddsButtons.length < 2) {
                 return null;
             }
-            if (selection === 'over') {
-                return oddsButtons
-                    .filter((item) => item.rect.left >= overLabel.rect.right - 8)
-                    .filter((item) => item.rect.right <= underLabel.rect.left + 14)
-                    .sort((a, b) => Math.abs(a.rect.left - overLabel.rect.right) - Math.abs(b.rect.left - overLabel.rect.right))[0]
-                    || oddsButtons
-                        .filter((item) => item.rect.left >= overLabel.rect.right - 8 && item.rect.left < underLabel.rect.left + 40)
+            if (overLabel && underLabel) {
+                if (selection === 'over') {
+                    return oddsButtons
+                        .filter((item) => item.rect.left >= overLabel.rect.right - 8)
+                        .filter((item) => item.rect.right <= underLabel.rect.left + 14)
                         .sort((a, b) => Math.abs(a.rect.left - overLabel.rect.right) - Math.abs(b.rect.left - overLabel.rect.right))[0]
-                    || null;
+                        || oddsButtons
+                            .filter((item) => item.rect.left >= overLabel.rect.right - 8 && item.rect.left < underLabel.rect.left + 40)
+                            .sort((a, b) => Math.abs(a.rect.left - overLabel.rect.right) - Math.abs(b.rect.left - overLabel.rect.right))[0]
+                        || null;
+                }
+                if (selection === 'under') {
+                    return oddsButtons
+                        .filter((item) => item.rect.left >= underLabel.rect.right - 8)
+                        .sort((a, b) => Math.abs(a.rect.left - underLabel.rect.right) - Math.abs(b.rect.left - underLabel.rect.right))[0]
+                        || null;
+                }
             }
-            if (selection === 'under') {
-                return oddsButtons
-                    .filter((item) => item.rect.left >= underLabel.rect.right - 8)
-                    .sort((a, b) => Math.abs(a.rect.left - underLabel.rect.right) - Math.abs(b.rect.left - underLabel.rect.right))[0]
-                    || null;
+            if (lineCell) {
+                const oddsAfterLine = oddsButtons
+                    .filter((item) => item.rect.left >= lineCell.rect.right - 8)
+                    .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top);
+                if (oddsAfterLine.length >= 2) {
+                    return selection === 'over' ? oddsAfterLine[0] : oddsAfterLine[1];
+                }
             }
             return null;
         };
@@ -3244,27 +3257,27 @@ def _select_black_asian_total_goals(
             if (rect.width <= 280 || rect.height < 24 || rect.height > 120) {
                 return null;
             }
-            if (!text.includes('over') || !text.includes('under')) {
+            if (!hasOverUnderMarkers(text)) {
                 return null;
             }
             const lineCell = findExactLineCell(element);
             if (!lineCell) {
                 return null;
             }
-            const overLabel = findSelectionLabel(element, 'over');
-            const underLabel = findSelectionLabel(element, 'under');
-            if (!overLabel || !underLabel) {
-                return null;
-            }
-            const targetOdds = pickOddsForSelection(element);
+            const overLabel = findSelectionLabel(element, ['over', 'o']);
+            const underLabel = findSelectionLabel(element, ['under', 'u']);
+            const targetOdds = pickOddsForSelection(element, lineCell, overLabel, underLabel);
             if (!targetOdds) {
                 return null;
             }
-            const verticalCenters = [lineCell.rect, overLabel.rect, underLabel.rect, targetOdds.rect]
+            const anchorRects = [lineCell.rect, targetOdds.rect];
+            if (overLabel) anchorRects.push(overLabel.rect);
+            if (underLabel) anchorRects.push(underLabel.rect);
+            const verticalCenters = anchorRects
                 .map((candidateRect) => candidateRect.top + candidateRect.height / 2);
             const minCenter = Math.min.apply(null, verticalCenters);
             const maxCenter = Math.max.apply(null, verticalCenters);
-            if (maxCenter - minCenter > 22) {
+            if (maxCenter - minCenter > 30) {
                 return null;
             }
             return {
