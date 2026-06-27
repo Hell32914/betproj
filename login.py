@@ -15,6 +15,7 @@ import socket
 import subprocess
 import unicodedata
 import requests
+from urllib.parse import quote
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -60,6 +61,8 @@ TEAM_SEARCH_ALIASES = {
     "mipk": ["mikkelin palloilijat", "mikkelin palloilijat k"],
     "botafogo sp u20": ["botafogo sp", "botafogo sp u20"],
     "fk siauliai ii": ["siauliai", "fk siauliai reserves", "siauliai reserves"],
+    "sportivo ac las parejas": ["sportivo las parejas", "las parejas"],
+    "def belgrano vr": ["defensores de belgrano", "belgrano villa ramallo", "def belgrano"],
 }
 
 
@@ -3374,7 +3377,7 @@ def _select_black_asian_total_goals(
         };
         const parseCompactRowsFromText = (text) => {
             const rows = [];
-            const compactLineRegex = /(\\d+(?:[.,]\\d+)?)\\s+o\\s+([\\d]+(?:[.,]\\d+)?)\\s+u\\s+([\\d]+(?:[.,]\\d+)?)/gi;
+            const compactLineRegex = /(\\d+(?:[.,]\\d+)?)\\s+(?:o|over)\\s+([\\d]+(?:[.,]\\d+)?)\\s+(?:u|under)\\s+([\\d]+(?:[.,]\\d+)?)/gi;
             let match;
             while ((match = compactLineRegex.exec(text || '')) !== null) {
                 rows.push({
@@ -3385,17 +3388,72 @@ def _select_black_asian_total_goals(
             }
             return rows;
         };
+        const lineMatchesTarget = (lineText) => normalizedLineVariants.includes(normalizeNumber(lineText));
         const oddsMatchesValue = (oddsText, targetValue) => {
             const left = normalizeNumber(oddsText);
             const right = normalizeNumber(targetValue);
             return left === right || oddsText.replace(',', '.') === targetValue.replace(',', '.');
         };
-        const findOddsElementForValue = (rootElement, targetValue) => {
-            return descendants(rootElement, 'button,div,[role="button"],span')
+        const findOddsElementForValue = (rootElement, targetValue, lineText) => {
+            const candidates = descendants(rootElement, 'button,div,[role="button"],span')
                 .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
                 .filter((item) => oddsPattern.test(item.text))
-                .filter((item) => oddsMatchesValue(item.text, targetValue))
-                .sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y)[0] || null;
+                .filter((item) => oddsMatchesValue(item.text, targetValue));
+            if (!candidates.length) {
+                return null;
+            }
+            if (!lineText) {
+                return candidates.sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y)[0];
+            }
+            const lineNeedle = normalizeNumber(lineText);
+            const scored = candidates.map((item) => {
+                let node = item.element;
+                let score = 0;
+                for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
+                    const rowText = normalizedTextOf(node);
+                    if (!rowText) continue;
+                    if (rowText.includes(lineNeedle) || normalizedLineVariants.some((variant) => rowText.includes(variant))) {
+                        score += 40 - depth;
+                    }
+                    if (marketHeaders.some((header) => rowText.includes(header))) {
+                        score += 10;
+                    }
+                }
+                return { item, score };
+            }).sort((a, b) => b.score - a.score || a.item.rect.y - b.item.rect.y || a.item.rect.x - b.item.rect.x);
+            return (scored[0] && scored[0].score > 0 ? scored[0].item : candidates[0]) || null;
+        };
+        const tryRowTextSelection = () => {
+            const lineChoices = normalizedLineVariants.map((value) => value.replace(/\\./g, '[.,]')).join('|');
+            const rowRegex = new RegExp(`(?:^|\\s)(${lineChoices})\\s+(?:o|over)\\s+([\\d]+(?:[.,]\\d+)?)\\s+(?:u|under)\\s+([\\d]+(?:[.,]\\d+)?)`, 'i');
+            const rowElements = Array.from(document.querySelectorAll('div,section,li,button,[role="button"],span'))
+                .filter(isVisible)
+                .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
+                .filter((item) => item.text && item.text.length <= 220)
+                .filter((item) => rowRegex.test(` ${item.text} `))
+                .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height) || a.rect.y - b.rect.y);
+            for (const row of rowElements) {
+                const match = ` ${row.text} `.match(rowRegex);
+                if (!match) continue;
+                const lineText = normalizeNumber(match[1]);
+                if (!lineMatchesTarget(lineText)) continue;
+                const oddsValue = selection === 'over' ? match[2].replace(',', '.') : match[3].replace(',', '.');
+                let targetOdds = findOddsElementForValue(row.element, oddsValue, lineText);
+                if (!targetOdds && row.element.parentElement) {
+                    targetOdds = findOddsElementForValue(row.element.parentElement, oddsValue, lineText);
+                }
+                if (!targetOdds) continue;
+                clickElement(targetOdds.element);
+                return {
+                    ok: true,
+                    rowText: row.text.slice(0, 220),
+                    sectionText: 'row-text',
+                    lineText,
+                    selection,
+                    mode: 'row-text',
+                };
+            }
+            return null;
         };
         const buildRowCandidate = (element) => {
             const rect = element.getBoundingClientRect();
@@ -3421,7 +3479,7 @@ def _select_black_asian_total_goals(
                 }
                 lineText = targetCompact.lineText;
                 const oddsValue = selection === 'over' ? targetCompact.overOdds : targetCompact.underOdds;
-                targetOdds = findOddsElementForValue(element, oddsValue);
+                targetOdds = findOddsElementForValue(element, oddsValue, lineText);
             }
             if (!lineText || !targetOdds) {
                 return null;
@@ -3515,7 +3573,7 @@ def _select_black_asian_total_goals(
                     const targetRow = compactRows.find((row) => normalizedLineVariants.includes(row.lineText));
                     if (!targetRow) continue;
                     const oddsValue = selection === 'over' ? targetRow.overOdds : targetRow.underOdds;
-                    const targetOdds = findOddsElementForValue(current, oddsValue);
+                    const targetOdds = findOddsElementForValue(current, oddsValue, targetRow.lineText);
                     if (!targetOdds) continue;
                     clickElement(targetOdds.element);
                     return {
@@ -3533,6 +3591,10 @@ def _select_black_asian_total_goals(
         const compactResult = tryCompactSectionSelection();
         if (compactResult) {
             return compactResult;
+        }
+        const rowTextResult = tryRowTextSelection();
+        if (rowTextResult) {
+            return rowTextResult;
         }
         const sectionTexts = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
             .filter(isVisible)
@@ -5448,6 +5510,50 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
     )
 
 
+def _reveal_betfair_search_input(driver: webdriver.Remote) -> None:
+    try:
+        driver.execute_script(
+            r"""
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            const toggles = Array.from(document.querySelectorAll(
+                "button, a, [role='button'], [aria-label], [title], [data-testid]"
+            )).filter(visible).filter((el) => {
+                const marker = [
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                    el.className || '',
+                    el.innerText || '',
+                ].join(' ').toLowerCase();
+                return marker.includes('search') || marker.includes('find');
+            });
+            for (const toggle of toggles.slice(0, 6)) {
+                try { toggle.click(); } catch (error) {}
+            }
+            """
+        )
+        time.sleep(0.4)
+    except Exception:
+        pass
+
+
+def _navigate_betfair_search_results(driver: webdriver.Remote, search_query: str) -> None:
+    driver.get(f"https://www.betfair.com/exchange/plus/search?query={quote(search_query)}")
+    try:
+        WebDriverWait(driver, 12).until(
+            lambda browser: browser.execute_script("return document.readyState") == "complete"
+        )
+    except Exception:
+        pass
+    time.sleep(1.0)
+
+
 def _find_betfair_search_input(driver: webdriver.Remote):
     """Return the top-bar Betfair search input element, or None."""
     return driver.execute_script(
@@ -5462,7 +5568,7 @@ def _find_betfair_search_input(driver: webdriver.Remote):
         // Prefer explicit search inputs (type=search), then text inputs whose
         // placeholder/aria mentions team/competition/event/sport in any language.
         const all = Array.from(document.querySelectorAll(
-            "input[type='search'], input[type='text'], input:not([type])"
+            "input[type='search'], input[type='text'], input:not([type]), [contenteditable='true'], [role='searchbox'], [role='combobox']"
         )).filter(visible);
         // Exclude obvious login fields by ignoring inputs whose closest <form>
         // also contains a password field.
@@ -5490,6 +5596,7 @@ def _ensure_betfair_search_input(driver: webdriver.Remote, profile_label: str):
     deadline = time.time() + 20
     while time.time() < deadline:
         _dismiss_betfair_blocking_overlays(driver, profile_label)
+        _reveal_betfair_search_input(driver)
         search_el = _find_betfair_search_input(driver)
         if search_el:
             return search_el
@@ -5504,6 +5611,7 @@ def _ensure_betfair_search_input(driver: webdriver.Remote, profile_label: str):
 
     deadline = time.time() + 15
     while time.time() < deadline:
+        _reveal_betfair_search_input(driver)
         search_el = _find_betfair_search_input(driver)
         if search_el:
             return search_el
@@ -5766,15 +5874,6 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
             }
 
     search_el = _ensure_betfair_search_input(driver, profile_label)
-    if not search_el:
-        return {
-            "profile_label": profile_label,
-            "team": team_name,
-            "opponent": opponent_name,
-            "opened": False,
-            "url": driver.current_url,
-            "error": "Betfair search input not found after login/reopen.",
-        }
 
     team_norms = _normalized_team_aliases(team_name)
     opponent_norms = _normalized_team_aliases(opponent_name) if opponent_name else []
@@ -5805,7 +5904,34 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
     for search_query in search_queries or [team_name]:
         search_el = _find_betfair_search_input(driver) or _ensure_betfair_search_input(driver, profile_label)
         if not search_el:
-            break
+            print(
+                f"[{profile_label}] Betfair search input still missing; opening search results URL for '{search_query}'.",
+                flush=True,
+            )
+            _navigate_betfair_search_results(driver, search_query)
+            overlay_state = _dismiss_betfair_blocking_overlays(driver, profile_label)
+            if overlay_state.get("requiresLogin"):
+                login_betfair(driver, profile_label)
+            followed = _follow_betfair_search_results(driver, team_norms, opponent_norms, profile_label)
+            if followed:
+                clicked_label = followed
+            try:
+                WebDriverWait(driver, 12).until(
+                    lambda browser: browser.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
+                pass
+            if _betfair_page_matches_target_event(driver, team_norms, opponent_norms):
+                print(f"[{profile_label}] Betfair opened result via search URL: {clicked_label!r}")
+                return {
+                    "profile_label": profile_label,
+                    "team": team_name,
+                    "opponent": opponent_name,
+                    "opened": True,
+                    "label": clicked_label,
+                    "url": driver.current_url,
+                }
+            continue
 
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", search_el)
