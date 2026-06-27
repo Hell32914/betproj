@@ -55,6 +55,11 @@ TEAM_SUFFIXES = {
 TEAM_SEARCH_ALIASES = {
     "alaves": ["deportivo alaves", "alavés", "deportivo alavés"],
     "sao paulo": ["são paulo", "sao paulo fc", "são paulo fc"],
+    "stabaek": ["stabæk", "stabæk if", "stabaek if"],
+    "stromsgodset": ["strømsgodset", "strømsgodset if", "stromsgodset if"],
+    "mipk": ["mikkelin palloilijat", "mikkelin palloilijat k"],
+    "botafogo sp u20": ["botafogo sp", "botafogo sp u20"],
+    "fk siauliai ii": ["siauliai", "fk siauliai reserves", "siauliai reserves"],
 }
 
 
@@ -1578,6 +1583,7 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
                         f"[{profile_label}] Black search rows not visible yet for {normalized_query!r}; continuing with typed query.",
                         flush=True,
                     )
+                    time.sleep(3.5)
                     search_state = {"ok": True, "reason": "search-timeout-soft", "requested": normalized_query}
             if not search_state or not search_state.get("ok"):
                 raise RuntimeError(
@@ -2452,7 +2458,7 @@ def _black_match_context_matches(
             .replace(/\\s+/g, ' ')
             .trim();
         const wordsFor = (variants) => Array.from(new Set(
-            variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))
+            variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 2))
         ));
         const wordMatch = (text, word) => {
             if (!word) return false;
@@ -2752,7 +2758,7 @@ def _find_black_live_match_candidate(
                 if (normalizedText.includes('no results') || normalizedText.includes('no events')) score -= 500;
                 if (normalizedText.includes('use ctrl f') || normalizedText.includes('all sports live events')) score -= 220;
                 if (normalizedText.includes('order id') || normalizedText.includes('selection status price stake')) score -= 260;
-                if (normalizedText.includes('asian total goals') || normalizedText.includes('over') || normalizedText.includes('under')) score -= 60;
+                if (normalizedText.includes('asian total goals') || normalizedText.includes('over') || normalizedText.includes('under')) score -= 20;
                 if (rect.x < 8 || rect.x > window.innerWidth - 90) score -= 90;
                 if (rect.y < 45) score -= 80;
                 return { score, teamHits, opponentHits, exactTeam, exactOpponent, hasVs, normalizedText };
@@ -2762,9 +2768,10 @@ def _find_black_live_match_candidate(
                     || metrics.teamHits >= Math.max(1, Math.min(teamWords.length || 1, 2));
                 if (!hasTeam) return false;
                 if (!opponentWords.length && !opponentVariants.length) return true;
-                const hasOpponent = metrics.exactOpponent || metrics.opponentHits >= 1;
-                const strongTeamOnly = metrics.teamHits >= Math.max(1, Math.min(teamWords.length || 1, 2));
-                return hasOpponent || (strongTeamOnly && metrics.hasVs) || metrics.exactTeam;
+            const hasOpponent = metrics.exactOpponent || metrics.opponentHits >= 1;
+            const strongTeamOnly = metrics.teamHits >= Math.max(1, Math.min(teamWords.length || 1, 2));
+            const singleWordTeam = (teamWords.length || 0) <= 1 && metrics.teamHits >= 1;
+            return hasOpponent || (strongTeamOnly && metrics.hasVs) || metrics.exactTeam || singleWordTeam;
             };
 
             const rootCandidates = Array.from(document.querySelectorAll('aside,section,div,main'))
@@ -2904,7 +2911,7 @@ def _open_black_live_match(
             .replace(/\\s+/g, ' ')
             .trim();
         const wordsFor = (variants) => Array.from(new Set(
-            variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))
+            variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 2))
         ));
         const teamWords = wordsFor(teamVariants);
         const opponentWords = wordsFor(opponentVariants);
@@ -2974,6 +2981,75 @@ def _open_black_live_match(
         except Exception:
             pass
 
+    try:
+        team_only = driver.execute_script(
+            """
+            const teamVariants = arguments[0] || [];
+            const normalize = (value) => (value || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\\u0300-\\u036f]/g, '')
+                .replace(/[^a-z0-9]+/g, ' ')
+                .replace(/\\s+/g, ' ')
+                .trim();
+            const teamWords = Array.from(new Set(
+                teamVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 2))
+            ));
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0
+                    && rect.x < window.innerWidth
+                    && rect.y < window.innerHeight;
+            };
+            const textOf = (element) => (element.innerText || element.textContent || '').trim().toLowerCase();
+            const fuzzyHas = (text, word) => {
+                if (!word) return false;
+                if (text.includes(word)) return true;
+                for (const token of text.split(' ')) {
+                    const prefix = Math.min(token.length, word.length, 4);
+                    if (prefix >= 3 && token.slice(0, prefix) === word.slice(0, prefix)) return true;
+                }
+                return false;
+            };
+            const candidates = Array.from(document.querySelectorAll('li,a,button,[role="button"],[role="option"],article,div'))
+                .filter(isVisible)
+                .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+                .filter((item) => item.rect.y > 80 && item.rect.y < window.innerHeight * 0.92)
+                .filter((item) => item.rect.width > 120 && item.rect.height >= 24 && item.rect.height <= 180)
+                .filter((item) => item.text.length >= 4 && item.text.length <= 220)
+                .filter((item) => {
+                    const text = normalize(item.text);
+                    return teamVariants.some((value) => normalize(value) && text.includes(normalize(value)))
+                        || teamWords.filter((word) => fuzzyHas(text, word)).length >= Math.min(2, Math.max(1, teamWords.length));
+                })
+                .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+            if (!candidates.length) return false;
+            const pick = candidates[0].element.closest('a,button,[role="button"],li') || candidates[0].element;
+            pick.scrollIntoView({ block: 'center', inline: 'center' });
+            try { pick.click(); } catch (error) {}
+            return true;
+            """,
+            team_variants,
+        )
+        if team_only:
+            before_url = driver.current_url or ""
+            open_reason = WebDriverWait(driver, 6).until(lambda browser: (
+                "context" if match_opened(browser)
+                else "url" if (browser.current_url or "") != before_url and _black_current_match_page_open(browser)
+                else False
+            ))
+            if open_reason:
+                print(f"[{profile_label}] Opened Black live match for: {team_name} via team-only fallback ({open_reason}).")
+                return
+    except Exception:
+        pass
+
     details = driver.execute_script(
         """
         const teamVariants = arguments[0];
@@ -2985,8 +3061,8 @@ def _open_black_live_match(
             .replace(/[^a-z0-9]+/g, ' ')
             .replace(/\\s+/g, ' ')
             .trim();
-        const teamWords = Array.from(new Set(teamVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))));
-        const opponentWords = Array.from(new Set(opponentVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))));
+        const teamWords = Array.from(new Set(teamVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 2))));
+        const opponentWords = Array.from(new Set(opponentVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 2))));
         const fuzzyHas = (text, word) => {
             if (!word) return false;
             if (text.includes(word)) return true;
@@ -3019,8 +3095,12 @@ def _open_black_live_match(
             .filter((item) => {
                 if (!opponentVariants.length && !opponentWords.length) return true;
                 const text = normalize(item.text);
-                return opponentVariants.some((value) => normalize(value) && text.includes(normalize(value)))
+                const opponentMatch = opponentVariants.some((value) => normalize(value) && text.includes(normalize(value)))
                     || opponentWords.some((word) => fuzzyHas(text, word));
+                if (opponentMatch) return true;
+                const teamMatch = teamVariants.some((value) => normalize(value) && text.includes(normalize(value)))
+                    || teamWords.some((word) => fuzzyHas(text, word));
+                return teamMatch;
             })
             .slice(0, 8)
             .map((item) => item.text.slice(0, 220));
@@ -3058,7 +3138,7 @@ def _verify_black_betslip_target(
             .replace(/\\s+/g, ' ')
             .trim();
         const wordsFor = (variants) => Array.from(new Set(
-            variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 3))
+            variants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 2))
         ));
         const wordMatch = (text, word) => {
             if (!word) return false;
@@ -3150,6 +3230,47 @@ def _verify_black_betslip_target(
         f"[{profile_label}] Black betslip has {selection} {line}, but match context is not confirmed. "
         f"Ticket: {verified.get('text', '')}"
     )
+
+
+def _click_black_period_tab(driver: webdriver.Remote, preferred_tabs: list[str]) -> None:
+    if not preferred_tabs:
+        return
+    try:
+        driver.execute_script(
+            """
+            const preferredTabs = arguments[0].map((value) => (value || '').toLowerCase().trim());
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.right > 0;
+            };
+            const normalize = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();
+            const candidates = Array.from(document.querySelectorAll('a,button,[role="button"],[role="tab"],li,div,span'))
+                .filter(isVisible)
+                .map((element) => ({
+                    element,
+                    text: normalize(element.innerText || element.textContent || ''),
+                    rect: element.getBoundingClientRect(),
+                }))
+                .filter((item) => item.text && item.text.length <= 48)
+                .filter((item) => preferredTabs.some((tab) => item.text === tab || item.text.startsWith(tab) || item.text.includes(tab)))
+                .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+            if (!candidates.length) return false;
+            const pick = candidates[0].element.closest('a,button,[role="button"],[role="tab"]') || candidates[0].element;
+            pick.scrollIntoView({ block: 'center', inline: 'center' });
+            try { pick.click(); } catch (error) {}
+            return true;
+            """,
+            preferred_tabs,
+        )
+        time.sleep(0.8)
+    except Exception:
+        pass
 
 
 def _select_black_asian_total_goals(
@@ -3251,40 +3372,74 @@ def _select_black_asian_total_goals(
             }
             return null;
         };
+        const parseCompactRowsFromText = (text) => {
+            const rows = [];
+            const compactLineRegex = /(\\d+(?:[.,]\\d+)?)\\s+o\\s+([\\d]+(?:[.,]\\d+)?)\\s+u\\s+([\\d]+(?:[.,]\\d+)?)/gi;
+            let match;
+            while ((match = compactLineRegex.exec(text || '')) !== null) {
+                rows.push({
+                    lineText: normalizeNumber(match[1]),
+                    overOdds: match[2].replace(',', '.'),
+                    underOdds: match[3].replace(',', '.'),
+                });
+            }
+            return rows;
+        };
+        const oddsMatchesValue = (oddsText, targetValue) => {
+            const left = normalizeNumber(oddsText);
+            const right = normalizeNumber(targetValue);
+            return left === right || oddsText.replace(',', '.') === targetValue.replace(',', '.');
+        };
+        const findOddsElementForValue = (rootElement, targetValue) => {
+            return descendants(rootElement, 'button,div,[role="button"],span')
+                .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+                .filter((item) => oddsPattern.test(item.text))
+                .filter((item) => oddsMatchesValue(item.text, targetValue))
+                .sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y)[0] || null;
+        };
         const buildRowCandidate = (element) => {
             const rect = element.getBoundingClientRect();
             const text = normalizedTextOf(element);
-            if (rect.width <= 280 || rect.height < 24 || rect.height > 120) {
+            if (rect.width <= 180 || rect.height < 20 || rect.height > 180) {
                 return null;
             }
             if (!hasOverUnderMarkers(text)) {
                 return null;
             }
-            const lineCell = findExactLineCell(element);
-            if (!lineCell) {
+            let lineCell = findExactLineCell(element);
+            let lineText = lineCell ? normalizeNumber(lineCell.text) : null;
+            let targetOdds = null;
+            if (lineCell) {
+                const overLabel = findSelectionLabel(element, ['over', 'o']);
+                const underLabel = findSelectionLabel(element, ['under', 'u']);
+                targetOdds = pickOddsForSelection(element, lineCell, overLabel, underLabel);
+            } else {
+                const compactRows = parseCompactRowsFromText(text);
+                const targetCompact = compactRows.find((row) => normalizedLineVariants.includes(row.lineText));
+                if (!targetCompact) {
+                    return null;
+                }
+                lineText = targetCompact.lineText;
+                const oddsValue = selection === 'over' ? targetCompact.overOdds : targetCompact.underOdds;
+                targetOdds = findOddsElementForValue(element, oddsValue);
+            }
+            if (!lineText || !targetOdds) {
                 return null;
             }
-            const overLabel = findSelectionLabel(element, ['over', 'o']);
-            const underLabel = findSelectionLabel(element, ['under', 'u']);
-            const targetOdds = pickOddsForSelection(element, lineCell, overLabel, underLabel);
-            if (!targetOdds) {
-                return null;
-            }
-            const anchorRects = [lineCell.rect, targetOdds.rect];
-            if (overLabel) anchorRects.push(overLabel.rect);
-            if (underLabel) anchorRects.push(underLabel.rect);
+            const anchorRects = [targetOdds.rect];
+            if (lineCell) anchorRects.push(lineCell.rect);
             const verticalCenters = anchorRects
                 .map((candidateRect) => candidateRect.top + candidateRect.height / 2);
             const minCenter = Math.min.apply(null, verticalCenters);
             const maxCenter = Math.max.apply(null, verticalCenters);
-            if (maxCenter - minCenter > 30) {
+            if (maxCenter - minCenter > 36) {
                 return null;
             }
             return {
                 element,
                 rect,
                 text,
-                lineText: normalizeNumber(lineCell.text),
+                lineText,
                 targetOdds,
                 area: rect.width * rect.height,
             };
@@ -3344,6 +3499,41 @@ def _select_black_asian_total_goals(
                 selection,
             };
         }
+        const tryCompactSectionSelection = () => {
+            const headers = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
+                .filter(isVisible)
+                .map((element) => ({ element, text: normalizeHeader(normalizedTextOf(element)), rect: element.getBoundingClientRect() }))
+                .filter((item) => marketHeaders.includes(item.text))
+                .sort((a, b) => a.rect.y - b.rect.y);
+            for (const header of headers) {
+                let current = header.element;
+                for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+                    if (!current || !isVisible(current)) continue;
+                    const text = normalizedTextOf(current);
+                    if (!hasOverUnderMarkers(text)) continue;
+                    const compactRows = parseCompactRowsFromText(text);
+                    const targetRow = compactRows.find((row) => normalizedLineVariants.includes(row.lineText));
+                    if (!targetRow) continue;
+                    const oddsValue = selection === 'over' ? targetRow.overOdds : targetRow.underOdds;
+                    const targetOdds = findOddsElementForValue(current, oddsValue);
+                    if (!targetOdds) continue;
+                    clickElement(targetOdds.element);
+                    return {
+                        ok: true,
+                        rowText: text.slice(0, 220),
+                        sectionText: header.text,
+                        lineText: targetRow.lineText,
+                        selection,
+                        mode: 'compact-section',
+                    };
+                }
+            }
+            return null;
+        };
+        const compactResult = tryCompactSectionSelection();
+        if (compactResult) {
+            return compactResult;
+        }
         const sectionTexts = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
             .filter(isVisible)
             .map((element) => normalizedTextOf(element))
@@ -3352,7 +3542,7 @@ def _select_black_asian_total_goals(
         const rowSamples = Array.from(document.querySelectorAll('div,section,li,button,[role="button"]'))
             .filter(isVisible)
             .map((element) => normalizedTextOf(element))
-            .filter((text) => text.includes('over') && text.includes('under'))
+            .filter((text) => hasOverUnderMarkers(text) || (text.includes('over') && text.includes('under')))
             .slice(0, 8);
         return {
             ok: false,
@@ -4269,6 +4459,12 @@ def place_black_bet(session: dict, signal) -> dict:
         # minutes.
         market_headers = _black_market_headers(signal)
         market_label = _signal_market_label(signal)
+        market_key = _signal_market_key(signal)
+        if market_key == "second_half_goals":
+            _click_black_period_tab(
+                driver,
+                ["half-time", "half time", "2nd half", "half-time/full-time"],
+            )
         try:
             WebDriverWait(driver, 20).until(
                 lambda browser: any(header in _visible_text_lower(browser) for header in market_headers)
