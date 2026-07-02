@@ -342,84 +342,88 @@ async def main():
             async def process_betfair_open():
                 """Profile-2 mirror flow: open the same match on Betfair."""
                 await state.ready.wait()
-                betfair_session = next(
-                    (s for s in state.sessions if s.get("betfair")),
-                    None,
-                )
-                if betfair_session is None:
-                    await event.reply("Betfair: профиль не готов — пропускаю.")
-                    return
-                if not betfair_session.get("stake"):
-                    primary_session = next(
-                        (s for s in state.sessions if s.get("login_enabled") and s.get("stake")),
+                async with state.betfair_lock:
+                    betfair_session = next(
+                        (s for s in state.sessions if s.get("betfair")),
                         None,
                     )
-                    if primary_session and primary_session.get("stake"):
-                        betfair_session["stake"] = dict(primary_session["stake"])
-                        betfair_session["stake"]["source"] = "Profile-1 fallback"
-                        state.stakes[betfair_session["profile_label"]] = betfair_session["stake"]
-                        print(
-                            f"Betfair stake missing; using Profile-1 stake EUR "
-                            f"{betfair_session['stake']['stake']} as fallback.",
-                            flush=True,
+                    if betfair_session is None:
+                        await event.reply("Betfair: профиль не готов — пропускаю.")
+                        return
+                    if not betfair_session.get("stake"):
+                        primary_session = next(
+                            (s for s in state.sessions if s.get("login_enabled") and s.get("stake")),
+                            None,
                         )
-                selection_attempts = 3
-                selection_retry_pause = 120  # 3 attempts over ~6 minutes
-                result = None
-                for attempt in range(1, selection_attempts + 1):
-                    async with state.betfair_lock:
+                        if primary_session and primary_session.get("stake"):
+                            betfair_session["stake"] = dict(primary_session["stake"])
+                            betfair_session["stake"]["source"] = "Profile-1 fallback"
+                            state.stakes[betfair_session["profile_label"]] = betfair_session["stake"]
+                            print(
+                                f"Betfair stake missing; using Profile-1 stake EUR "
+                                f"{betfair_session['stake']['stake']} as fallback.",
+                                flush=True,
+                            )
+                    selection_attempts = 3
+                    selection_retry_pause = 120  # 3 attempts over ~6 minutes
+                    result = None
+                    signal_teams = signal.teams or "unknown match"
+                    signal_label = signal.selection_label
+                    for attempt in range(1, selection_attempts + 1):
                         loop = asyncio.get_running_loop()
                         try:
                             result = await loop.run_in_executor(
-                                None, lambda: open_betfair_match(betfair_session, signal)
+                                None,
+                                lambda sig=signal: open_betfair_match(betfair_session, sig),
                             )
                             print(
-                                f"Betfair match open completed: opened={result.get('opened')}, "
+                                f"Betfair match open completed for {signal_teams} ({signal_label}): "
+                                f"opened={result.get('opened')}, "
                                 f"label={result.get('label')!r}, url={result.get('url')}",
                                 flush=True,
                             )
                         except Exception as exc:
                             detail = _describe_exception(exc)
-                            print(f"Betfair match open failed: {detail}", flush=True)
+                            print(f"Betfair match open failed for {signal_teams}: {detail}", flush=True)
                             traceback.print_exc()
                             await event.reply(f"Betfair: ошибка — {detail}")
                             return
 
-                    if not result.get("opened"):
-                        await event.reply(
-                            "Betfair: матч не найден — открыта страница поиска."
-                        )
-                        return
-
-                    sel_err = result.get("selection_error")
-                    if not sel_err:
-                        label = (result.get("label") or "").strip()
-                        await event.reply(
-                            f"Betfair: открыл матч — {label or signal.teams or 'unknown'}"
-                        )
-                        bf_sel = result.get("betfair_selection")
-                        bf_odds = result.get("betfair_odds")
-                        bf_stake = result.get("betfair_stake")
-                        bf_placed = result.get("betfair_bet_placed", False)
-                        if bf_sel:
-                            stake_part = f", ставка {bf_stake}" if bf_stake else ""
-                            placed_part = " ✓" if bf_placed else ""
+                        if not result.get("opened"):
                             await event.reply(
-                                f"Betfair: выбрал Back {bf_sel} @ {bf_odds}{stake_part}{placed_part}"
+                                "Betfair: матч не найден — открыта страница поиска."
                             )
-                        return
+                            return
 
-                    print(
-                        f"Betfair selection attempt {attempt}/{selection_attempts} "
-                        f"did not find the line: {sel_err}",
-                        flush=True,
-                    )
-                    if attempt == selection_attempts:
-                        await event.reply(
-                            "Betfair: 3 раза проверено, нужная ставка так и не появилась на сайте."
+                        sel_err = result.get("selection_error")
+                        if not sel_err:
+                            label = (result.get("label") or "").strip()
+                            await event.reply(
+                                f"Betfair: открыл матч — {label or signal_teams}"
+                            )
+                            bf_sel = result.get("betfair_selection")
+                            bf_odds = result.get("betfair_odds")
+                            bf_stake = result.get("betfair_stake")
+                            bf_placed = result.get("betfair_bet_placed", False)
+                            if bf_sel:
+                                stake_part = f", ставка {bf_stake}" if bf_stake else ""
+                                placed_part = " ✓" if bf_placed else ""
+                                await event.reply(
+                                    f"Betfair: выбрал Back {bf_sel} @ {bf_odds}{stake_part}{placed_part}"
+                                )
+                            return
+
+                        print(
+                            f"Betfair selection attempt {attempt}/{selection_attempts} "
+                            f"for {signal_teams} did not find the line: {sel_err}",
+                            flush=True,
                         )
-                        return
-                    await asyncio.sleep(selection_retry_pause)
+                        if attempt == selection_attempts:
+                            await event.reply(
+                                "Betfair: 3 раза проверено, нужная ставка так и не появилась на сайте."
+                            )
+                            return
+                        await asyncio.sleep(selection_retry_pause)
 
             asyncio.create_task(process_betfair_open())
 

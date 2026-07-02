@@ -5636,6 +5636,51 @@ def _is_betfair_event_url(url: str | None) -> bool:
     return bool(re.search(r"-betting-\d{6,}", lower) or re.search(r"[?&]eventid=\d+", lower))
 
 
+def _betfair_reset_to_exchange_home(driver: webdriver.Remote, profile_label: str) -> None:
+    """Leave the current event page so autocomplete/search cannot reuse the prior match."""
+    current = driver.current_url or ""
+    if not _is_betfair_event_url(current):
+        return
+    print(f"[{profile_label}] Betfair resetting to exchange home before new search.", flush=True)
+    driver.get(BETFAIR_LOGIN_URL)
+    try:
+        WebDriverWait(driver, 12).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except Exception:
+        pass
+    _dismiss_betfair_blocking_overlays(driver, profile_label)
+
+
+def _betfair_label_matches_target(
+    driver: webdriver.Remote,
+    label: str | None,
+    team_norms: list[str],
+    opponent_norms: list[str],
+    min_score: int = 80,
+) -> bool:
+    if not label:
+        return False
+    lowered = label.lower().strip()
+    if "results for" in lowered or lowered.startswith("0 results"):
+        return False
+    try:
+        score = driver.execute_script(
+            _BETFAIR_FUZZY_HELPERS + r"""
+            const label = arguments[0] || '';
+            const teamNorms = arguments[1] || [];
+            const oppNorms = arguments[2] || [];
+            return fuzzyAliasScore(norm(label), teamNorms, oppNorms);
+            """,
+            label,
+            team_norms,
+            opponent_norms,
+        )
+        return bool(score and int(score) >= min_score)
+    except Exception:
+        return False
+
+
 def _find_betfair_event_href_in_dom(
     driver: webdriver.Remote,
     team_norms: list[str],
@@ -5724,17 +5769,14 @@ def _betfair_page_matches_target_event(
             let oppBest = 0;
             for (const oppNorm of oppNorms) oppBest = Math.max(oppBest, countHits(focusText, oppNorm));
             if (oppNorms.length && oppBest < 1) return 0;
-
-            const bodyText = norm((document.body?.innerText || '').slice(0, 25000));
-            const fuzzy = fuzzyAliasScore(bodyText, teamNorms, oppNorms);
-            return teamBest * 60 + oppBest * 80 + Math.min(40, fuzzy);
+            return teamBest * 60 + oppBest * 80;
             """,
             team_norms,
             opponent_norms,
         )
-        return bool(match_score and int(match_score) > 0)
+        return bool(match_score and int(match_score) >= 100)
     except Exception:
-        return True
+        return False
 
 
 def open_betfair_match(session: dict, signal) -> dict:
@@ -5878,6 +5920,8 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
     team_norms = _normalized_team_aliases(team_name)
     opponent_norms = _normalized_team_aliases(opponent_name) if opponent_name else []
 
+    _betfair_reset_to_exchange_home(driver, profile_label)
+
     search_queries: list[str] = []
     seen_queries: set[str] = set()
 
@@ -5902,6 +5946,7 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
 
     clicked_label = None
     for search_query in search_queries or [team_name]:
+        _betfair_reset_to_exchange_home(driver, profile_label)
         search_el = _find_betfair_search_input(driver) or _ensure_betfair_search_input(driver, profile_label)
         if not search_el:
             print(
@@ -5970,7 +6015,10 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                     const text = (el.innerText || el.textContent || '').trim();
                     const score = fuzzyAliasScore(norm(text), teamNorms, oppNorms);
                     return { el, text, n: norm(text), score };
-                }).filter((it) => it.text && it.text.length < 250 && it.score > 0);
+                }).filter((it) => it.text && it.text.length < 250 && it.score >= 80)
+                  .filter((it) => it.n.indexOf('results for') === -1)
+                  .filter((it) => !/^\d+\s+results\b/.test(it.n))
+                  .filter((it) => /\bv\b|\bvs\b/.test(it.n) || it.score >= 120);
                 if (items.length === 0) return null;
                 items.sort((a, b) => b.score - a.score || a.text.length - b.text.length);
                 const pick = items[0];
@@ -5984,6 +6032,15 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
             if clicked_label:
                 break
             time.sleep(0.5)
+
+        if clicked_label and not _betfair_label_matches_target(
+            driver, clicked_label, team_norms, opponent_norms
+        ):
+            print(
+                f"[{profile_label}] Betfair rejected autocomplete result: {clicked_label!r}",
+                flush=True,
+            )
+            clicked_label = None
 
         if not clicked_label:
             print(f"[{profile_label}] No Betfair autocomplete result for '{search_query}'; submitting search via Enter.")
@@ -6021,7 +6078,13 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
 
         followed = _follow_betfair_search_results(driver, team_norms, opponent_norms, profile_label)
         if followed:
-            clicked_label = followed
+            if _betfair_label_matches_target(driver, followed, team_norms, opponent_norms):
+                clicked_label = followed
+            else:
+                print(
+                    f"[{profile_label}] Betfair rejected search-result link: {followed!r}",
+                    flush=True,
+                )
 
         try:
             WebDriverWait(driver, 15).until(
@@ -6070,18 +6133,6 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                 flush=True,
             )
 
-        current_url = (driver.current_url or "").lower()
-        if "/search" not in current_url and "search?" not in current_url and _betfair_page_matches_target_event(driver, team_norms, opponent_norms):
-            inferred_label = f"{team_name} v {opponent_name}" if opponent_name else team_name
-            print(f"[{profile_label}] Betfair left search after query '{search_query}', using current match page.")
-            return {
-                "profile_label": profile_label,
-                "team": team_name,
-                "opponent": opponent_name,
-                "opened": True,
-                "label": inferred_label,
-                "url": driver.current_url,
-            }
     return {
         "profile_label": profile_label,
         "team": team_name,
@@ -6719,9 +6770,37 @@ def _select_betfair_overunder_back(
             const normalizeMarket = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
             const marketTextNorms = marketTexts.map(normalizeMarket);
             const normalizedLine = (lineStr || '').toLowerCase().replace(',', '.').trim();
+            function isBlockedMarket(text) {
+                const t = normalizeMarket(text);
+                if (t.indexOf('correct score') !== -1) return true;
+                if (t.indexOf('match odds') !== -1) return true;
+                if (t.indexOf('half time score') !== -1) return true;
+                if (t.indexOf('asian handicap') !== -1) return true;
+                if (t.indexOf('both teams to score') !== -1) return true;
+                return false;
+            }
+            function looksLikeCorrectScore(text) {
+                return /\b\d+\s*[-–]\s*\d+\b/.test(text || '');
+            }
+            function hasOverUnderContext(text) {
+                const t = normalizeMarket(text);
+                if (isBlockedMarket(t)) return false;
+                if (marketKey === 'second_half_goals') {
+                    return t.indexOf('2nd half') !== -1 || t.indexOf('second half') !== -1
+                        || t.indexOf('half goals') !== -1;
+                }
+                if (marketKey === 'next_goal') {
+                    return t.indexOf('next goal') !== -1 || t.indexOf('full time goals') !== -1
+                        || t.indexOf('over under') !== -1 || t.indexOf('over/under') !== -1;
+                }
+                return t.indexOf('over under') !== -1 || t.indexOf('over/under') !== -1
+                    || (/\bover\s+\d/.test(t) && t.indexOf('goals') !== -1);
+            }
             const rowMatchesSelection = (text) => {
                 const normalized = (text || '').toLowerCase().replace(/\s+/g, ' ').replace(',', '.').trim();
                 if (!normalized || normalized.indexOf(want) === -1) return false;
+                if (looksLikeCorrectScore(normalized)) return false;
+                if (isBlockedMarket(normalized)) return false;
                 if (normalized.indexOf(labelText) !== -1) return true;
                 return normalized.indexOf(normalizedLine) !== -1;
             };
@@ -6834,9 +6913,11 @@ def _select_betfair_overunder_back(
                     .filter(visible)
                     .map((el) => ({ el, text: normalizedTxt(el), rect: el.getBoundingClientRect() }))
                     .filter((item) => item.rect.x > 120)
+                    .filter((item) => !isBlockedMarket(item.text))
                     .filter((item) => {
                         const text = normalizeMarket(item.text);
-                        return marketTextNorms.some((marketText) => text === marketText || text.indexOf(marketText) !== -1);
+                        const matchesMarket = marketTextNorms.some((marketText) => text === marketText || text.indexOf(marketText) !== -1);
+                        return matchesMarket && (hasOverUnderContext(item.text) || matchesMarket);
                     })
                     .sort((a, b) => a.text.length - b.text.length || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
                 const debug = [];
@@ -6846,7 +6927,9 @@ def _select_betfair_overunder_back(
                         if (!visible(container)) continue;
                         const containerText = normalizedTxt(container);
                         const containerMarketText = normalizeMarket(containerText);
+                        if (isBlockedMarket(containerMarketText)) continue;
                         if (!marketTextNorms.some((marketText) => containerMarketText.indexOf(marketText) !== -1)) continue;
+                        if (!hasOverUnderContext(containerText)) continue;
                         if (!rowMatchesSelection(containerText)) continue;
                         const containerRect = container.getBoundingClientRect();
                         if (containerRect.width < 220 || containerRect.height < 55) continue;
@@ -6887,9 +6970,15 @@ def _select_betfair_overunder_back(
                 .filter((el) => {
                     const t = txt(el).toLowerCase();
                     if (!t || t.length > 200) return false;
+                    if (looksLikeCorrectScore(t)) return false;
                     if (!rowMatchesSelection(t)) return false;
                     if (marketKey !== 'second_half_goals' && t.indexOf('half') !== -1) return false;
-                    return true;
+                    let parent = el.parentElement;
+                    for (let depth = 0; depth < 12 && parent; depth++, parent = parent.parentElement) {
+                        const parentText = normalizeMarket(txt(parent));
+                        if (isBlockedMarket(parentText)) return false;
+                    }
+                    return hasOverUnderContext(t) || marketTextNorms.some((marketText) => normalizeMarket(t).indexOf(marketText) !== -1);
                 });
             if (labels.length === 0) {
                 return { error: 'label not found', labelText, marketKey };
