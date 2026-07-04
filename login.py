@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+import random
 import socket
 import subprocess
 import unicodedata
@@ -270,6 +271,23 @@ def connect_to_browser(browser_info: dict, profile_label: str = "") -> webdriver
             time.sleep(3)
 
     raise RuntimeError(f"Could not connect to browser after 3 attempts: {last_exc}")
+
+
+def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str = "") -> None:
+    """Best-effort maximize of the active profile browser window.
+
+    The two AdsPower profiles work strictly one after another; before a profile
+    starts operating we bring its window full-screen so the currently working
+    profile (Asia/Black or Betfair) is the one visible on screen.
+    """
+    try:
+        driver.switch_to.window(driver.current_window_handle)
+    except Exception:
+        pass
+    try:
+        driver.maximize_window()
+    except Exception:
+        pass
 
 
 def _find_first_visible(driver: webdriver.Remote, selectors: list[tuple[str, str]], timeout: int = 30):
@@ -607,6 +625,86 @@ def _betfair_market_texts(signal, line_str: str) -> list[str]:
     ]
 
 
+def _betfair_strict_market_texts(line_str: str, market_key: str) -> list[str]:
+    """Exact left-column market names for the requested Over/Under line only.
+
+    Unlike ``_betfair_market_texts`` these never include generic aliases
+    (``total goals``/``goal lines``) so we click the precise ``Over/Under
+    <line> Goals`` sidebar entry and don't drift onto another line.
+    """
+    if market_key == "second_half_goals":
+        return [
+            f"2nd half over/under {line_str} goals",
+            f"second half over/under {line_str} goals",
+            f"2nd half goals over/under {line_str}",
+            f"second half goals over/under {line_str}",
+        ]
+    return [
+        f"over/under {line_str} goals",
+        f"goals over/under {line_str}",
+    ]
+
+
+def _select_betfair_left_market(driver: webdriver.Remote, strict_texts: list[str], profile_label: str) -> bool:
+    """Click the exact ``Over/Under <line> Goals`` entry in the left market column
+    and confirm the central market panel switched to it.
+
+    Returns True once the requested market is the active one in the main panel.
+    This runs BEFORE selecting a Back cell so the bot never places on a different
+    Over/Under line that also happens to be visible on the page.
+    """
+    end = time.time() + 12
+    last = None
+    while time.time() < end:
+        last = driver.execute_script(
+            r"""
+            const targets = (arguments[0] || []).map((v) =>
+                (v || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim());
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            const normM = (v) =>
+                (v || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+            // 1) Click the LEFT-column entry whose text exactly equals a target.
+            const sidebar = Array.from(document.querySelectorAll("a, button, [role='button'], li"))
+                .filter(visible)
+                .map((el) => ({ el, t: normM(el.innerText || el.textContent || ''), rect: el.getBoundingClientRect() }))
+                .filter((it) => it.t && it.rect.x < window.innerWidth * 0.30 && it.rect.width < window.innerWidth * 0.34)
+                .filter((it) => targets.some((tg) => it.t === tg));
+            let clicked = false, clickedText = null;
+            if (sidebar.length) {
+                sidebar.sort((a, b) => a.rect.y - b.rect.y);
+                const pick = sidebar[0].el.closest("a, button, [role='button'], li") || sidebar[0].el;
+                pick.scrollIntoView({ block: 'center' });
+                try { pick.click(); clicked = true; clickedText = sidebar[0].t; } catch (e) {}
+            }
+            // 2) Verify the CENTRAL market panel now shows exactly this market header.
+            const headers = Array.from(document.querySelectorAll("h1, h2, h3, [role='heading'], div, span, a"))
+                .filter(visible)
+                .map((el) => ({ t: normM(el.innerText || el.textContent || ''), rect: el.getBoundingClientRect() }))
+                .filter((it) => it.t && it.t.length <= 40
+                    && it.rect.x > 160 && it.rect.x < window.innerWidth * 0.72
+                    && it.rect.y > 150 && it.rect.y < window.innerHeight * 0.55);
+            const active = headers.some((it) => targets.some((tg) => it.t === tg || it.t.startsWith(tg)));
+            return { clicked, clickedText, active };
+            """,
+            strict_texts,
+        ) or {"clicked": False, "clickedText": None, "active": False}
+        if last.get("active"):
+            if last.get("clicked"):
+                print(
+                    f"[{profile_label}] Betfair selected left market: {last.get('clickedText')}",
+                    flush=True,
+                )
+            return True
+        time.sleep(0.6)
+    return bool(last and last.get("active"))
+
+
 def _signal_market_label(signal) -> str:
     market_key = _signal_market_key(signal)
     if market_key == "second_half_goals":
@@ -672,10 +770,36 @@ def _money_to_decimal(value: str) -> Decimal:
 
 
 def _format_stake_amount(amount: Decimal) -> str:
-    rounded = amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    if amount > 0 and rounded == Decimal("0.00"):
-        rounded = Decimal("0.01")
+    rounded = _round_stake_to_half(amount)
     return format(rounded, "f")
+
+
+def _round_stake_to_half(amount: Decimal) -> Decimal:
+    """Round a stake DOWN to the nearest 0.5 step (e.g. 1.6 -> 1.5, 1.4 -> 1.0).
+
+    Stakes are always a multiple of 0.5 (either a whole number or x.5). A
+    positive stake is never rounded below the smallest allowed 0.5 step.
+    """
+    if amount <= 0:
+        return Decimal("0")
+    step = Decimal("0.5")
+    floored = (amount / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if floored < step:
+        floored = step
+    return floored.quantize(Decimal("0.1"), rounding=ROUND_DOWN)
+
+
+def _human_delay(min_seconds: float = 1.0, max_seconds: float = 3.0) -> None:
+    """Sleep for a random, human-like pause before a main action.
+
+    Used to space out the primary automation steps (opening a match, running a
+    search, selecting a market, placing a bet) so actions don't fire instantly
+    back to back.
+    """
+    try:
+        time.sleep(random.uniform(min_seconds, max_seconds))
+    except Exception:
+        time.sleep(min_seconds)
 
 
 def _calculate_stake_from_balance(balance: Decimal) -> Decimal:
@@ -2245,6 +2369,7 @@ def check_black_order_by_id(session: dict, order_id: int, signal=None) -> dict:
     driver = None
     try:
         driver = connect_to_browser(session["browser_info"], profile_label)
+        bring_profile_window_to_front(driver, profile_label)
         result = _read_black_order_by_id(driver, profile_label, int(order_id))
     finally:
         close_driver_bridge(driver)
@@ -3423,11 +3548,39 @@ def _select_black_asian_total_goals(
             }).sort((a, b) => b.score - a.score || a.item.rect.y - b.item.rect.y || a.item.rect.x - b.item.rect.x);
             return (scored[0] && scored[0].score > 0 ? scored[0].item : candidates[0]) || null;
         };
+        const allowedMarketContainers = () => {
+            const headers = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
+                .filter(isVisible)
+                .map((element) => ({ element, text: normalizeHeader(normalizedTextOf(element)), rect: element.getBoundingClientRect() }))
+                .filter((item) => marketHeaders.includes(item.text))
+                .sort((a, b) => a.rect.y - b.rect.y);
+            const containers = [];
+            for (const header of headers) {
+                let current = header.element;
+                for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+                    if (!current || !isVisible(current)) continue;
+                    const rect = current.getBoundingClientRect();
+                    if (rect.width > 300 && rect.height > 60) {
+                        if (!containers.includes(current)) containers.push(current);
+                        break;
+                    }
+                }
+            }
+            return containers;
+        };
         const tryRowTextSelection = () => {
+            // Only look inside the allowed Total Goals / Asian Total Goals sections so
+            // we never grab an identical 'X.5 Over/Under' row that belongs to a
+            // different market (e.g. a 'To Score' or 'Total Home/Away Goals' block).
+            const scopeContainers = allowedMarketContainers();
+            if (!scopeContainers.length) {
+                return null;
+            }
             const lineChoices = normalizedLineVariants.map((value) => value.replace(/\\./g, '[.,]')).join('|');
             const rowRegex = new RegExp(`(?:^|\\s)(${lineChoices})\\s+(?:o|over)\\s+([\\d]+(?:[.,]\\d+)?)\\s+(?:u|under)\\s+([\\d]+(?:[.,]\\d+)?)`, 'i');
             const rowElements = Array.from(document.querySelectorAll('div,section,li,button,[role="button"],span'))
                 .filter(isVisible)
+                .filter((element) => scopeContainers.some((container) => container.contains(element)))
                 .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
                 .filter((item) => item.text && item.text.length <= 220)
                 .filter((item) => rowRegex.test(` ${item.text} `))
@@ -4420,6 +4573,7 @@ def place_black_bet(session: dict, signal) -> dict:
     driver = None
     try:
         driver = connect_to_browser(session["browser_info"], profile_label)
+        bring_profile_window_to_front(driver, profile_label)
         # Snapshot the current highest order id before we place anything. The new bet's
         # row must have a strictly greater id, which prevents picking a leftover top row
         # for the same team while the freshly placed row is still rendering.
@@ -4468,6 +4622,7 @@ def place_black_bet(session: dict, signal) -> dict:
                 except Exception:
                     pass
             print(f"[{profile_label}] Searching Black by normalized team: {search_team}")
+            _human_delay()
             _open_black_search(driver, profile_label)
             alternate_names = [name for name in (team_name, opponent_name) if name and name != search_team]
             used_query = _search_black_live_events(driver, search_team, profile_label, alternate_names)
@@ -4531,6 +4686,7 @@ def place_black_bet(session: dict, signal) -> dict:
             WebDriverWait(driver, 20).until(
                 lambda browser: any(header in _visible_text_lower(browser) for header in market_headers)
             )
+            _human_delay()
             _ensure_black_betslip_safe_to_use(driver, profile_label)
             _select_black_asian_total_goals(
                 driver,
@@ -4546,6 +4702,7 @@ def place_black_bet(session: dict, signal) -> dict:
                 f"{team_name} vs {opponent_name or '?'}: {exc}"
             ) from exc
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
+        _human_delay()
         _set_black_betslip_price_and_place(driver, signal.odds, profile_label, stake=stake_value)
         # Just remember the new order id. Order ids are monotonic and only one bet is
         # placed at a time under the bet lock, so the new max id is unambiguously ours.
@@ -5793,12 +5950,15 @@ def open_betfair_match(session: dict, signal) -> dict:
     driver = None
     try:
         driver = connect_to_browser(session["browser_info"], profile_label)
+        bring_profile_window_to_front(driver, profile_label)
+        _human_delay()
         open_result = _betfair_search_and_open(driver, signal, profile_label)
         if not open_result.get("opened"):
             return open_result
         try:
             stake_info = session.get("stake") if isinstance(session.get("stake"), dict) else None
             fallback_stake = (stake_info or {}).get("stake")
+            _human_delay()
             sel_result = _select_betfair_overunder_back(driver, signal, profile_label, fallback_stake=fallback_stake)
             open_result.update(sel_result)
         except Exception as exc:
@@ -6000,6 +6160,7 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
             pass
 
         print(f"[{profile_label}] Betfair search: typing query '{search_query}'")
+        _human_delay()
         search_el.send_keys(search_query)
 
         end = time.time() + 8
@@ -6375,6 +6536,114 @@ def _follow_betfair_search_results(
     return None
 
 
+def _betfair_keep_unmatched_and_update(driver: webdriver.Remote, profile_label: str) -> dict:
+    """Handle Betfair's 'Unmatched bets' / 'During In-Play' panel.
+
+    The unmatched bet lives on the 'Open bets' tab (not the 'Place bets' tab used
+    to place the bet). After placing we switch to 'Open bets' and check: if there
+    is no unmatched-bet row the bet is fully matched and we're done; if there is
+    one we set 'During In-Play' to 'Keep' and click 'Update' to keep it live.
+    Best-effort and idempotent.
+    """
+    # 1) Switch to the 'Open bets' tab where unmatched bets are shown.
+    try:
+        driver.execute_script(
+            r"""
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            function norm(text) {
+                return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            }
+            const tabs = Array.from(document.querySelectorAll("button, a, [role='tab'], li, div, span"))
+                .filter(visible)
+                .map((el) => ({ el, t: norm(el.innerText || el.textContent || el.getAttribute('aria-label') || ''), rect: el.getBoundingClientRect() }))
+                .filter((it) => it.t === 'open bets' || it.t.startsWith('open bets'))
+                .filter((it) => it.rect.x > window.innerWidth * 0.45)
+                .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+            if (tabs.length) {
+                const pick = tabs[0].el.closest("button, a, [role='tab'], li") || tabs[0].el;
+                pick.scrollIntoView({ block: 'center', inline: 'center' });
+                try { pick.click(); } catch (e) {}
+                return true;
+            }
+            return false;
+            """
+        )
+    except Exception:
+        pass
+    time.sleep(1.2)
+
+    # 2) On the Open bets tab, detect the unmatched panel and Keep + Update it.
+    try:
+        result = driver.execute_script(
+            r"""
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            function norm(text) {
+                return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            }
+            const bodyNorm = norm(document.body ? document.body.innerText : '');
+            const hasPanel = bodyNorm.includes('during in-play')
+                || bodyNorm.includes('unmatched bets')
+                || bodyNorm.includes('cancel all unmatched');
+            if (!hasPanel) return { present: false };
+
+            // 1) Select the 'Keep' option (label + its radio input).
+            let keptClicked = false;
+            const keepLabels = Array.from(document.querySelectorAll("label, span, div, button, [role='radio']"))
+                .filter(visible)
+                .map((el) => ({ el, t: norm(el.innerText || el.textContent || el.getAttribute('aria-label') || ''), rect: el.getBoundingClientRect() }))
+                .filter((it) => it.t === 'keep')
+                .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+            for (const lab of keepLabels) {
+                try { lab.el.scrollIntoView({ block: 'center' }); } catch (e) {}
+                try { lab.el.click(); keptClicked = true; } catch (e) {}
+                const forId = lab.el.getAttribute ? lab.el.getAttribute('for') : null;
+                if (forId) {
+                    const inp = document.getElementById(forId);
+                    if (inp && visible(inp)) { try { inp.click(); keptClicked = true; } catch (e) {} }
+                }
+                // Radio input sitting just left of the 'Keep' label on the same row.
+                const r = lab.rect;
+                const radios = Array.from(document.querySelectorAll("input[type='radio'], [role='radio']"))
+                    .filter(visible)
+                    .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+                    .filter((it) => Math.abs(it.rect.top - r.top) < 22 && it.rect.left <= r.left + 6 && (r.left - it.rect.left) < 80)
+                    .sort((a, b) => (r.left - a.rect.left) - (r.left - b.rect.left));
+                if (radios.length) { try { radios[0].el.click(); keptClicked = true; } catch (e) {} }
+                if (keptClicked) break;
+            }
+
+            // 2) Click 'Update' (prefer the rightmost, matching the panel layout).
+            let updateClicked = false;
+            const updateButtons = Array.from(document.querySelectorAll("button, [role='button'], input[type='submit'], input[type='button']"))
+                .filter(visible)
+                .map((el) => ({ el, t: norm(el.innerText || el.value || el.getAttribute('aria-label') || ''), rect: el.getBoundingClientRect() }))
+                .filter((it) => it.t === 'update' || it.t.startsWith('update'))
+                .sort((a, b) => b.rect.x - a.rect.x || a.rect.y - b.rect.y);
+            if (updateButtons.length) {
+                const pick = updateButtons[0].el;
+                try { pick.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+                try { pick.click(); updateClicked = true; } catch (e) {}
+            }
+            return { present: true, keptClicked, updateClicked };
+            """
+        )
+        return result if isinstance(result, dict) else {"present": False}
+    except Exception as exc:
+        return {"present": False, "error": str(exc)}
+
+
 def _select_betfair_overunder_back(
     driver: webdriver.Remote,
     signal,
@@ -6399,6 +6668,7 @@ def _select_betfair_overunder_back(
     market_texts = _betfair_market_texts(signal, line_str)
     market_label = _signal_market_label(signal)
     market_key = _signal_market_key(signal)
+    strict_market_texts = _betfair_strict_market_texts(line_str, market_key)
     allow_label_fallback = True
     preferred_tabs = ["half time", "2nd half"] if market_key == "second_half_goals" else []
 
@@ -6436,36 +6706,44 @@ def _select_betfair_overunder_back(
         except Exception:
             pass
 
-    # 1) Try to bring the market into the DOM: click the left-sidebar entry if
-    # the market section is not already visible.
-    try:
-        driver.execute_script(
-            r"""
-            const marketTexts = arguments[0];
-            const normalizeMarket = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
-            const marketTextNorms = marketTexts.map(normalizeMarket);
-            function visible(el) {
-                if (!el) return false;
-                const r = el.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) return false;
-                const cs = window.getComputedStyle(el);
-                return cs.visibility !== 'hidden' && cs.display !== 'none';
-            }
-            const links = Array.from(document.querySelectorAll("a, button, [role='button'], li"))
-                .filter(visible)
-                .filter((el) => {
-                    const t = normalizeMarket(el.innerText || '');
-                    return marketTextNorms.some((marketText) => t === marketText || t.includes(marketText));
-                });
-            if (links.length > 0) {
-                links[0].scrollIntoView({ block: 'center' });
-                links[0].click();
-            }
-            """,
-            market_texts,
+    # 1) Select the exact Over/Under <line> Goals market from the LEFT column first,
+    # and confirm the central panel switched to it, so we never place a bet on a
+    # different Over/Under line that also happens to be visible on the page.
+    left_selected = _select_betfair_left_market(driver, strict_market_texts, profile_label)
+    if not left_selected:
+        print(
+            f"[{profile_label}] Betfair could not confirm left market "
+            f"{strict_market_texts[0]!r}; falling back to in-page market detection.",
+            flush=True,
         )
-    except Exception:
-        pass
+        try:
+            driver.execute_script(
+                r"""
+                const marketTexts = arguments[0];
+                const normalizeMarket = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+                const marketTextNorms = marketTexts.map(normalizeMarket);
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const cs = window.getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none';
+                }
+                const links = Array.from(document.querySelectorAll("a, button, [role='button'], li"))
+                    .filter(visible)
+                    .filter((el) => {
+                        const t = normalizeMarket(el.innerText || '');
+                        return marketTextNorms.some((marketText) => t === marketText || t.includes(marketText));
+                    });
+                if (links.length > 0) {
+                    links[0].scrollIntoView({ block: 'center' });
+                    links[0].click();
+                }
+                """,
+                market_texts,
+            )
+        except Exception:
+            pass
 
     # 2) Poll for a row whose label text equals 'Over <line> Goals' / 'Under <line> Goals'
     end = time.time() + 30
@@ -7069,6 +7347,7 @@ def _select_betfair_overunder_back(
     )
 
     # 3) Fill in stake and place the bet.
+    _human_delay()
     stake_str = None
     bet_placed = False
     accepted_odds_text = target_odds
@@ -7569,9 +7848,21 @@ def _select_betfair_overunder_back(
             last_betfair_error = f"stake/odds fill failed: {placed!r}"
         else:
             accepted_odds_text = str(placed.get("oddsValue") or target_odds)
-            # Wait for Betfair UI to update button label to "Confirm bet".
+            # New right-side betslip: click the yellow "Place bets" button, then
+            # Betfair shows a "Please confirm your bets" view with "Confirm bets".
+            # Both the place button and the confirm view can render with a small
+            # delay, so poll for each instead of relying on a fixed sleep.
             time.sleep(1.2)
-            confirmed = _click_betfair_action_button(confirm_only=False)
+            confirmed = None
+            place_deadline = time.monotonic() + 6
+            while True:
+                confirmed = _click_betfair_action_button(confirm_only=False)
+                if isinstance(confirmed, dict) and confirmed.get("ok"):
+                    break
+                if time.monotonic() >= place_deadline:
+                    break
+                _activate_betfair_betslip()
+                time.sleep(0.7)
             if isinstance(confirmed, dict) and confirmed.get("ok"):
                 first_label = confirmed.get("label", "")
                 print(
@@ -7579,11 +7870,16 @@ def _select_betfair_overunder_back(
                     f"{market_label} {selection.title()} {line_str} @ {accepted_odds_text} "
                     f"(target {target_odds}, available {odds_text}), stake {stake_str}"
                 )
-                # If the first button was "Place bet/bets", Betfair shows a
-                # second "Confirm bet" button. Wait and click it.
+                # If the first button was "Place bet(s)", Betfair shows a second
+                # "Confirm bet(s)" button. Poll for it for a few seconds.
                 if "place" in first_label.lower():
-                    time.sleep(1.2)
-                    confirmed2 = _click_betfair_action_button(confirm_only=True)
+                    confirmed2 = None
+                    confirm_deadline = time.monotonic() + 8
+                    while time.monotonic() < confirm_deadline:
+                        time.sleep(0.8)
+                        confirmed2 = _click_betfair_action_button(confirm_only=True)
+                        if isinstance(confirmed2, dict) and confirmed2.get("ok"):
+                            break
                     if isinstance(confirmed2, dict) and confirmed2.get("ok"):
                         print(
                             f"[{profile_label}] Betfair: confirmed — "
@@ -7603,6 +7899,24 @@ def _select_betfair_overunder_back(
                 print(f"[{profile_label}] Betfair: confirm click result: {confirmed!r}", flush=True)
     else:
         last_betfair_error = last_betfair_error or "stake value is unavailable"
+
+    if bet_placed:
+        # If the bet is not fully matched in-play, Betfair shows an 'Unmatched
+        # bets' panel on the 'Open bets' tab — switch there, and set it to 'Keep'
+        # then 'Update' if present. No panel there means it fully matched.
+        time.sleep(1.0)
+        keep_update = _betfair_keep_unmatched_and_update(driver, profile_label)
+        if keep_update.get("present"):
+            print(
+                f"[{profile_label}] Betfair unmatched-bet panel handled on Open bets: "
+                f"keep={keep_update.get('keptClicked')}, update={keep_update.get('updateClicked')}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[{profile_label}] Betfair: no unmatched bets on Open bets tab — bet fully matched.",
+                flush=True,
+            )
 
     if not bet_placed:
         raise RuntimeError(

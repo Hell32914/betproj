@@ -339,190 +339,197 @@ async def main():
                 f"{signal.selection_label}"
             )
 
-            async def process_betfair_open():
-                """Profile-2 mirror flow: open the same match on Betfair."""
+            async def process_signal():
+                """Strictly serialized flow for one signal.
+
+                Asia/Black works first (full-screen), then Betfair works
+                (full-screen). If either one cannot find the requested line it is
+                retried, and when both are still missing the line they are checked
+                one after another (never at the same time) for up to 3 rounds.
+                Finally, if Black placed a bet, its order status is checked ~5 min
+                later.
+                """
                 await state.ready.wait()
-                async with state.betfair_lock:
-                    betfair_session = next(
-                        (s for s in state.sessions if s.get("betfair")),
-                        None,
+                loop = asyncio.get_running_loop()
+
+                signal_teams = signal.teams or "unknown match"
+                signal_label = signal.selection_label
+
+                max_rounds = 3
+                round_pause = 90  # seconds between alternating retry rounds
+                deferred_check_delay = 5 * 60  # final Black status check delay
+
+                # State machines: "pending" -> placed | missing | not_found | error
+                black_state = "pending"
+                black_order_id = None
+                black_place_result = None
+                betfair_state = "pending"
+
+                def _pick_black_session():
+                    return next(
+                        (s for s in state.sessions if s.get("login_enabled")),
+                        state.sessions[0],
                     )
-                    if betfair_session is None:
-                        await event.reply("Betfair: профиль не готов — пропускаю.")
-                        return
-                    if not betfair_session.get("stake"):
-                        primary_session = next(
-                            (s for s in state.sessions if s.get("login_enabled") and s.get("stake")),
-                            None,
-                        )
-                        if primary_session and primary_session.get("stake"):
-                            betfair_session["stake"] = dict(primary_session["stake"])
-                            betfair_session["stake"]["source"] = "Profile-1 fallback"
-                            state.stakes[betfair_session["profile_label"]] = betfair_session["stake"]
-                            print(
-                                f"Betfair stake missing; using Profile-1 stake EUR "
-                                f"{betfair_session['stake']['stake']} as fallback.",
-                                flush=True,
-                            )
-                    selection_attempts = 3
-                    selection_retry_pause = 120  # 3 attempts over ~6 minutes
-                    result = None
-                    signal_teams = signal.teams or "unknown match"
-                    signal_label = signal.selection_label
-                    for attempt in range(1, selection_attempts + 1):
-                        loop = asyncio.get_running_loop()
-                        try:
-                            result = await loop.run_in_executor(
-                                None,
-                                lambda sig=signal: open_betfair_match(betfair_session, sig),
-                            )
-                            print(
-                                f"Betfair match open completed for {signal_teams} ({signal_label}): "
-                                f"opened={result.get('opened')}, "
-                                f"label={result.get('label')!r}, url={result.get('url')}",
-                                flush=True,
-                            )
-                        except Exception as exc:
-                            detail = _describe_exception(exc)
-                            print(f"Betfair match open failed for {signal_teams}: {detail}", flush=True)
-                            traceback.print_exc()
-                            await event.reply(f"Betfair: ошибка — {detail}")
-                            return
 
-                        if not result.get("opened"):
-                            await event.reply(
-                                "Betfair: матч не найден — открыта страница поиска."
-                            )
-                            return
+                def _pick_betfair_session():
+                    return next((s for s in state.sessions if s.get("betfair")), None)
 
-                        sel_err = result.get("selection_error")
-                        if not sel_err:
-                            label = (result.get("label") or "").strip()
-                            await event.reply(
-                                f"Betfair: открыл матч — {label or signal_teams}"
-                            )
-                            bf_sel = result.get("betfair_selection")
-                            bf_odds = result.get("betfair_odds")
-                            bf_stake = result.get("betfair_stake")
-                            bf_placed = result.get("betfair_bet_placed", False)
-                            if bf_sel:
-                                stake_part = f", ставка {bf_stake}" if bf_stake else ""
-                                placed_part = " ✓" if bf_placed else ""
-                                await event.reply(
-                                    f"Betfair: выбрал Back {bf_sel} @ {bf_odds}{stake_part}{placed_part}"
+                for round_index in range(1, max_rounds + 1):
+                    is_last_round = round_index == max_rounds
+
+                    # ---- Phase 1: Asia / Black ----
+                    if black_state in ("pending", "missing"):
+                        async with state.bet_lock:
+                            primary_session = _pick_black_session()
+                            try:
+                                place_result = await loop.run_in_executor(
+                                    None, lambda: place_black_bet(primary_session, signal)
                                 )
-                            return
-
-                        print(
-                            f"Betfair selection attempt {attempt}/{selection_attempts} "
-                            f"for {signal_teams} did not find the line: {sel_err}",
-                            flush=True,
-                        )
-                        if attempt == selection_attempts:
-                            await event.reply(
-                                "Betfair: 3 раза проверено, нужная ставка так и не появилась на сайте."
-                            )
-                            return
-                        await asyncio.sleep(selection_retry_pause)
-
-            asyncio.create_task(process_betfair_open())
-
-            async def process_signal_reply():
-                await state.ready.wait()
-                # Up to 3 attempts at placing the bet. If the Asian Total Goals line
-                # isn't on the site yet we release the bet lock between attempts so
-                # other queued signals can be placed in the meantime; the signal that
-                # is still waiting for its line just rejoins the queue after the pause.
-                selection_attempts = 3
-                selection_retry_pause = 90  # seconds — 3 attempts * 90s ≈ 4.5 min total
-                deferred_check_delay = 5 * 60  # final status check 5 min after placing
-                place_result = None
-                for attempt in range(1, selection_attempts + 1):
-                    async with state.bet_lock:
-                        primary_session = next(
-                            (session for session in state.sessions if session.get("login_enabled")),
-                            state.sessions[0],
-                        )
-                        loop = asyncio.get_running_loop()
-                        try:
-                            place_result = await loop.run_in_executor(
-                                None, lambda: place_black_bet(primary_session, signal)
-                            )
-                            print(
-                                f"Black bet placement completed with status: "
-                                f"{place_result.get('status')}, orderId={place_result.get('order_id')}",
-                                flush=True,
-                            )
-                            break
-                        except BlackSelectionMissingError as exc:
-                            print(
-                                f"Black bet placement attempt {attempt}/{selection_attempts} "
-                                f"gave up on missing line: {exc}",
-                                flush=True,
-                            )
-                            if attempt == selection_attempts:
-                                await event.reply(
-                                    "Asia: Ставка проверена 3 раза, нужная линия так и не появилась на сайте."
+                                black_place_result = place_result
+                                black_order_id = place_result.get("order_id")
+                                black_state = "placed"
+                                print(
+                                    f"Black bet placement completed with status: "
+                                    f"{place_result.get('status')}, orderId={black_order_id}",
+                                    flush=True,
                                 )
-                                return
-                        except Exception as exc:
-                            detail = _describe_exception(exc)
-                            print(f"Black bet placement failed: {detail}", flush=True)
-                            traceback.print_exc()
-                            await event.reply(f"Asia: Ставка не завершена: {detail}")
-                            return
-                    # Lock released here so queued signals can place their bets while we wait.
-                    await asyncio.sleep(selection_retry_pause)
+                            except BlackSelectionMissingError as exc:
+                                black_state = "missing"
+                                print(
+                                    f"Black attempt {round_index}/{max_rounds} "
+                                    f"gave up on missing line: {exc}",
+                                    flush=True,
+                                )
+                                if is_last_round:
+                                    await event.reply(
+                                        "Asia: Ставка проверена 3 раза, нужная линия так и не появилась на сайте."
+                                    )
+                            except Exception as exc:
+                                black_state = "error"
+                                detail = _describe_exception(exc)
+                                print(f"Black bet placement failed: {detail}", flush=True)
+                                traceback.print_exc()
+                                await event.reply(f"Asia: Ставка не завершена: {detail}")
 
-                if place_result is None:
+                    # ---- Phase 2: Betfair (only after Asia finished this round) ----
+                    if betfair_state in ("pending", "missing"):
+                        betfair_session = _pick_betfair_session()
+                        if betfair_session is None:
+                            betfair_state = "error"
+                            await event.reply("Betfair: профиль не готов — пропускаю.")
+                        else:
+                            async with state.betfair_lock:
+                                if not betfair_session.get("stake"):
+                                    stake_source = next(
+                                        (s for s in state.sessions if s.get("login_enabled") and s.get("stake")),
+                                        None,
+                                    )
+                                    if stake_source and stake_source.get("stake"):
+                                        betfair_session["stake"] = dict(stake_source["stake"])
+                                        betfair_session["stake"]["source"] = "Profile-1 fallback"
+                                        state.stakes[betfair_session["profile_label"]] = betfair_session["stake"]
+                                        print(
+                                            f"Betfair stake missing; using Profile-1 stake EUR "
+                                            f"{betfair_session['stake']['stake']} as fallback.",
+                                            flush=True,
+                                        )
+                                try:
+                                    result = await loop.run_in_executor(
+                                        None,
+                                        lambda sig=signal: open_betfair_match(betfair_session, sig),
+                                    )
+                                    print(
+                                        f"Betfair match open completed for {signal_teams} ({signal_label}): "
+                                        f"opened={result.get('opened')}, "
+                                        f"label={result.get('label')!r}, url={result.get('url')}",
+                                        flush=True,
+                                    )
+                                    if not result.get("opened"):
+                                        betfair_state = "not_found"
+                                        await event.reply(
+                                            "Betfair: матч не найден — открыта страница поиска."
+                                        )
+                                    elif result.get("selection_error"):
+                                        betfair_state = "missing"
+                                        print(
+                                            f"Betfair attempt {round_index}/{max_rounds} for "
+                                            f"{signal_teams} did not find the line: {result.get('selection_error')}",
+                                            flush=True,
+                                        )
+                                        if is_last_round:
+                                            await event.reply(
+                                                "Betfair: 3 раза проверено, нужная ставка так и не появилась на сайте."
+                                            )
+                                    else:
+                                        betfair_state = "placed"
+                                        label = (result.get("label") or "").strip()
+                                        await event.reply(
+                                            f"Betfair: открыл матч — {label or signal_teams}"
+                                        )
+                                        bf_sel = result.get("betfair_selection")
+                                        if bf_sel:
+                                            bf_odds = result.get("betfair_odds")
+                                            bf_stake = result.get("betfair_stake")
+                                            bf_placed = result.get("betfair_bet_placed", False)
+                                            stake_part = f", ставка {bf_stake}" if bf_stake else ""
+                                            placed_part = " ✓" if bf_placed else ""
+                                            await event.reply(
+                                                f"Betfair: выбрал Back {bf_sel} @ {bf_odds}{stake_part}{placed_part}"
+                                            )
+                                except Exception as exc:
+                                    betfair_state = "error"
+                                    detail = _describe_exception(exc)
+                                    print(f"Betfair match open failed for {signal_teams}: {detail}", flush=True)
+                                    traceback.print_exc()
+                                    await event.reply(f"Betfair: ошибка — {detail}")
+
+                    # Keep retrying (one after another) only while a side still misses the line.
+                    if black_state != "missing" and betfair_state != "missing":
+                        break
+                    if not is_last_round:
+                        await asyncio.sleep(round_pause)
+
+                # ---- Phase 3: Black deferred final status (only if it placed) ----
+                if black_state != "placed":
                     return
 
-                order_id = place_result.get("order_id")
-                if order_id is None or order_id == "":
-                    # Couldn't capture the order id — send a single error reply.
+                if black_order_id in (None, ""):
                     await event.reply(
                         "Asia: Не удалось определить номер заказа после ставки — проверьте вручную."
                     )
                     return
 
                 print(
-                    f"Black bet placed, order #{order_id}. Sleeping {deferred_check_delay}s "
+                    f"Black bet placed, order #{black_order_id}. Sleeping {deferred_check_delay}s "
                     f"before final status check.",
                     flush=True,
                 )
-                # No interim Telegram message — wait 5 minutes outside the bet lock so
-                # queued signals can be placed, then look up the exact order id and send
-                # the single final reply.
                 await asyncio.sleep(deferred_check_delay)
 
                 async with state.bet_lock:
-                    primary_session = next(
-                        (session for session in state.sessions if session.get("login_enabled")),
-                        state.sessions[0],
-                    )
-                    loop = asyncio.get_running_loop()
+                    primary_session = _pick_black_session()
                     try:
                         final_result = await loop.run_in_executor(
                             None,
-                            lambda: check_black_order_by_id(primary_session, order_id, signal),
+                            lambda: check_black_order_by_id(primary_session, black_order_id, signal),
                         )
                         print(
-                            f"Black deferred check for order #{order_id}: "
+                            f"Black deferred check for order #{black_order_id}: "
                             f"status={final_result.get('order_status')}, "
                             f"stake={final_result.get('order_stake')}",
                             flush=True,
                         )
-                        final_result.setdefault("teams", place_result.get("teams"))
-                        final_result.setdefault("selection", place_result.get("selection"))
-                        final_result.setdefault("odds", place_result.get("odds"))
+                        final_result.setdefault("teams", (black_place_result or {}).get("teams"))
+                        final_result.setdefault("selection", (black_place_result or {}).get("selection"))
+                        final_result.setdefault("odds", (black_place_result or {}).get("odds"))
                         await event.reply(_format_signal_result_message(final_result))
                     except Exception as exc:
                         print(f"Black deferred order check failed: {exc}", flush=True)
                         await event.reply(
-                            f"Asia: Не удалось прочитать итог по заказу #{order_id}: {exc}"
+                            f"Asia: Не удалось прочитать итог по заказу #{black_order_id}: {exc}"
                         )
 
-            asyncio.create_task(process_signal_reply())
+            asyncio.create_task(process_signal())
 
         adspower_task = asyncio.create_task(start_adspower_after_listener_ready(state))
         adspower_task.add_done_callback(report_adspower_task_result)
