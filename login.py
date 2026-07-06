@@ -612,6 +612,8 @@ def _betfair_market_texts(signal, line_str: str) -> list[str]:
             "second half over under goals",
             f"2nd half over/under {line_str} goals",
             f"second half over/under {line_str} goals",
+            f"over/under {line_str} goals",
+            f"goals over/under {line_str}",
         ]
     return [
         f"over/under {line_str} goals",
@@ -633,11 +635,15 @@ def _betfair_strict_market_texts(line_str: str, market_key: str) -> list[str]:
     <line> Goals`` sidebar entry and don't drift onto another line.
     """
     if market_key == "second_half_goals":
+        # Betfair often labels the left column as plain "Over/Under X.X Goals" once
+        # the Half Time / 2nd half tab is active — no "2nd half" prefix in the name.
         return [
             f"2nd half over/under {line_str} goals",
             f"second half over/under {line_str} goals",
             f"2nd half goals over/under {line_str}",
             f"second half goals over/under {line_str}",
+            f"over/under {line_str} goals",
+            f"goals over/under {line_str}",
         ]
     return [
         f"over/under {line_str} goals",
@@ -645,7 +651,12 @@ def _betfair_strict_market_texts(line_str: str, market_key: str) -> list[str]:
     ]
 
 
-def _select_betfair_left_market(driver: webdriver.Remote, strict_texts: list[str], profile_label: str) -> bool:
+def _select_betfair_left_market(
+    driver: webdriver.Remote,
+    strict_texts: list[str],
+    profile_label: str,
+    market_key: str = "full_time_goals",
+) -> bool:
     """Click the exact ``Over/Under <line> Goals`` entry in the left market column
     and confirm the central market panel switched to it.
 
@@ -660,6 +671,7 @@ def _select_betfair_left_market(driver: webdriver.Remote, strict_texts: list[str
             r"""
             const targets = (arguments[0] || []).map((v) =>
                 (v || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim());
+            const marketKey = arguments[1] || 'full_time_goals';
             function visible(el) {
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
@@ -669,15 +681,38 @@ def _select_betfair_left_market(driver: webdriver.Remote, strict_texts: list[str
             }
             const normM = (v) =>
                 (v || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
-            // 1) Click the LEFT-column entry whose text exactly equals a target.
-            const sidebar = Array.from(document.querySelectorAll("a, button, [role='button'], li"))
+            const isSecondHalf = marketKey === 'second_half_goals';
+            const specificTargets = targets.filter((tg) =>
+                tg.indexOf('2nd half') !== -1 || tg.indexOf('second half') !== -1);
+            const genericTargets = targets.filter((tg) =>
+                tg.indexOf('2nd half') === -1 && tg.indexOf('second half') === -1);
+            const sidebarItems = Array.from(document.querySelectorAll("a, button, [role='button'], li"))
                 .filter(visible)
                 .map((el) => ({ el, t: normM(el.innerText || el.textContent || ''), rect: el.getBoundingClientRect() }))
-                .filter((it) => it.t && it.rect.x < window.innerWidth * 0.30 && it.rect.width < window.innerWidth * 0.34)
-                .filter((it) => targets.some((tg) => it.t === tg));
+                .filter((it) => it.t && it.rect.x < window.innerWidth * 0.30 && it.rect.width < window.innerWidth * 0.34);
+            let activeTargets = targets;
+            if (isSecondHalf) {
+                activeTargets = specificTargets.length ? specificTargets.slice() : [];
+                const hasSpecificInSidebar = sidebarItems.some((it) =>
+                    specificTargets.some((tg) => it.t === tg));
+                if (!hasSpecificInSidebar && genericTargets.length) {
+                    activeTargets = activeTargets.concat(genericTargets);
+                }
+            }
+            if (!activeTargets.length) {
+                return { clicked: false, clickedText: null, active: false };
+            }
+            // 1) Click the LEFT-column entry whose text exactly equals a target.
+            const sidebar = sidebarItems
+                .filter((it) => activeTargets.some((tg) => it.t === tg));
             let clicked = false, clickedText = null;
             if (sidebar.length) {
-                sidebar.sort((a, b) => a.rect.y - b.rect.y);
+                sidebar.sort((a, b) => {
+                    const aSpec = specificTargets.some((tg) => a.t === tg) ? 0 : 1;
+                    const bSpec = specificTargets.some((tg) => b.t === tg) ? 0 : 1;
+                    if (aSpec !== bSpec) return aSpec - bSpec;
+                    return a.rect.y - b.rect.y;
+                });
                 const pick = sidebar[0].el.closest("a, button, [role='button'], li") || sidebar[0].el;
                 pick.scrollIntoView({ block: 'center' });
                 try { pick.click(); clicked = true; clickedText = sidebar[0].t; } catch (e) {}
@@ -689,10 +724,11 @@ def _select_betfair_left_market(driver: webdriver.Remote, strict_texts: list[str
                 .filter((it) => it.t && it.t.length <= 40
                     && it.rect.x > 160 && it.rect.x < window.innerWidth * 0.72
                     && it.rect.y > 150 && it.rect.y < window.innerHeight * 0.55);
-            const active = headers.some((it) => targets.some((tg) => it.t === tg || it.t.startsWith(tg)));
+            const active = headers.some((it) => activeTargets.some((tg) => it.t === tg || it.t.startsWith(tg)));
             return { clicked, clickedText, active };
             """,
             strict_texts,
+            market_key,
         ) or {"clicked": False, "clickedText": None, "active": False}
         if last.get("active"):
             if last.get("clicked"):
@@ -6709,7 +6745,7 @@ def _select_betfair_overunder_back(
     # 1) Select the exact Over/Under <line> Goals market from the LEFT column first,
     # and confirm the central panel switched to it, so we never place a bet on a
     # different Over/Under line that also happens to be visible on the page.
-    left_selected = _select_betfair_left_market(driver, strict_market_texts, profile_label)
+    left_selected = _select_betfair_left_market(driver, strict_market_texts, profile_label, market_key)
     if not left_selected:
         print(
             f"[{profile_label}] Betfair could not confirm left market "
@@ -7064,8 +7100,15 @@ def _select_betfair_overunder_back(
                 const t = normalizeMarket(text);
                 if (isBlockedMarket(t)) return false;
                 if (marketKey === 'second_half_goals') {
-                    return t.indexOf('2nd half') !== -1 || t.indexOf('second half') !== -1
-                        || t.indexOf('half goals') !== -1;
+                    if (t.indexOf('2nd half') !== -1 || t.indexOf('second half') !== -1
+                        || t.indexOf('half goals') !== -1) {
+                        return true;
+                    }
+                    // After the Half Time tab is selected, Betfair may show only
+                    // "Over/Under <line> Goals" without a second-half prefix.
+                    const lineNorm = normalizedLine.replace(/\./g, ' ');
+                    return (t.indexOf('over under') !== -1 || t.indexOf('over/under') !== -1)
+                        && t.indexOf(lineNorm) !== -1;
                 }
                 if (marketKey === 'next_goal') {
                     return t.indexOf('next goal') !== -1 || t.indexOf('full time goals') !== -1
