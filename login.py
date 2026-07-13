@@ -26,7 +26,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.common.exceptions import NoSuchWindowException, TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    NoSuchWindowException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 
 load_dotenv()
@@ -1412,6 +1417,17 @@ def _open_black_search(driver: webdriver.Remote, profile_label: str) -> None:
         return
 
     if result is not True:
+        # Hard recovery: leave Orders/stuck pages, reopen sportsbook, try Ctrl+F again.
+        try:
+            driver.get(BLACK_SPORTSBOOK_URL)
+            _wait_document_ready(driver)
+            time.sleep(1.5)
+            _dismiss_black_update_banner(driver, profile_label)
+            if open_search_with_shortcut(driver):
+                print(f"[{profile_label}] Opened Black search via sportsbook Ctrl+F recovery.")
+                return
+        except Exception:
+            pass
         raise RuntimeError(f"Could not open Black search. Details: {result!r}")
     WebDriverWait(driver, 10).until(search_dialog_open)
     print(f"[{profile_label}] Opened Black search.")
@@ -1977,7 +1993,7 @@ def _read_black_orders_max_id(driver: webdriver.Remote, profile_label: str) -> i
                         text: textOf(element),
                         rect: element.getBoundingClientRect(),
                     }))
-                    .filter((item) => item.text && /\\b\\d{6,14}\\b/.test(item.text))
+                    .filter((item) => item.text && /\\b\\d{9,10}\\b/.test(item.text))
                     .filter((item) => item.text.length <= 320)
                     .filter((item) => !hasOrdersHeaders(item.text))
                     .filter((item) => /\u20ac/.test(item.text) || statusRegex.test(item.text) || item.text.toLowerCase().includes('order id'))
@@ -1999,10 +2015,14 @@ def _read_black_orders_max_id(driver: webdriver.Remote, profile_label: str) -> i
 
             let max = 0;
             for (const source of sources) {
-                const matches = source.match(/\\b\\d{6,14}\\b/g) || [];
+                // Black order ids are typically 9-10 digits (e.g. 1862754449).
+                // Wider matches pick up timestamps / event ids and break the watermark.
+                const matches = source.match(/\\b\\d{9,10}\\b/g) || [];
                 for (const value of matches) {
                     const num = parseInt(value, 10);
-                    if (Number.isFinite(num) && num > max) max = num;
+                    if (Number.isFinite(num) && num >= 100000000 && num <= 9999999999 && num > max) {
+                        max = num;
+                    }
                 }
             }
             return max || null;
@@ -3352,6 +3372,16 @@ def _verify_black_betslip_target(
         for (const panel of panels) {
             const text = panel.text;
             const normalizedText = normalize(text);
+            // Reject team-goal / To Score tickets even if they contain Over X.X.
+            if (normalizedText.includes('to score')
+                || normalizedText.includes('home goals')
+                || normalizedText.includes('away goals')
+                || normalizedText.includes('total home')
+                || normalizedText.includes('total away')
+                || normalizedText.includes('team total')
+                || normalizedText.includes('team goals')) {
+                continue;
+            }
             const hasLine = hasExactLineToken(text);
             const hasSelection = text.includes(selection);
             const hasHome = teamPresent(normalizedText, homeVariants, homeWords, false);
@@ -3495,6 +3525,35 @@ def _select_black_asian_total_goals(
             return (tokenPresent(text, 'over') && tokenPresent(text, 'under'))
                 || (tokenPresent(text, 'o') && tokenPresent(text, 'u'));
         };
+        // Team / home / away goal markets share the same Over/Under layout as
+        // Asian Total Goals. Never treat them as match totals.
+        const isBlockedMarketText = (text) => {
+            const t = normalizeHeader(text);
+            if (!t) return false;
+            if (t.includes('to score')) return true;
+            if (t.includes('team total') || t.includes('team goals')) return true;
+            if (t.includes('home goals') || t.includes('away goals')) return true;
+            if (t.includes('total home') || t.includes('total away')) return true;
+            if (/\b(home|away)\b/.test(t) && t.includes('goals')
+                && !t.includes('asian total') && t !== 'total goals') {
+                return true;
+            }
+            return false;
+        };
+        const looksLikeMarketSectionTitle = (text) => {
+            const t = normalizeHeader(text);
+            if (!t || t.length > 64) return false;
+            if (marketHeaders.includes(t)) return true;
+            if (isBlockedMarketText(t)) return true;
+            if (t === '1 x 2' || t === '1x2') return true;
+            if (t.includes('asian handicap') || t.includes('correct score')) return true;
+            if (t.includes('double chance') || t.includes('odd even')) return true;
+            if (t.includes('win margin') || t.includes('goal line')) return true;
+            if (t.includes('half time') || t.includes('full time')) return true;
+            if (t.includes('goals between') || t.includes('both teams')) return true;
+            if (t.includes('asian total') || t === 'total goals' || t.includes('total goals')) return true;
+            return false;
+        };
         const findSelectionLabel = (rowElement, aliases) => descendants(rowElement, 'button,div,[role="button"],span,p,li')
             .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
             .filter((item) => aliases.some((alias) => tokenPresent(item.text, alias)))
@@ -3585,18 +3644,22 @@ def _select_black_asian_total_goals(
             return (scored[0] && scored[0].score > 0 ? scored[0].item : candidates[0]) || null;
         };
         const allowedMarketContainers = () => {
-            const headers = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
+            const allHeaders = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
                 .filter(isVisible)
                 .map((element) => ({ element, text: normalizeHeader(normalizedTextOf(element)), rect: element.getBoundingClientRect() }))
-                .filter((item) => marketHeaders.includes(item.text))
+                .filter((item) => item.text && looksLikeMarketSectionTitle(item.text))
                 .sort((a, b) => a.rect.y - b.rect.y);
+            const headers = allHeaders.filter((item) => marketHeaders.includes(item.text));
             const containers = [];
             for (const header of headers) {
+                const nextHeader = allHeaders.find((item) => item.rect.y > header.rect.bottom + 4) || null;
                 let current = header.element;
                 for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
                     if (!current || !isVisible(current)) continue;
                     const rect = current.getBoundingClientRect();
                     if (rect.width > 300 && rect.height > 60) {
+                        // Attach next-header bound so callers can clip descendants.
+                        current.__blackNextHeaderTop = nextHeader ? nextHeader.rect.top : null;
                         if (!containers.includes(current)) containers.push(current);
                         break;
                     }
@@ -3616,9 +3679,15 @@ def _select_black_asian_total_goals(
             const rowRegex = new RegExp(`(?:^|\\s)(${lineChoices})\\s+(?:o|over)\\s+([\\d]+(?:[.,]\\d+)?)\\s+(?:u|under)\\s+([\\d]+(?:[.,]\\d+)?)`, 'i');
             const rowElements = Array.from(document.querySelectorAll('div,section,li,button,[role="button"],span'))
                 .filter(isVisible)
-                .filter((element) => scopeContainers.some((container) => container.contains(element)))
+                .filter((element) => scopeContainers.some((container) => {
+                    if (!container.contains(element)) return false;
+                    const boundTop = container.__blackNextHeaderTop;
+                    if (boundTop == null) return true;
+                    return element.getBoundingClientRect().y < boundTop - 8;
+                }))
                 .map((element) => ({ element, text: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
                 .filter((item) => item.text && item.text.length <= 220)
+                .filter((item) => !isBlockedMarketText(item.text))
                 .filter((item) => rowRegex.test(` ${item.text} `))
                 .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height) || a.rect.y - b.rect.y);
             for (const row of rowElements) {
@@ -3648,6 +3717,9 @@ def _select_black_asian_total_goals(
             const rect = element.getBoundingClientRect();
             const text = normalizedTextOf(element);
             if (rect.width <= 180 || rect.height < 20 || rect.height > 180) {
+                return null;
+            }
+            if (isBlockedMarketText(text)) {
                 return null;
             }
             if (!hasOverUnderMarkers(text)) {
@@ -3692,15 +3764,24 @@ def _select_black_asian_total_goals(
             };
         };
         const collectSectionCandidates = () => {
-            const headers = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
+            // Collect ALL market section titles so we can stop at the next section
+            // (e.g. Correct Score / Total Home Goals), not only at another Total Goals header.
+            const allHeaders = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
                 .filter(isVisible)
-                .map((element) => ({ element, text: normalizeHeader(normalizedTextOf(element)), rawText: normalizedTextOf(element), rect: element.getBoundingClientRect() }))
-                .filter((item) => marketHeaders.includes(item.text))
-                .sort((a, b) => a.rect.y - b.rect.y);
+                .map((element) => ({
+                    element,
+                    text: normalizeHeader(normalizedTextOf(element)),
+                    rawText: normalizedTextOf(element),
+                    rect: element.getBoundingClientRect(),
+                }))
+                .filter((item) => item.text && item.rect.width < window.innerWidth * 0.75)
+                .filter((item) => looksLikeMarketSectionTitle(item.text))
+                .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+            const startHeaders = allHeaders.filter((item) => marketHeaders.includes(item.text));
             const containers = [];
-            for (let index = 0; index < headers.length; index += 1) {
-                const header = headers[index];
-                const nextHeader = headers[index + 1] || null;
+            for (let index = 0; index < startHeaders.length; index += 1) {
+                const header = startHeaders[index];
+                const nextHeader = allHeaders.find((item) => item.rect.y > header.rect.bottom + 4) || null;
                 let current = header.element;
                 for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
                     if (!current || !isVisible(current)) continue;
@@ -3709,8 +3790,8 @@ def _select_black_asian_total_goals(
                     const rows = descendants(current, 'div,section,li,button,[role="button"]')
                         .map(buildRowCandidate)
                         .filter(Boolean)
-                        .filter((item) => item.rect.y >= header.rect.bottom - 8);
-                        
+                        .filter((item) => item.rect.y >= header.rect.bottom - 8)
+                        .filter((item) => !isBlockedMarketText(item.text));
                     const boundedRows = nextHeader
                         ? rows.filter((item) => item.rect.y < nextHeader.rect.top - 8)
                         : rows;
@@ -3720,12 +3801,13 @@ def _select_black_asian_total_goals(
                         rect,
                         headerText: header.text,
                         rows: boundedRows,
+                        priority: marketHeaders.indexOf(header.text),
                     });
                     break;
                 }
             }
             return containers
-                .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))
+                .sort((a, b) => a.priority - b.priority || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))
                 .filter((item, index, array) => array.findIndex((candidate) => candidate.element === item.element) === index);
         };
         const marketSections = collectSectionCandidates();
@@ -3747,16 +3829,19 @@ def _select_black_asian_total_goals(
             };
         }
         const tryCompactSectionSelection = () => {
-            const headers = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
+            const allHeaders = Array.from(document.querySelectorAll('div,section,header,span,h2,h3,h4'))
                 .filter(isVisible)
                 .map((element) => ({ element, text: normalizeHeader(normalizedTextOf(element)), rect: element.getBoundingClientRect() }))
-                .filter((item) => marketHeaders.includes(item.text))
+                .filter((item) => item.text && looksLikeMarketSectionTitle(item.text))
                 .sort((a, b) => a.rect.y - b.rect.y);
+            const headers = allHeaders.filter((item) => marketHeaders.includes(item.text));
             for (const header of headers) {
+                const nextHeader = allHeaders.find((item) => item.rect.y > header.rect.bottom + 4) || null;
                 let current = header.element;
                 for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
                     if (!current || !isVisible(current)) continue;
                     const text = normalizedTextOf(current);
+                    if (isBlockedMarketText(text)) continue;
                     if (!hasOverUnderMarkers(text)) continue;
                     const compactRows = parseCompactRowsFromText(text);
                     const targetRow = compactRows.find((row) => normalizedLineVariants.includes(row.lineText));
@@ -3764,6 +3849,7 @@ def _select_black_asian_total_goals(
                     const oddsValue = selection === 'over' ? targetRow.overOdds : targetRow.underOdds;
                     const targetOdds = findOddsElementForValue(current, oddsValue, targetRow.lineText);
                     if (!targetOdds) continue;
+                    if (nextHeader && targetOdds.rect.y >= nextHeader.rect.top - 8) continue;
                     clickElement(targetOdds.element);
                     return {
                         ok: true,
@@ -4073,7 +4159,17 @@ def _set_black_betslip_price_and_place(
         except Exception:
             return False
         if current_price != normalized_price:
-            return False
+            # Fall back to any visible price input value from debug dump.
+            price_ok = False
+            for item in ((state.get("controlDebug") or {}).get("inputs") or []):
+                try:
+                    if normalized_decimal_text(str(item.get("value", ""))) == normalized_price:
+                        price_ok = True
+                        break
+                except Exception:
+                    continue
+            if not price_ok:
+                return False
         if normalized_stake is not None:
             current_stake_input = state.get("stakeInput")
             stake_ok = False
@@ -4095,41 +4191,91 @@ def _set_black_betslip_price_and_place(
                         break
             if not stake_ok:
                 return False
-        if state.get("placeDisabled"):
+        panel_text = (state.get("panelText") or "").lower()
+        returns_ready = bool(re.search(r"ex\.?\s*returns[^\n\r]*\d", panel_text))
+        # Place can briefly report disabled while Ex. Returns is still "-".
+        if state.get("placeDisabled") and not returns_ready:
             return False
         return state
 
     try:
-        ready_state = WebDriverWait(driver, 8).until(betslip_ready)
+        ready_state = WebDriverWait(driver, 12).until(betslip_ready)
     except TimeoutException as exc:
-        debug_state = None
+        # One recovery pass: re-locate, re-fill, blur, then short wait.
         try:
-            debug_state = driver.execute_script(locate_script)
+            recovery = locate_controls(timeout=2.0)
+            if recovery.get("stakeInput") and stake_text:
+                _fill_betslip_input(driver, recovery.get("stakeInput"), stake_text)
+            if recovery.get("priceInput"):
+                _fill_betslip_input(driver, recovery.get("priceInput"), price_text)
+            time.sleep(1.2)
+            ready_state = WebDriverWait(driver, 6).until(betslip_ready)
         except Exception:
+            # Last resort: if stake+price values are already correct, click Place anyway.
             debug_state = None
-        snapshot = _read_black_betslip_state(driver)
-        panel_text = " | ".join(line.strip() for line in (snapshot.get("text", "") or "").splitlines() if line.strip())[:700]
-        inputs = snapshot.get("inputs") or []
-        inputs_text = "; ".join(
-            f"tag={item.get('tag', '')!r}, role={item.get('role', '')!r}, value={item.get('value', '')!r}, "
-            f"text={item.get('text', '')!r}, placeholder={item.get('placeholder', '')!r}, aria={item.get('aria', '')!r}"
-            for item in inputs[:4]
-        )
-        raise RuntimeError(
-            f"Black betslip did not become ready after filling stake/price. "
-            f"Target stake={stake_text or 'existing'}, price={price_text}. "
-            f"Inputs: {inputs_text or 'none'}. Controls: {(debug_state or {}).get('controlDebug')!r}. "
-            f"Panel: {panel_text}"
-        ) from exc
+            try:
+                debug_state = driver.execute_script(locate_script)
+            except Exception:
+                debug_state = None
+            values_ok = False
+            if debug_state and debug_state.get("ok"):
+                debug_inputs = ((debug_state.get("controlDebug") or {}).get("inputs") or [])
+                found_price = False
+                found_stake = normalized_stake is None
+                for item in debug_inputs:
+                    try:
+                        value = normalized_decimal_text(str(item.get("value", "")))
+                    except Exception:
+                        continue
+                    if value == normalized_price:
+                        found_price = True
+                    if normalized_stake is not None and value == normalized_stake:
+                        found_stake = True
+                values_ok = found_price and found_stake and bool(debug_state.get("placeButton"))
+            if values_ok:
+                print(
+                    f"[{profile_label}] Black betslip Place still marked disabled; "
+                    f"clicking anyway because stake/price match.",
+                    flush=True,
+                )
+                ready_state = debug_state
+            else:
+                snapshot = _read_black_betslip_state(driver)
+                panel_text = " | ".join(line.strip() for line in (snapshot.get("text", "") or "").splitlines() if line.strip())[:700]
+                inputs = snapshot.get("inputs") or []
+                inputs_text = "; ".join(
+                    f"tag={item.get('tag', '')!r}, role={item.get('role', '')!r}, value={item.get('value', '')!r}, "
+                    f"text={item.get('text', '')!r}, placeholder={item.get('placeholder', '')!r}, aria={item.get('aria', '')!r}"
+                    for item in inputs[:4]
+                )
+                raise RuntimeError(
+                    f"Black betslip did not become ready after filling stake/price. "
+                    f"Target stake={stake_text or 'existing'}, price={price_text}. "
+                    f"Inputs: {inputs_text or 'none'}. Controls: {(debug_state or {}).get('controlDebug')!r}. "
+                    f"Panel: {panel_text}"
+                ) from exc
     ready_place_button = ready_state.get("placeButton")
-    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", ready_place_button)
     try:
-        ready_place_button.click()
-    except Exception:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", ready_place_button)
         try:
-            ActionChains(driver).move_to_element(ready_place_button).click().perform()
+            ready_place_button.click()
+        except StaleElementReferenceException:
+            ready_state = locate_controls(timeout=2.0)
+            ready_place_button = ready_state.get("placeButton")
+            if not ready_place_button:
+                raise RuntimeError("Black Place button became stale and could not be re-located.")
+            ready_place_button.click()
         except Exception:
-            driver.execute_script("arguments[0].click();", ready_place_button)
+            try:
+                ActionChains(driver).move_to_element(ready_place_button).click().perform()
+            except Exception:
+                driver.execute_script("arguments[0].click();", ready_place_button)
+    except StaleElementReferenceException:
+        ready_state = locate_controls(timeout=2.0)
+        ready_place_button = ready_state.get("placeButton")
+        if not ready_place_button:
+            raise RuntimeError("Black Place button became stale and could not be re-located.")
+        driver.execute_script("arguments[0].click();", ready_place_button)
     _confirm_black_place_order(driver, profile_label)
     print(f"[{profile_label}] Entered stake {stake_text or 'existing'}, price {price_text} and clicked Place.")
 
@@ -7587,19 +7733,27 @@ def _select_betfair_overunder_back(
                     seen.add(candidate)
                     try:
                         element.click()
+                    except StaleElementReferenceException:
+                        raise
                     except Exception:
                         pass
                     try:
                         element.send_keys(Keys.CONTROL, "a")
                         element.send_keys(Keys.DELETE)
+                    except StaleElementReferenceException:
+                        raise
                     except Exception:
                         pass
                     try:
                         element.send_keys(candidate)
+                    except StaleElementReferenceException:
+                        raise
                     except Exception:
                         _set_input_value(driver, element, candidate)
                     try:
                         element.send_keys(Keys.TAB)
+                    except StaleElementReferenceException:
+                        raise
                     except Exception:
                         pass
                     time.sleep(0.15)
@@ -7608,34 +7762,131 @@ def _select_betfair_overunder_back(
                         return current
                 return _control_value(driver, element)
 
-            odds_before = controls.get("oddsBefore") or ""
-            if _same_numeric_text(odds_before, target_odds):
-                odds_after = odds_before
-            else:
-                odds_after = send_value(odds_input, target_odds, allow_leading_dot=False)
-            stake_after = controls.get("stakeBefore") or ""
-            if not _same_numeric_text(stake_after, stake_str):
-                stake_after = send_value(stake_input, stake_str, allow_leading_dot=True)
+            def fill_once(stake_el, odds_el, stake_before: str, odds_before: str) -> dict:
+                if _same_numeric_text(odds_before, target_odds):
+                    odds_after = odds_before
+                else:
+                    odds_after = send_value(odds_el, target_odds, allow_leading_dot=False)
+                stake_after = stake_before or ""
+                if not _same_numeric_text(stake_after, stake_str):
+                    stake_after = send_value(stake_el, stake_str, allow_leading_dot=True)
+                if not _same_numeric_text(odds_after, target_odds):
+                    return {
+                        "ok": False,
+                        "error": "odds input below/ mismatched target after send_keys",
+                        "oddsValue": odds_after,
+                        "targetOdds": target_odds,
+                    }
+                if not _same_numeric_text(stake_after, stake_str):
+                    return {
+                        "ok": False,
+                        "error": "stake input did not keep target after send_keys",
+                        "stakeValue": stake_after,
+                        "targetStake": stake_str,
+                    }
+                return {
+                    "ok": True,
+                    "oddsValue": odds_after,
+                    "stakeValue": stake_after,
+                }
 
-            if not _same_numeric_text(odds_after, target_odds):
-                return {
-                    "ok": False,
-                    "error": "fallback odds mismatch",
-                    "oddsAfter": odds_after,
-                    "targetOdds": target_odds,
-                }
-            if not _same_numeric_text(stake_after, stake_str):
-                return {
-                    "ok": False,
-                    "error": "fallback stake mismatch",
-                    "stakeAfter": stake_after,
-                    "targetStake": stake_str,
-                }
-            return {
-                "ok": True,
-                "oddsValue": odds_after,
-                "stakeValue": stake_after,
-            }
+            try:
+                return fill_once(
+                    stake_input,
+                    odds_input,
+                    controls.get("stakeBefore") or "",
+                    controls.get("oddsBefore") or "",
+                )
+            except StaleElementReferenceException:
+                # DOM refreshed mid-fill — re-resolve inputs once and retry.
+                time.sleep(0.4)
+                controls = driver.execute_script(
+                    r"""
+                    function visible(el) {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) return false;
+                        const cs = window.getComputedStyle(el);
+                        return cs.visibility !== 'hidden' && cs.display !== 'none';
+                    }
+                    function norm(text) {
+                        return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                    }
+                    function val(el) {
+                        if (!el) return '';
+                        if (typeof el.value === 'string') return el.value;
+                        return (el.textContent || el.innerText || el.getAttribute('aria-valuetext') || '').trim();
+                    }
+                    function findInputByLabel(labelWord) {
+                        const labels = Array.from(document.querySelectorAll('*')).filter(visible).filter((el) => {
+                            const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                            if (t !== labelWord) return false;
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.width < 180 && r.height > 0 && r.height < 60;
+                        });
+                        const editableSelector = "input, textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton']";
+                        for (const label of labels) {
+                            const r = label.getBoundingClientRect();
+                            const cx = r.left + r.width / 2;
+                            const cy = r.bottom + 10;
+                            for (let dy = 0; dy < 72; dy += 6) {
+                                const hit = document.elementFromPoint(cx, cy + dy);
+                                if (!hit) continue;
+                                const inp = hit.closest?.(editableSelector) || (hit.matches?.(editableSelector) ? hit : null);
+                                if (inp && visible(inp)) return inp;
+                            }
+                        }
+                        return null;
+                    }
+                    const selector = "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea, [contenteditable='true'], [role='textbox'], [role='spinbutton']";
+                    const panels = Array.from(document.querySelectorAll('aside, section, div, form'))
+                        .filter(visible)
+                        .map((el) => {
+                            const rect = el.getBoundingClientRect();
+                            const text = norm(el.innerText || el.textContent || '');
+                            const inputs = Array.from(el.querySelectorAll(selector)).filter(visible);
+                            const hasCancel = Array.from(el.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']"))
+                                .filter(visible)
+                                .some((b) => norm(b.innerText || b.value || '').includes('cancel'));
+                            const hasAction = Array.from(el.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']"))
+                                .filter(visible)
+                                .some((b) => {
+                                    const t = norm(b.innerText || b.value || '');
+                                    return t.includes('place') || t.includes('confirm') || t.includes('edit');
+                                });
+                            const betslipLike = text.includes('betslip') || text.includes('bet slip') || text.includes('place bet') || text.includes('confirm bet') || text.includes('open bets')
+                                || text.includes('stake') || text.includes('odds');
+                            return { el, rect, text, inputs, hasCancel, hasAction, betslipLike };
+                        })
+                        .filter((p) => p.rect.width > 120 && p.rect.height > 70)
+                        .filter((p) => p.inputs.length > 0 || p.hasAction || p.betslipLike)
+                        .sort((a, b) => {
+                            const aScore = (a.hasCancel ? 4 : 0) + (a.hasAction ? 5 : 0) + (a.betslipLike ? 4 : 0) + (a.rect.x > window.innerWidth * 0.5 ? 2 : 0) + a.inputs.length;
+                            const bScore = (b.hasCancel ? 4 : 0) + (b.hasAction ? 5 : 0) + (b.betslipLike ? 4 : 0) + (b.rect.x > window.innerWidth * 0.5 ? 2 : 0) + b.inputs.length;
+                            return bScore - aScore || b.rect.y - a.rect.y;
+                        });
+                    if (!panels.length) return { ok: false, reason: 'betslip controls panel not found' };
+                    const panel = panels[0];
+                    let inputs = panel.inputs;
+                    let stakeInput = findInputByLabel('stake');
+                    let oddsInput = findInputByLabel('odds');
+                    if (!stakeInput) stakeInput = inputs[1] || inputs[0] || null;
+                    if (!oddsInput) oddsInput = inputs.find((el) => el !== stakeInput) || inputs[0] || null;
+                    if (!stakeInput || !oddsInput) return { ok: false, reason: 'stake/odds controls unresolved' };
+                    return { ok: true, stakeInput, oddsInput, stakeBefore: val(stakeInput), oddsBefore: val(oddsInput) };
+                    """
+                )
+                if not isinstance(controls, dict) or not controls.get("ok"):
+                    return {"ok": False, "error": f"stale retry controls not found: {controls!r}"}
+                try:
+                    return fill_once(
+                        controls.get("stakeInput"),
+                        controls.get("oddsInput"),
+                        controls.get("stakeBefore") or "",
+                        controls.get("oddsBefore") or "",
+                    )
+                except StaleElementReferenceException as stale_exc:
+                    return {"ok": False, "error": f"stale element after retry: {stale_exc}"}
 
         # Give the betslip panel time to render after clicking the Back cell.
         time.sleep(1.5)
