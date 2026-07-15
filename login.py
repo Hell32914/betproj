@@ -4869,6 +4869,45 @@ def place_black_bet(session: dict, signal) -> dict:
                 lambda browser: any(header in _visible_text_lower(browser) for header in market_headers)
             )
             _human_delay()
+            # Expand collapsed Asian Total Goals lines (e.g. only 1.75/2/2.25 shown).
+            try:
+                expanded = driver.execute_script(
+                    r"""
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        const cs = window.getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+                    };
+                    const norm = (v) => (v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                    const buttons = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
+                        .filter(isVisible)
+                        .map((el) => ({ el, text: norm(el.innerText || el.textContent || ''), rect: el.getBoundingClientRect() }))
+                        .filter((item) => item.text === 'show all lines' || item.text.startsWith('show all lines'));
+                    if (!buttons.length) return false;
+                    // Prefer the one nearest an Asian Total Goals header.
+                    const headers = Array.from(document.querySelectorAll('div,section,span,h2,h3,h4'))
+                        .filter(isVisible)
+                        .map((el) => ({ text: norm(el.innerText || el.textContent || ''), rect: el.getBoundingClientRect() }))
+                        .filter((item) => item.text.includes('asian total goals') || item.text === 'total goals');
+                    buttons.sort((a, b) => {
+                        const dist = (btn) => {
+                            if (!headers.length) return btn.rect.y;
+                            return Math.min.apply(null, headers.map((h) => Math.abs(btn.rect.y - h.rect.y)));
+                        };
+                        return dist(a) - dist(b) || a.rect.y - b.rect.y;
+                    });
+                    const pick = buttons[0].el.closest('button,a,[role="button"]') || buttons[0].el;
+                    pick.scrollIntoView({ block: 'center' });
+                    try { pick.click(); } catch (e) {}
+                    return true;
+                    """
+                )
+                if expanded:
+                    print(f"[{profile_label}] Expanded Black 'show all lines' for totals.", flush=True)
+                    time.sleep(0.6)
+            except Exception:
+                pass
             _ensure_black_betslip_safe_to_use(driver, profile_label)
             _select_black_asian_total_goals(
                 driver,
@@ -6852,11 +6891,13 @@ def _select_betfair_overunder_back(
     market_key = _signal_market_key(signal)
     strict_market_texts = _betfair_strict_market_texts(line_str, market_key)
     allow_label_fallback = True
-    preferred_tabs = ["half time", "2nd half"] if market_key == "second_half_goals" else []
+    # For SH Goals prefer the event market tabs (Half Time / 2nd Half / All Markets),
+    # then open the matching left-column Over/Under market.
+    preferred_tabs = ["2nd half", "second half", "half time", "all markets"] if market_key == "second_half_goals" else []
 
     if preferred_tabs:
         try:
-            driver.execute_script(
+            tab_result = driver.execute_script(
                 r"""
                 const preferredTabs = arguments[0].map((value) => (value || '').toLowerCase().trim());
                 function visible(el) {
@@ -6874,17 +6915,31 @@ def _select_betfair_overunder_back(
                         rect: el.getBoundingClientRect(),
                     }))
                     .filter((item) => item.text && item.text.length <= 40)
-                    .filter((item) => preferredTabs.some((tab) => item.text === tab || item.text.startsWith(tab)));
-                if (candidates.length > 0) {
-                    candidates.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
-                    const pick = candidates[0].el.closest("a, button, [role='button'], [role='tab']") || candidates[0].el;
-                    pick.scrollIntoView({ block: 'center', inline: 'center' });
-                    pick.click();
-                }
+                    .filter((item) => preferredTabs.some((tab) => item.text === tab || item.text.startsWith(tab)))
+                    // Prefer the horizontal market-tab strip under the match header.
+                    .filter((item) => item.rect.y > 80 && item.rect.y < window.innerHeight * 0.55)
+                    .filter((item) => item.rect.x > 80);
+                if (candidates.length === 0) return { clicked: false };
+                candidates.sort((a, b) => {
+                    const rank = (text) => {
+                        const idx = preferredTabs.findIndex((tab) => text === tab || text.startsWith(tab));
+                        return idx === -1 ? 99 : idx;
+                    };
+                    return rank(a.text) - rank(b.text) || a.rect.y - b.rect.y || a.rect.x - b.rect.x;
+                });
+                const pick = candidates[0].el.closest("a, button, [role='button'], [role='tab']") || candidates[0].el;
+                pick.scrollIntoView({ block: 'center', inline: 'center' });
+                pick.click();
+                return { clicked: true, text: candidates[0].text };
                 """,
                 preferred_tabs,
-            )
-            time.sleep(0.7)
+            ) or {"clicked": False}
+            if tab_result.get("clicked"):
+                print(
+                    f"[{profile_label}] Betfair opened market tab: {tab_result.get('text')}",
+                    flush=True,
+                )
+            time.sleep(0.8)
         except Exception:
             pass
 
@@ -7245,22 +7300,35 @@ def _select_betfair_overunder_back(
             function hasOverUnderContext(text) {
                 const t = normalizeMarket(text);
                 if (isBlockedMarket(t)) return false;
+                const lineNorm = normalizedLine.replace(/\./g, ' ');
+                const looksLikeRunnerLabel = (
+                    (t === labelText || t.indexOf(labelText) === 0
+                        || ((/\bover\s+\d/.test(t) || /\bunder\s+\d/.test(t)) && t.indexOf('goals') !== -1))
+                    && (t.indexOf(normalizedLine) !== -1 || t.indexOf(lineNorm) !== -1)
+                );
                 if (marketKey === 'second_half_goals') {
                     if (t.indexOf('2nd half') !== -1 || t.indexOf('second half') !== -1
                         || t.indexOf('half goals') !== -1) {
                         return true;
                     }
-                    // After the Half Time tab is selected, Betfair may show only
-                    // "Over/Under <line> Goals" without a second-half prefix.
-                    const lineNorm = normalizedLine.replace(/\./g, ' ');
-                    return (t.indexOf('over under') !== -1 || t.indexOf('over/under') !== -1)
-                        && t.indexOf(lineNorm) !== -1;
+                    // Market header: "Over/Under 1.5 Goals" (no 2nd-half prefix after tab switch).
+                    if ((t.indexOf('over under') !== -1 || t.indexOf('over/under') !== -1)
+                        && (t.indexOf(normalizedLine) !== -1 || t.indexOf(lineNorm) !== -1)) {
+                        return true;
+                    }
+                    // Runner row label after the O/U market is already open: "Over 1.5 Goals".
+                    // Previously SH context rejected this and caused 'label not found'
+                    // even when the left market was correctly selected.
+                    if (looksLikeRunnerLabel) return true;
+                    return false;
                 }
                 if (marketKey === 'next_goal') {
                     return t.indexOf('next goal') !== -1 || t.indexOf('full time goals') !== -1
-                        || t.indexOf('over under') !== -1 || t.indexOf('over/under') !== -1;
+                        || t.indexOf('over under') !== -1 || t.indexOf('over/under') !== -1
+                        || looksLikeRunnerLabel;
                 }
                 return t.indexOf('over under') !== -1 || t.indexOf('over/under') !== -1
+                    || looksLikeRunnerLabel
                     || (/\bover\s+\d/.test(t) && t.indexOf('goals') !== -1);
             }
             const rowMatchesSelection = (text) => {
@@ -7440,12 +7508,17 @@ def _select_betfair_overunder_back(
                     if (looksLikeCorrectScore(t)) return false;
                     if (!rowMatchesSelection(t)) return false;
                     if (marketKey !== 'second_half_goals' && t.indexOf('half') !== -1) return false;
+                    // Exact runner label is enough once the O/U market panel is open.
+                    const exactRunner = normalizeMarket(t) === normalizeMarket(labelText)
+                        || normalizeMarket(t).indexOf(normalizeMarket(labelText)) === 0;
                     let parent = el.parentElement;
                     for (let depth = 0; depth < 12 && parent; depth++, parent = parent.parentElement) {
                         const parentText = normalizeMarket(txt(parent));
                         if (isBlockedMarket(parentText)) return false;
                     }
-                    return hasOverUnderContext(t) || marketTextNorms.some((marketText) => normalizeMarket(t).indexOf(marketText) !== -1);
+                    return exactRunner
+                        || hasOverUnderContext(t)
+                        || marketTextNorms.some((marketText) => normalizeMarket(t).indexOf(marketText) !== -1);
                 });
             if (labels.length === 0) {
                 return { error: 'label not found', labelText, marketKey };
