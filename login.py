@@ -707,9 +707,11 @@ def _select_betfair_left_market(
             if (!activeTargets.length) {
                 return { clicked: false, clickedText: null, active: false };
             }
-            // 1) Click the LEFT-column entry whose text exactly equals a target.
+            // 1) Click the left-column entry matching the complete requested line.
+            // Betfair sometimes adds a harmless suffix/prefix to market names.
             const sidebar = sidebarItems
-                .filter((it) => activeTargets.some((tg) => it.t === tg));
+                .filter((it) => activeTargets.some((tg) =>
+                    it.t === tg || it.t.startsWith(tg) || tg.startsWith(it.t)));
             let clicked = false, clickedText = null;
             if (sidebar.length) {
                 sidebar.sort((a, b) => {
@@ -729,7 +731,8 @@ def _select_betfair_left_market(
                 .filter((it) => it.t && it.t.length <= 40
                     && it.rect.x > 160 && it.rect.x < window.innerWidth * 0.72
                     && it.rect.y > 150 && it.rect.y < window.innerHeight * 0.55);
-            const active = headers.some((it) => activeTargets.some((tg) => it.t === tg || it.t.startsWith(tg)));
+            const active = headers.some((it) => activeTargets.some((tg) =>
+                it.t === tg || it.t.startsWith(tg) || tg.startsWith(it.t)));
             return { clicked, clickedText, active };
             """,
             strict_texts,
@@ -5620,10 +5623,10 @@ def login(driver: webdriver.Remote, profile_label: str) -> None:
 
 
 def _is_betfair_logged_in(driver: webdriver.Remote) -> bool:
-    """Detect whether the Betfair top bar shows a logged-in state.
+    """Return whether the current page looks usable by an authenticated account.
 
-    Primary signal: there is no visible password input on the page. The login
-    form sits in the top header and disappears once the user is authenticated.
+    A missing search input is not evidence of logout: Betfair temporarily hides
+    it on search-result and SPA-transition pages.
     """
     try:
         return bool(driver.execute_script(
@@ -5641,22 +5644,23 @@ def _is_betfair_logged_in(driver: webdriver.Remote) -> bool:
             if (pwds.length > 0) return false;
             const text = (document.body?.innerText || '').toLowerCase();
             if (text.includes('log out') || text.includes('logout') || text.includes('my account')) return true;
-            const searchInputs = Array.from(document.querySelectorAll("input[type='search'], input[type='text'], input:not([type])"))
-                .filter(visible)
-                .filter((el) => {
-                    const hint = [
-                        el.getAttribute('placeholder') || '',
-                        el.getAttribute('aria-label') || '',
-                        el.getAttribute('name') || '',
-                        el.id || '',
-                    ].join(' ').toLowerCase();
-                    return /search|find|team|competition|event|sport|market|команд|соревн|событ|поиск|найти/.test(hint);
-                });
-            return searchInputs.length > 0 && !text.includes('присоединиться сейчас') && !text.includes('join now');
+            const candidates = Array.from(document.querySelectorAll(
+                "input[type='search'], input[type='text'], input:not([type]), [contenteditable='true'], [role='searchbox'], [role='combobox']"
+            )).filter(visible).filter((el) => {
+                const form = el.closest('form');
+                return !(form && form.querySelector("input[type='password']"));
+            });
+            // The Exchange shell itself is enough once no login form is visible.
+            // Search controls and the betslip may render asynchronously.
+            const exchangePage = (window.location.pathname || '').includes('/exchange/plus/');
+            const hasAccountChrome = /my bets|open bets|betslip|bet slip|cash out|place bets/.test(text);
+            return exchangePage || hasAccountChrome || candidates.length > 0;
             """
         ))
     except Exception:
-        return False
+        # Navigation can replace the DOM between Selenium calls. Do not erase an
+        # otherwise live session merely because authentication cannot be sampled.
+        return True
 
 
 def _dismiss_betfair_blocking_overlays(driver: webdriver.Remote, profile_label: str) -> dict:
@@ -5679,7 +5683,7 @@ def _dismiss_betfair_blocking_overlays(driver: webdriver.Remote, profile_label: 
                 return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
             }
             const keywords = [
-                'session expired', 'you have been logged out', 'logged out',
+                'session expired', 'you have been logged out',
                 'session has expired', 'your session has expired'
             ];
             const buttonKeywords = ['ok', 'okay', 'close', 'dismiss', 'log in', 'login'];
@@ -5694,8 +5698,10 @@ def _dismiss_betfair_blocking_overlays(driver: webdriver.Remote, profile_label: 
                     return { el, rect, text, z, fixedLike };
                 })
                 .filter((item) => item.text)
+                .filter((item) => item.text.length <= 360)
                 .filter((item) => keywords.some((kw) => item.text.includes(kw)))
-                .filter((item) => item.fixedLike || item.z >= 100 || (item.rect.width >= 240 && item.rect.height >= 80));
+                .filter((item) => item.el.matches('dialog, [role="dialog"], [aria-modal="true"]')
+                    || item.fixedLike || item.z >= 100);
             if (!roots.length) return { found: false };
             roots.sort((a, b) => b.z - a.z || (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
             const root = roots[0];
@@ -5714,7 +5720,7 @@ def _dismiss_betfair_blocking_overlays(driver: webdriver.Remote, profile_label: 
                 found: true,
                 text: root.text.slice(0, 220),
                 clicked: pick ? pick.text : null,
-                requiresLogin: root.text.includes('expired') || root.text.includes('logged out'),
+                requiresLogin: keywords.some((kw) => root.text.includes(kw)),
             };
             """
         ) or {"found": False}
@@ -6157,6 +6163,32 @@ def _betfair_page_matches_target_event(
         return False
 
 
+def _betfair_event_label_from_page(driver: webdriver.Remote) -> str | None:
+    """Read the short event title after a verified event-page navigation."""
+    try:
+        label = driver.execute_script(
+            r"""
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = window.getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            }
+            const values = Array.from(document.querySelectorAll(
+                "h1, h2, [role='heading'], [data-test], [data-testid]"
+            )).filter(visible)
+                .map((el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim())
+                .filter((text) => text && text.length <= 180)
+                .filter((text) => /\bv\b|\bvs\b/i.test(text));
+            return values[0] || '';
+            """
+        )
+        return str(label).strip() or None
+    except Exception:
+        return None
+
+
 def open_betfair_match(session: dict, signal) -> dict:
     """Open the match on Betfair for the signal, then click the Back cell of
     the matching Over/Under <line> Goals market.
@@ -6444,21 +6476,18 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
             except Exception:
                 pass
 
+        # A real modal is the only reason to interrupt a live result page for
+        # re-login. Absence of a search field during SPA navigation is normal.
         overlay_state = _dismiss_betfair_blocking_overlays(driver, profile_label)
         if overlay_state.get("requiresLogin"):
             print(f"[{profile_label}] Betfair search for '{search_query}' hit an expired session dialog; logging in again.", flush=True)
             login_betfair(driver, profile_label)
             continue
 
-        if not _is_betfair_logged_in(driver):
-            print(
-                f"[{profile_label}] Betfair search for '{search_query}' landed on a logged-out page; logging in again.",
-                flush=True,
-            )
-            login_betfair(driver, profile_label)
-            continue
-
-        followed = _follow_betfair_search_results(driver, team_norms, opponent_norms, profile_label)
+        event_ok = _betfair_page_matches_target_event(driver, team_norms, opponent_norms)
+        followed = None
+        if not event_ok:
+            followed = _follow_betfair_search_results(driver, team_norms, opponent_norms, profile_label)
         if followed:
             if _betfair_label_matches_target(driver, followed, team_norms, opponent_norms):
                 clicked_label = followed
@@ -6498,7 +6527,8 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                 except Exception:
                     pass
 
-        if clicked_label and event_ok:
+        if event_ok:
+            clicked_label = clicked_label or _betfair_event_label_from_page(driver)
             print(f"[{profile_label}] Betfair opened result: {clicked_label!r}")
             return {
                 "profile_label": profile_label,
@@ -6709,18 +6739,13 @@ def _follow_betfair_search_results(
                     clicked = true;
                 } catch (e) {}
             }
-            // Hard fallback: navigate to the href directly so the SPA loads the match.
+            // Navigate to the verified event URL directly. Some SPA result cards
+            // acknowledge click events without changing routes, which used to leave
+            // the bot on Exchange Home and make it discard a valid result.
             if (pick.href) {
                 try {
                     const absolute = new URL(pick.href, window.location.origin).href;
-                    if (window.location.href !== absolute) {
-                        // Only navigate if the SPA click didn't trigger a route change.
-                        setTimeout(() => {
-                            if (window.location.href.indexOf('/search') !== -1) {
-                                window.location.href = absolute;
-                            }
-                        }, 800);
-                    }
+                    if (window.location.href !== absolute) window.location.href = absolute;
                 } catch (e) {}
             }
             return { ok: true, text: (pick.label || pick.text || pick.href).slice(0, 200), href: pick.href };
@@ -6891,9 +6916,9 @@ def _select_betfair_overunder_back(
     market_key = _signal_market_key(signal)
     strict_market_texts = _betfair_strict_market_texts(line_str, market_key)
     allow_label_fallback = True
-    # For SH Goals prefer the event market tabs (Half Time / 2nd Half / All Markets),
-    # then open the matching left-column Over/Under market.
-    preferred_tabs = ["2nd half", "second half", "half time", "all markets"] if market_key == "second_half_goals" else []
+    # SH signals must never fall back to a full-time line with the same number.
+    # Only a genuine second-half tab is acceptable before market selection.
+    preferred_tabs = ["2nd half", "second half"] if market_key == "second_half_goals" else []
 
     if preferred_tabs:
         try:
@@ -6939,9 +6964,14 @@ def _select_betfair_overunder_back(
                     f"[{profile_label}] Betfair opened market tab: {tab_result.get('text')}",
                     flush=True,
                 )
-            time.sleep(0.8)
+            if not tab_result.get("clicked"):
+                raise RuntimeError(
+                    f"[{profile_label}] Betfair could not open a Second Half tab; "
+                    "refusing to use the full-time market for an SH signal."
+                )
+            time.sleep(2.0)
         except Exception:
-            pass
+            raise
 
     # 1) Select the exact Over/Under <line> Goals market from the LEFT column first,
     # and confirm the central panel switched to it, so we never place a bet on a
@@ -7285,6 +7315,24 @@ def _select_betfair_overunder_back(
             const normalizeMarket = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
             const marketTextNorms = marketTexts.map(normalizeMarket);
             const normalizedLine = (lineStr || '').toLowerCase().replace(',', '.').trim();
+            const secondHalfTabActive = Array.from(document.querySelectorAll(
+                "a, button, [role='button'], [role='tab'], li"
+            )).filter((el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const text = normalizeMarket(el.innerText || el.textContent || '');
+                if (!(text === '2nd half' || text.startsWith('2nd half')
+                    || text === 'second half' || text.startsWith('second half'))) {
+                    return false;
+                }
+                const cls = (el.className && el.className.toString
+                    ? el.className.toString().toLowerCase() : '');
+                const selected = ((el.getAttribute('aria-selected') || '') + ' '
+                    + (el.getAttribute('aria-current') || '')).toLowerCase();
+                return selected.includes('true') || selected === 'page'
+                    || /\bactive\b|\bselected\b|\bcurrent\b/.test(cls);
+            }).length > 0;
             function isBlockedMarket(text) {
                 const t = normalizeMarket(text);
                 if (t.indexOf('correct score') !== -1) return true;
@@ -7316,10 +7364,6 @@ def _select_betfair_overunder_back(
                         && (t.indexOf(normalizedLine) !== -1 || t.indexOf(lineNorm) !== -1)) {
                         return true;
                     }
-                    // Runner row label after the O/U market is already open: "Over 1.5 Goals".
-                    // Previously SH context rejected this and caused 'label not found'
-                    // even when the left market was correctly selected.
-                    if (looksLikeRunnerLabel) return true;
                     return false;
                 }
                 if (marketKey === 'next_goal') {
@@ -7508,13 +7552,28 @@ def _select_betfair_overunder_back(
                     if (looksLikeCorrectScore(t)) return false;
                     if (!rowMatchesSelection(t)) return false;
                     if (marketKey !== 'second_half_goals' && t.indexOf('half') !== -1) return false;
-                    // Exact runner label is enough once the O/U market panel is open.
                     const exactRunner = normalizeMarket(t) === normalizeMarket(labelText)
                         || normalizeMarket(t).indexOf(normalizeMarket(labelText)) === 0;
                     let parent = el.parentElement;
+                    let secondHalfContext = false;
                     for (let depth = 0; depth < 12 && parent; depth++, parent = parent.parentElement) {
                         const parentText = normalizeMarket(txt(parent));
                         if (isBlockedMarket(parentText)) return false;
+                        if (parentText.indexOf('2nd half') !== -1
+                            || parentText.indexOf('second half') !== -1
+                            || parentText.indexOf('half goals') !== -1) {
+                            secondHalfContext = true;
+                        }
+                    }
+                    if (marketKey === 'second_half_goals') {
+                        // A bare runner label is safe only when its market card is
+                        // explicitly second-half scoped. This prevents a full-time
+                        // Over 2.5 runner from satisfying an SH signal.
+                        return (secondHalfContext || secondHalfTabActive)
+                            && (exactRunner
+                                || hasOverUnderContext(t)
+                                || marketTextNorms.some((marketText) =>
+                                    normalizeMarket(t).indexOf(marketText) !== -1));
                     }
                     return exactRunner
                         || hasOverUnderContext(t)

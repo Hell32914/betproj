@@ -446,9 +446,19 @@ async def main():
                                     )
                                     if not result.get("opened"):
                                         betfair_state = "not_found"
-                                        await event.reply(
-                                            "Betfair: матч не найден — открыта страница поиска."
-                                        )
+                                        result_url = (result.get("url") or "").lower()
+                                        result_error = (result.get("error") or "").strip()
+                                        if "/search" in result_url or "search?" in result_url:
+                                            message = "Betfair: матч не найден в результатах поиска."
+                                        elif result_url.rstrip("/").endswith("/exchange/plus"):
+                                            message = (
+                                                "Betfair: поиск не открыл матч и остался на главной биржи."
+                                            )
+                                        else:
+                                            message = "Betfair: матч не открыт после поиска."
+                                        if result_error:
+                                            message = f"{message} Причина: {result_error}"
+                                        await event.reply(message)
                                     elif result.get("selection_error"):
                                         betfair_state = "missing"
                                         print(
