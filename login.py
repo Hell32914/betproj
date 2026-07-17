@@ -699,8 +699,23 @@ def _select_betfair_left_market(
             if (isSecondHalf) {
                 activeTargets = specificTargets.length ? specificTargets.slice() : [];
                 const hasSpecificInSidebar = sidebarItems.some((it) =>
-                    specificTargets.some((tg) => it.t === tg));
-                if (!hasSpecificInSidebar && genericTargets.length) {
+                    specificTargets.some((tg) => it.t === tg || it.t.startsWith(tg) || tg.startsWith(it.t)));
+                const secondHalfTabActive = Array.from(document.querySelectorAll(
+                    "a, button, [role='button'], [role='tab'], li"
+                )).filter((el) => {
+                    if (!visible(el)) return false;
+                    const t = normM(el.innerText || el.textContent || '');
+                    if (!(t === '2nd half' || t.startsWith('2nd half')
+                        || t === 'second half' || t.startsWith('second half'))) return false;
+                    const selected = ((el.getAttribute('aria-selected') || '') + ' '
+                        + (el.getAttribute('aria-current') || '')).toLowerCase();
+                    const cls = (el.className && el.className.toString ? el.className.toString() : '').toLowerCase();
+                    return selected.includes('true') || selected === 'page'
+                        || /\bactive\b|\bselected\b|\bcurrent\b/.test(cls);
+                }).length > 0;
+                // Bare "Over/Under X.X Goals" is only second-half scoped after an
+                // actual Second Half tab switch. Otherwise it is a full-time line.
+                if (!hasSpecificInSidebar && secondHalfTabActive && genericTargets.length) {
                     activeTargets = activeTargets.concat(genericTargets);
                 }
             }
@@ -4870,7 +4885,7 @@ def place_black_bet(session: dict, signal) -> dict:
         if market_key == "second_half_goals":
             _click_black_period_tab(
                 driver,
-                ["half-time", "half time", "2nd half", "half-time/full-time"],
+                ["2nd half", "second half"],
             )
         try:
             WebDriverWait(driver, 20).until(
@@ -6977,8 +6992,9 @@ def _select_betfair_overunder_back(
     market_key = _signal_market_key(signal)
     strict_market_texts = _betfair_strict_market_texts(line_str, market_key)
     allow_label_fallback = True
-    # SH signals must never fall back to a full-time line with the same number.
-    # Only a genuine second-half tab is acceptable before market selection.
+    # Some Exchange layouts expose second-half markets in the left sidebar rather
+    # than a dedicated tab. A missing tab is therefore not itself an error; the
+    # selectors below still require an explicit second-half market context.
     preferred_tabs = ["2nd half", "second half"] if market_key == "second_half_goals" else []
 
     if preferred_tabs:
@@ -7026,11 +7042,13 @@ def _select_betfair_overunder_back(
                     flush=True,
                 )
             if not tab_result.get("clicked"):
-                raise RuntimeError(
-                    f"[{profile_label}] Betfair could not open a Second Half tab; "
-                    "refusing to use the full-time market for an SH signal."
+                print(
+                    f"[{profile_label}] Betfair has no Second Half tab; "
+                    "searching only explicitly second-half-scoped sidebar/market entries.",
+                    flush=True,
                 )
-            time.sleep(2.0)
+            else:
+                time.sleep(2.0)
         except Exception:
             raise
 
@@ -7458,9 +7476,11 @@ def _select_betfair_overunder_back(
                         || t.indexOf('half goals') !== -1) {
                         return true;
                     }
-                    // Market header: "Over/Under 1.5 Goals" (no 2nd-half prefix after tab switch).
+                    // A generic header is second-half scoped only after switching
+                    // a real Second Half tab; otherwise it is the full-time market.
                     if ((t.indexOf('over under') !== -1 || t.indexOf('over/under') !== -1)
-                        && (t.indexOf(normalizedLine) !== -1 || t.indexOf(lineNorm) !== -1)) {
+                        && (t.indexOf(normalizedLine) !== -1 || t.indexOf(lineNorm) !== -1)
+                        && secondHalfTabActive) {
                         return true;
                     }
                     return false;
