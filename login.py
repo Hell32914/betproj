@@ -16,7 +16,7 @@ import socket
 import subprocess
 import unicodedata
 import requests
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -1802,6 +1802,11 @@ def _search_black_live_events(
 
     for query in queries:
         try:
+            # A failed/empty Black search can dismiss its Ctrl+F dialog.  Do not
+            # type a fallback alias into a stale element or the sportsbook page:
+            # reopen the dialog before every independent query.
+            if not _black_search_dialog_open(driver):
+                _open_black_search(driver, profile_label)
             _fill_black_search(driver, query, profile_label)
             time.sleep(5)
             return query
@@ -6020,6 +6025,37 @@ def _is_betfair_event_url(url: str | None) -> bool:
     return bool(re.search(r"-betting-\d{6,}", lower) or re.search(r"[?&]eventid=\d+", lower))
 
 
+def _betfair_exchange_event_url(url: str | None) -> str | None:
+    """Convert a regular Betfair football event link into its Exchange route.
+
+    Search-result cards sometimes expose ``/en/football/...-betting-<id>``.
+    That route is a sportsbook page; the bot must use
+    ``/exchange/plus/en/football/...`` to access Back/Lay prices.
+    """
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    host = (parts.netloc or "").lower()
+    path = parts.path or ""
+    lower_path = path.lower()
+    if "betfair.com" not in host:
+        return url
+    if "/exchange/plus/" in lower_path:
+        return url
+    if "/football/" not in lower_path or not re.search(r"-betting-\d{6,}", lower_path):
+        return url
+    return urlunsplit((
+        parts.scheme or "https",
+        parts.netloc,
+        f"/exchange/plus{path if path.startswith('/') else f'/{path}'}",
+        parts.query,
+        parts.fragment,
+    ))
+
+
 def _betfair_reset_to_exchange_home(driver: webdriver.Remote, profile_label: str) -> None:
     """Leave the current event page so autocomplete/search cannot reuse the prior match."""
     current = driver.current_url or ""
@@ -6079,7 +6115,6 @@ def _find_betfair_event_href_in_dom(
                 const h = (href || '').toLowerCase();
                 if (!h) return false;
                 if (h.indexOf('betfair.com') === -1 && !h.startsWith('/')) return false;
-                if (h.indexOf('/exchange/plus/') === -1) return false;
                 if (h.indexOf('/football/') === -1) return false;
                 if (h.indexOf('/aboutus/') !== -1 || h.indexOf('/privacy.policy') !== -1) return false;
                 if (h.indexOf('/exchange/plus/search') !== -1) return false;
@@ -6504,6 +6539,23 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
         except Exception:
             pass
 
+        # Autocomplete/search cards can navigate to a sportsbook URL instead of
+        # Exchange. Canonicalise it before event validation or the next query
+        # would reset a valid result back to Exchange Home.
+        exchange_url = _betfair_exchange_event_url(driver.current_url)
+        if exchange_url and exchange_url != driver.current_url:
+            try:
+                print(
+                    f"[{profile_label}] Betfair converting sportsbook event link to Exchange: {exchange_url}",
+                    flush=True,
+                )
+                driver.get(exchange_url)
+                WebDriverWait(driver, 12).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
+                pass
+
         event_ok = _betfair_page_matches_target_event(driver, team_norms, opponent_norms)
         if not event_ok:
             candidate = _find_betfair_event_href_in_dom(driver, team_norms, opponent_norms)
@@ -6516,6 +6568,7 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                     )
                 except Exception:
                     absolute = href
+                absolute = _betfair_exchange_event_url(absolute) or absolute
                 try:
                     driver.get(absolute)
                     WebDriverWait(driver, 12).until(
@@ -6744,7 +6797,15 @@ def _follow_betfair_search_results(
             // the bot on Exchange Home and make it discard a valid result.
             if (pick.href) {
                 try {
-                    const absolute = new URL(pick.href, window.location.origin).href;
+                    const targetUrl = new URL(pick.href, window.location.origin);
+                    // Results can link to the sportsbook event page. Keep all
+                    // selection on Exchange, where Back/Lay market controls exist.
+                    if (!targetUrl.pathname.toLowerCase().includes('/exchange/plus/')
+                        && targetUrl.pathname.toLowerCase().includes('/football/')
+                        && /-betting-\d{6,}/i.test(targetUrl.pathname)) {
+                        targetUrl.pathname = '/exchange/plus' + targetUrl.pathname;
+                    }
+                    const absolute = targetUrl.href;
                     if (window.location.href !== absolute) window.location.href = absolute;
                 } catch (e) {}
             }
@@ -7179,6 +7240,44 @@ def _select_betfair_overunder_back(
             return result if isinstance(result, dict) else {"error": "action button click script returned invalid result"}
         except Exception as exc:
             return {"error": f"action button click failed: {exc}"}
+
+    def _betfair_placement_receipt_visible() -> dict:
+        """Return a fresh placement acknowledgement, if Betfair skipped confirmation.
+
+        Some Exchange layouts place a single bet immediately after ``Place bet``
+        and replace the confirmation view with a short-lived receipt.  Treating
+        that as a missing confirmation causes a second attempt for the same
+        signal, which is unsafe.
+        """
+        try:
+            result = driver.execute_script(
+                r"""
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const cs = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+                }
+                function norm(value) {
+                    return (value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                }
+                const messages = Array.from(document.querySelectorAll(
+                    "[role='alert'], [role='status'], [aria-live], [class*='toast' i], [class*='notification' i], [class*='receipt' i]"
+                ))
+                    .filter(visible)
+                    .map((el) => norm(el.innerText || el.textContent || ''))
+                    .filter((text) => text && text.length <= 500);
+                const receipt = messages.find((text) =>
+                    /\b(?:bet|bets)\s+(?:has |have |were )?(?:been )?placed\b/.test(text)
+                    || /\b(?:bet|bets)\s+successfully\s+placed\b/.test(text)
+                    || /\bbet\s+matched\b/.test(text)
+                );
+                return receipt ? { placed: true, text: receipt.slice(0, 300) } : { placed: false, messages: messages.slice(0, 8) };
+                """
+            )
+            return result if isinstance(result, dict) else {"placed": False}
+        except Exception as exc:
+            return {"placed": False, "error": str(exc)}
 
     def read_betfair_betslip_state(timeout: float = 0.0) -> dict:
         deadline = time.monotonic() + max(timeout, 0.0)
@@ -8313,11 +8412,21 @@ def _select_betfair_overunder_back(
                         )
                         bet_placed = True
                     else:
-                        last_betfair_error = f"confirm bet button not found/clicked: {confirmed2!r}"
-                        print(
-                            f"[{profile_label}] Betfair: confirm-2 result: {confirmed2!r}",
-                            flush=True,
-                        )
+                        receipt = _betfair_placement_receipt_visible()
+                        if receipt.get("placed"):
+                            bet_placed = True
+                            print(
+                                f"[{profile_label}] Betfair: placement receipt found after Place bet — "
+                                f"{receipt.get('text')!r}",
+                                flush=True,
+                            )
+                        else:
+                            last_betfair_error = f"confirm bet button not found/clicked: {confirmed2!r}"
+                            print(
+                                f"[{profile_label}] Betfair: confirm-2 result: {confirmed2!r}; "
+                                f"receipt={receipt!r}",
+                                flush=True,
+                            )
                 else:
                     bet_placed = True
             else:
