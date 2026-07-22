@@ -19,6 +19,11 @@ import requests
 from urllib.parse import quote, urlsplit, urlunsplit
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from dotenv import load_dotenv
+from openai_assist import (
+    assist_pick_market,
+    assist_pick_match,
+    gate_place_bet,
+)
 from selenium import webdriver
 from selenium.webdriver import ActionChains
 from selenium.webdriver.common.keys import Keys
@@ -2898,6 +2903,8 @@ def _find_black_live_match_candidate(
     opponent_variants: list[str],
     team_name: str,
     opponent_name: str | None,
+    signal=None,
+    profile_label: str = "Profile-1",
 ):
     last_state: dict = {}
 
@@ -3040,12 +3047,63 @@ def _find_black_live_match_candidate(
         return candidate or False
 
     try:
-        return WebDriverWait(driver, 18).until(read_candidate)
+        candidate = WebDriverWait(driver, 18).until(read_candidate)
     except TimeoutException as exc:
         raise RuntimeError(
             f"Could not find Black live match row for {team_name} vs {opponent_name or '?'}. "
             f"Search state: {last_state!r}"
         ) from exc
+
+    candidates_meta = last_state.get("candidates") or []
+    if signal is not None and candidates_meta:
+        picked_index = assist_pick_match(
+            driver,
+            signal,
+            candidates_meta,
+            profile_label=profile_label,
+            exchange="black",
+        )
+        if picked_index is not None and picked_index > 0:
+            target_text = str(candidates_meta[picked_index].get("text") or "").strip()
+            if target_text:
+                resolved = driver.execute_script(
+                    """
+                    const targetText = (arguments[0] || '').trim();
+                    const normalize = (value) => (value || '')
+                        .toLowerCase()
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                    const wanted = normalize(targetText);
+                    const isVisible = (element) => {
+                        if (!element) return false;
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const rows = Array.from(document.querySelectorAll(
+                        'li,a,button,[role="button"],[role="option"],[role="listitem"],article,div'
+                    )).filter(isVisible);
+                    for (const element of rows) {
+                        const row = element.closest(
+                            'a,button,li,[role="button"],[role="option"],[role="listitem"],article'
+                        ) || element;
+                        const text = normalize(row.innerText || row.textContent || '');
+                        if (!text) continue;
+                        if (text === wanted || text.includes(wanted)
+                            || wanted.includes(text.slice(0, Math.min(text.length, 80)))) {
+                            return row;
+                        }
+                    }
+                    return null;
+                    """,
+                    target_text,
+                )
+                if resolved is not None:
+                    return resolved
+    return candidate
 
 
 def _open_black_live_match(
@@ -3053,6 +3111,7 @@ def _open_black_live_match(
     team_name: str,
     opponent_name: str | None,
     profile_label: str,
+    signal=None,
 ) -> None:
     team_variants = _team_search_queries(team_name)
     opponent_variants = _team_search_queries(opponent_name)
@@ -3089,7 +3148,13 @@ def _open_black_live_match(
     for attempt_name, attempt in click_attempts:
         try:
             candidate = _find_black_live_match_candidate(
-                driver, team_variants, opponent_variants, team_name, opponent_name
+                driver,
+                team_variants,
+                opponent_variants,
+                team_name,
+                opponent_name,
+                signal=signal,
+                profile_label=profile_label,
             )
             before_url = driver.current_url or ""
             attempt(candidate)
@@ -3930,6 +3995,7 @@ def _set_black_betslip_price_and_place(
     price: Decimal,
     profile_label: str,
     stake: str | None = None,
+    signal=None,
 ) -> None:
     price_text = format(price.normalize(), "f")
     stake_text = (stake or "").strip()
@@ -4278,6 +4344,20 @@ def _set_black_betslip_price_and_place(
                     f"Panel: {panel_text}"
                 ) from exc
     ready_place_button = ready_state.get("placeButton")
+    if signal is not None:
+        gate = gate_place_bet(
+            driver,
+            signal,
+            profile_label=profile_label,
+            exchange="black",
+            stake=stake_text,
+            target_odds=price_text,
+            filled_odds=price_text,
+        )
+        if not gate.get("ok"):
+            raise RuntimeError(
+                f"OpenAI place gate отклонил ставку Black: {gate.get('reason')}"
+            )
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", ready_place_button)
         try:
@@ -4833,7 +4913,7 @@ def place_black_bet(session: dict, signal) -> dict:
             used_query = _search_black_live_events(driver, search_team, profile_label, alternate_names)
             print(f"[{profile_label}] Using Black search query: {used_query}")
             try:
-                _open_black_live_match(driver, team_name, opponent_name, profile_label)
+                _open_black_live_match(driver, team_name, opponent_name, profile_label, signal=signal)
                 open_match_error = None
                 break
             except Exception as exc:
@@ -4859,7 +4939,7 @@ def place_black_bet(session: dict, signal) -> dict:
         if not context_ok:
             try:
                 print(f"[{profile_label}] Black context mismatch, retrying match open before abort.")
-                _open_black_live_match(driver, team_name, opponent_name, profile_label)
+                _open_black_live_match(driver, team_name, opponent_name, profile_label, signal=signal)
             except Exception as exc:
                 print(f"[{profile_label}] Black context recovery open failed: {exc}", flush=True)
             context_ok = _black_match_context_matches(driver, team_name, opponent_name)
@@ -4932,6 +5012,24 @@ def place_black_bet(session: dict, signal) -> dict:
             except Exception:
                 pass
             _ensure_black_betslip_safe_to_use(driver, profile_label)
+            market_assist = assist_pick_market(
+                driver,
+                signal,
+                profile_label=profile_label,
+                exchange="black",
+                candidates=[{"header": header} for header in market_headers],
+            )
+            if market_assist is not None:
+                if market_assist.get("ok") is False and market_key == "second_half_goals":
+                    raise BlackSelectionMissingError(
+                        f"{market_label} {signal.selection} {signal.line} not available for "
+                        f"{team_name} vs {opponent_name or '?'}: OpenAI market assist — "
+                        f"{market_assist.get('reason')}"
+                    )
+                suggested = str(market_assist.get("header") or "").strip().lower()
+                if suggested:
+                    ordered = [suggested] + [h for h in market_headers if h != suggested]
+                    market_headers = ordered
             _select_black_asian_total_goals(
                 driver,
                 signal.selection,
@@ -4947,7 +5045,9 @@ def place_black_bet(session: dict, signal) -> dict:
             ) from exc
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
         _human_delay()
-        _set_black_betslip_price_and_place(driver, signal.odds, profile_label, stake=stake_value)
+        _set_black_betslip_price_and_place(
+            driver, signal.odds, profile_label, stake=stake_value, signal=signal
+        )
         # Just remember the new order id. Order ids are monotonic and only one bet is
         # placed at a time under the bet lock, so the new max id is unambiguously ours.
         # The actual status/price are intentionally NOT read here — the Telegram layer
@@ -6420,7 +6520,9 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
             overlay_state = _dismiss_betfair_blocking_overlays(driver, profile_label)
             if overlay_state.get("requiresLogin"):
                 login_betfair(driver, profile_label)
-            followed = _follow_betfair_search_results(driver, team_norms, opponent_norms, profile_label)
+            followed = _follow_betfair_search_results(
+                driver, team_norms, opponent_norms, profile_label, signal=signal
+            )
             if followed:
                 clicked_label = followed
             try:
@@ -6469,7 +6571,7 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
         end = time.time() + 8
         clicked_label = None
         while time.time() < end:
-            clicked_label = driver.execute_script(
+            autocomplete = driver.execute_script(
                 _BETFAIR_FUZZY_HELPERS + r"""
                 const teamNorms = arguments[0] || [];
                 const oppNorms = arguments[1] || [];
@@ -6478,20 +6580,49 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                 )).filter(visible).map((el) => {
                     const text = (el.innerText || el.textContent || '').trim();
                     const score = fuzzyAliasScore(norm(text), teamNorms, oppNorms);
-                    return { el, text, n: norm(text), score };
+                    return { text, n: norm(text), score };
                 }).filter((it) => it.text && it.text.length < 250 && it.score >= 80)
                   .filter((it) => it.n.indexOf('results for') === -1)
                   .filter((it) => !/^\d+\s+results\b/.test(it.n))
                   .filter((it) => /\bv\b|\bvs\b/.test(it.n) || it.score >= 120);
-                if (items.length === 0) return null;
                 items.sort((a, b) => b.score - a.score || a.text.length - b.text.length);
-                const pick = items[0];
+                return items.slice(0, 8).map((it) => ({ text: it.text.slice(0, 200), score: it.score }));
+                """,
+                team_norms,
+                opponent_norms,
+            ) or []
+            if not autocomplete:
+                time.sleep(0.5)
+                continue
+            pick_index = 0
+            picked = assist_pick_match(
+                driver,
+                signal,
+                autocomplete,
+                profile_label=profile_label,
+                exchange="betfair",
+            )
+            if picked is not None:
+                pick_index = picked
+            target_label = str(autocomplete[pick_index].get("text") or "").strip()
+            clicked_label = driver.execute_script(
+                _BETFAIR_FUZZY_HELPERS + r"""
+                const target = (arguments[0] || '').trim();
+                const wanted = norm(target);
+                const items = Array.from(document.querySelectorAll(
+                    "a, li, [role='option'], [role='listitem'], [role='menuitem'], [role='link'], [role='button']"
+                )).filter(visible).map((el) => {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    return { el, text, n: norm(text) };
+                }).filter((it) => it.text && it.n);
+                let pick = items.find((it) => it.n === wanted || it.text === target)
+                    || items.find((it) => it.n.includes(wanted) || wanted.includes(it.n));
+                if (!pick) return null;
                 pick.el.scrollIntoView({block: 'center'});
                 pick.el.click();
                 return pick.text.slice(0, 200);
                 """,
-                team_norms,
-                opponent_norms,
+                target_label,
             )
             if clicked_label:
                 break
@@ -6537,7 +6668,9 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
         event_ok = _betfair_page_matches_target_event(driver, team_norms, opponent_norms)
         followed = None
         if not event_ok:
-            followed = _follow_betfair_search_results(driver, team_norms, opponent_norms, profile_label)
+            followed = _follow_betfair_search_results(
+                driver, team_norms, opponent_norms, profile_label, signal=signal
+            )
         if followed:
             if _betfair_label_matches_target(driver, followed, team_norms, opponent_norms):
                 clicked_label = followed
@@ -6623,7 +6756,11 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
 
 
 def _follow_betfair_search_results(
-    driver: webdriver.Remote, team_norms: list[str], opponent_norms: list[str], profile_label: str
+    driver: webdriver.Remote,
+    team_norms: list[str],
+    opponent_norms: list[str],
+    profile_label: str,
+    signal=None,
 ):
     """If we are on a Betfair Search Results listing, click the matching match link.
 
@@ -6649,6 +6786,61 @@ def _follow_betfair_search_results(
             ))
         if not on_results:
             return None
+
+        if signal is not None:
+            listed = driver.execute_script(
+                _BETFAIR_FUZZY_HELPERS + r"""
+                const teamNorms = arguments[0] || [];
+                const oppNorms = arguments[1] || [];
+                const links = Array.from(document.querySelectorAll('a[href]'))
+                    .filter(visible)
+                    .map((a) => {
+                        const href = a.getAttribute('href') || '';
+                        const text = (a.innerText || a.textContent || '').trim();
+                        const score = fuzzyAliasScore(norm(text + ' ' + href), teamNorms, oppNorms);
+                        return { text: text.slice(0, 200), href, score };
+                    })
+                    .filter((item) => item.text && item.score >= 80)
+                    .filter((item) => /-betting-\d{6,}/i.test(item.href) || /\bv\b|\bvs\b/i.test(item.text))
+                    .sort((a, b) => b.score - a.score || a.text.length - b.text.length)
+                    .slice(0, 8);
+                return links;
+                """,
+                team_norms,
+                opponent_norms,
+            ) or []
+            picked = assist_pick_match(
+                driver,
+                signal,
+                listed,
+                profile_label=profile_label,
+                exchange="betfair",
+            )
+            if picked is not None and 0 <= picked < len(listed):
+                href = listed[picked].get("href")
+                label = listed[picked].get("text")
+                if href:
+                    try:
+                        absolute = driver.execute_script(
+                            "return new URL(arguments[0], window.location.origin).href;",
+                            href,
+                        )
+                    except Exception:
+                        absolute = href
+                    absolute = _betfair_exchange_event_url(absolute) or absolute
+                    try:
+                        print(
+                            f"[{profile_label}] Betfair search-results: OpenAI followed {label!r}",
+                            flush=True,
+                        )
+                        driver.get(absolute)
+                        WebDriverWait(driver, 12).until(
+                            lambda d: "/search" not in (d.current_url or "").lower()
+                        )
+                        return label
+                    except Exception:
+                        pass
+
         result = driver.execute_script(
             _BETFAIR_FUZZY_HELPERS + r"""
             const teamNorms = arguments[0] || [];
@@ -7051,6 +7243,23 @@ def _select_betfair_overunder_back(
                 time.sleep(2.0)
         except Exception:
             raise
+
+    market_assist = assist_pick_market(
+        driver,
+        signal,
+        profile_label=profile_label,
+        exchange="betfair",
+        candidates=[{"header": text} for text in strict_market_texts],
+    )
+    if market_assist is not None and market_assist.get("ok") is False and market_key == "second_half_goals":
+        raise RuntimeError(
+            f"[{profile_label}] OpenAI market assist: Second Half market not confirmed — "
+            f"{market_assist.get('reason')}"
+        )
+    if market_assist is not None:
+        suggested = str(market_assist.get("header") or "").strip().lower()
+        if suggested:
+            strict_market_texts = [suggested] + [t for t in strict_market_texts if t != suggested]
 
     # 1) Select the exact Over/Under <line> Goals market from the LEFT column first,
     # and confirm the central panel switched to it, so we never place a bet on a
@@ -8398,6 +8607,21 @@ def _select_betfair_overunder_back(
             # Both the place button and the confirm view can render with a small
             # delay, so poll for each instead of relying on a fixed sleep.
             time.sleep(1.2)
+            gate = gate_place_bet(
+                driver,
+                signal,
+                profile_label=profile_label,
+                exchange="betfair",
+                stake=stake_str,
+                target_odds=target_odds,
+                filled_odds=accepted_odds_text,
+            )
+            if not gate.get("ok"):
+                last_betfair_error = f"OpenAI place gate отклонил ставку: {gate.get('reason')}"
+                raise RuntimeError(
+                    f"[{profile_label}] Betfair bet was not placed after selecting {market_label} "
+                    f"{selection.title()} {line_str}: {last_betfair_error}"
+                )
             confirmed = None
             place_deadline = time.monotonic() + 6
             while True:
