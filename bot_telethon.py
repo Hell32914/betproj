@@ -387,12 +387,17 @@ async def main():
                                 )
                                 black_place_result = place_result
                                 black_order_id = place_result.get("order_id")
-                                black_state = "placed"
+                                black_state = "placed" if black_order_id not in (None, "") else "error"
                                 print(
                                     f"Black bet placement completed with status: "
                                     f"{place_result.get('status')}, orderId={black_order_id}",
                                     flush=True,
                                 )
+                                if black_state == "error":
+                                    await event.reply(
+                                        "Asia: Place был нажат, но новый order ID не подтверждён. "
+                                        "Автоповтор отключён, чтобы не создать дубликат; проверьте Orders."
+                                    )
                             except BlackSelectionMissingError as exc:
                                 black_state = "missing"
                                 print(

@@ -24,15 +24,32 @@ OPENAI_ASSIST_ENABLED = (os.getenv("OPENAI_ASSIST_ENABLED") or "1").strip().lowe
 SOFT_MIN_CONFIDENCE = 0.55
 # Hard Place gate: reject when confidence is below this, even if ok=true.
 GATE_MIN_CONFIDENCE = 0.70
+_STATUS_REPORTED = False
 
 
 def is_openai_assist_enabled() -> bool:
     return bool(OPENAI_ASSIST_ENABLED and OPENAI_API_KEY)
 
 
+def _report_status_once(profile_label: str) -> None:
+    global _STATUS_REPORTED
+    if _STATUS_REPORTED:
+        return
+    _STATUS_REPORTED = True
+    if not OPENAI_ASSIST_ENABLED:
+        detail = "disabled by OPENAI_ASSIST_ENABLED"
+    elif not OPENAI_API_KEY:
+        detail = "unavailable: OPENAI_API_KEY missing"
+    else:
+        detail = f"enabled, model={OPENAI_MODEL}"
+    print(f"[{profile_label}] OpenAI assist: {detail}.", flush=True)
+
+
 def signal_brief(signal: Any) -> dict[str, Any]:
     """Compact signal payload for vision prompts (no full raw Telegram text)."""
     market = getattr(signal, "market", None) or ""
+    raw_text = (getattr(signal, "raw_text", None) or "").lower()
+    is_sh_alert = "second half" in market.lower() or "sh goals" in raw_text
     return {
         "home_team": getattr(signal, "home_team", None),
         "away_team": getattr(signal, "away_team", None),
@@ -40,6 +57,11 @@ def signal_brief(signal: Any) -> dict[str, Any]:
         "league": getattr(signal, "league", None) or getattr(signal, "league_line", None),
         "country": getattr(signal, "country", None),
         "market": market,
+        "placement_intent": (
+            "full_time_absolute_line"
+            if is_sh_alert
+            else "ordinary_over_under_line"
+        ),
         "selection": getattr(signal, "selection", None),
         "line": str(getattr(signal, "line", "")),
         "odds": str(getattr(signal, "odds", "")),
@@ -171,6 +193,7 @@ def assist_pick_match(
     exchange: str = "unknown",
 ) -> int | None:
     """Soft: return candidate index, or None to keep the heuristic pick."""
+    _report_status_once(profile_label)
     if not is_openai_assist_enabled() or not candidates:
         return None
     if not match_pick_is_ambiguous(candidates):
@@ -228,6 +251,7 @@ def assist_pick_market(
     candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Soft: confirm market/line visibility; return model dict or None on soft failure."""
+    _report_status_once(profile_label)
     if not is_openai_assist_enabled():
         return None
     brief = signal_brief(signal)
@@ -236,9 +260,11 @@ def assist_pick_market(
         result = ask_vision(
             task=(
                 "Confirm whether the target Over/Under market and line from the signal "
-                "are visible and selectable on this page. Respect Second Half vs Full Time. "
-                "Never approve a full-time total for a SECOND HALF GOALS signal unless a "
-                "second-half market/tab/header is clearly active. "
+                "are visible and selectable on this page. IMPORTANT: InPlayGuru text "
+                "'SH Goals' is only an alert strategy label; its numeric line is the "
+                "absolute FULL-TIME match total shown by the exchange. Therefore use "
+                "ordinary Asian Total Goals / Over-Under X Goals and do not require a "
+                "Second Half tab. "
                 "Return JSON: "
                 '{"ok": true|false, "index": <candidate index or null>, '
                 '"header": "<visible market header or null>", '
@@ -269,6 +295,71 @@ def assist_pick_market(
         return None
 
 
+def assist_pick_ui_action(
+    driver: Any,
+    signal: Any,
+    candidates: list[dict[str, Any]],
+    *,
+    profile_label: str = "Profile",
+    exchange: str = "unknown",
+    goal: str = "focus the target market",
+) -> int | None:
+    """Choose one whitelisted DOM candidate to click/scroll into view."""
+    _report_status_once(profile_label)
+    if not is_openai_assist_enabled() or not candidates:
+        return None
+    try:
+        result = ask_vision(
+            task=(
+                f"Choose the safest UI element to {goal}. Candidates are a whitelist "
+                "collected from the current DOM; return only one candidate index. "
+                "For an InPlayGuru 'SH Goals' alert, choose the ordinary absolute "
+                "FULL-TIME Asian Total Goals / Over-Under X Goals element. Never "
+                "choose Asian Handicap, team totals, correct score, or another line. "
+                "Return JSON: "
+                '{"index": <0-based index or null>, "confidence": <0..1>, '
+                '"reason": "<short>"}'
+            ),
+            brief=signal_brief(signal),
+            image_b64=screenshot_b64(driver),
+            candidates=[
+                {
+                    "index": index,
+                    "text": str(item.get("text") or "")[:180],
+                    "context": str(item.get("context") or "")[:260],
+                    "clickable": bool(item.get("clickable")),
+                    "in_viewport": bool(item.get("in_viewport")),
+                    "x": item.get("x"),
+                    "y": item.get("y"),
+                }
+                for index, item in enumerate(candidates)
+            ],
+            extra={"exchange": exchange, "profile": profile_label, "goal": goal},
+        )
+        confidence = float(result.get("confidence") or 0)
+        index = result.get("index")
+        if index is None or confidence < SOFT_MIN_CONFIDENCE:
+            print(
+                f"[{profile_label}] OpenAI UI action: no pick "
+                f"(confidence={confidence:.2f}, reason={result.get('reason')!r})",
+                flush=True,
+            )
+            return None
+        index_int = int(index)
+        if not 0 <= index_int < len(candidates):
+            return None
+        print(
+            f"[{profile_label}] OpenAI UI action: picked={index_int} "
+            f"text={str(candidates[index_int].get('text') or '')[:80]!r} "
+            f"confidence={confidence:.2f} reason={result.get('reason')!r}",
+            flush=True,
+        )
+        return index_int
+    except Exception as exc:
+        print(f"[{profile_label}] OpenAI UI action failed (soft fallback): {exc}", flush=True)
+        return None
+
+
 def gate_place_bet(
     driver: Any,
     signal: Any,
@@ -280,8 +371,13 @@ def gate_place_bet(
     filled_odds: str | None = None,
 ) -> dict[str, Any]:
     """Hard gate before Place. Fail-closed on API errors / low confidence / reject."""
-    if not is_openai_assist_enabled():
+    _report_status_once(profile_label)
+    if not OPENAI_ASSIST_ENABLED:
         return {"ok": True, "reason": "openai-assist-disabled", "confidence": 1.0}
+    if not OPENAI_API_KEY:
+        reason = "OPENAI_API_KEY missing while OPENAI_ASSIST_ENABLED=1"
+        print(f"[{profile_label}] OpenAI place gate: REJECT ({reason})", flush=True)
+        return {"ok": False, "reason": reason, "confidence": 0.0}
 
     brief = signal_brief(signal)
     try:
@@ -289,9 +385,11 @@ def gate_place_bet(
         result = ask_vision(
             task=(
                 "Hard verification before clicking Place. Approve only if the betslip "
-                "clearly matches the signal: correct match/teams, correct market period "
-                "(Second Half vs Full Time / Next Goal), selection Over/Under, line, "
+                "clearly matches the signal: correct match/teams, selection Over/Under, line, "
                 "and odds at least the target when visible. Stake must not be empty. "
+                "IMPORTANT: InPlayGuru 'SH Goals' is a strategy label and maps to the "
+                "ordinary absolute FULL-TIME Over/Under line on the exchange; do not "
+                "require or expect a Second Half market. "
                 "Reject To Score / team totals / wrong period. "
                 "Return JSON: "
                 '{"ok": true|false, "confidence": <0..1>, "reason": "<short Russian>"}'

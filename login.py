@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from openai_assist import (
     assist_pick_market,
     assist_pick_match,
+    assist_pick_ui_action,
     gate_place_bet,
 )
 from selenium import webdriver
@@ -587,44 +588,22 @@ def _normalized_team_aliases(team_name: str | None) -> list[str]:
 def _signal_market_key(signal) -> str:
     market = (getattr(signal, "market", "") or "").lower()
     raw_text = (getattr(signal, "raw_text", "") or "").lower()
+    # InPlayGuru's "SH Goals" alert carries the absolute match total displayed
+    # by the exchanges (for example score 1-0 -> Over 1.5).  Betfair and Black
+    # do not expose that alert as a separately named "Second Half Over 1.5"
+    # market.  Select the normal full-time Over/Under / Asian Total Goals line.
     if "second half" in market or "sh goals" in raw_text or "second half" in raw_text:
-        return "second_half_goals"
+        return "full_time_goals"
     if "next goal" in market or "next goal" in raw_text:
         return "next_goal"
     return "full_time_goals"
 
 
 def _black_market_headers(signal) -> list[str]:
-    market_key = _signal_market_key(signal)
-    if market_key == "second_half_goals":
-        return [
-            "2nd half goals",
-            "second half goals",
-            "2nd half total goals",
-            "second half total goals",
-            "2nd half asian total goals",
-            "second half asian total goals",
-            "asian total goals",
-            "total goals",
-        ]
     return ["asian total goals", "total goals"]
 
 
 def _betfair_market_texts(signal, line_str: str) -> list[str]:
-    market_key = _signal_market_key(signal)
-    if market_key == "second_half_goals":
-        return [
-            "2nd half goals",
-            "second half goals",
-            "2nd half total goals",
-            "second half total goals",
-            "2nd half over under goals",
-            "second half over under goals",
-            f"2nd half over/under {line_str} goals",
-            f"second half over/under {line_str} goals",
-            f"over/under {line_str} goals",
-            f"goals over/under {line_str}",
-        ]
     return [
         f"over/under {line_str} goals",
         f"goals over/under {line_str}",
@@ -644,17 +623,6 @@ def _betfair_strict_market_texts(line_str: str, market_key: str) -> list[str]:
     (``total goals``/``goal lines``) so we click the precise ``Over/Under
     <line> Goals`` sidebar entry and don't drift onto another line.
     """
-    if market_key == "second_half_goals":
-        # Betfair often labels the left column as plain "Over/Under X.X Goals" once
-        # the Half Time / 2nd half tab is active — no "2nd half" prefix in the name.
-        return [
-            f"2nd half over/under {line_str} goals",
-            f"second half over/under {line_str} goals",
-            f"2nd half goals over/under {line_str}",
-            f"second half goals over/under {line_str}",
-            f"over/under {line_str} goals",
-            f"goals over/under {line_str}",
-        ]
     return [
         f"over/under {line_str} goals",
         f"goals over/under {line_str}",
@@ -771,11 +739,135 @@ def _select_betfair_left_market(
 
 def _signal_market_label(signal) -> str:
     market_key = _signal_market_key(signal)
-    if market_key == "second_half_goals":
-        return "Second Half Goals"
     if market_key == "next_goal":
         return "Next Goal / Full Time Goals"
+    raw_market = (getattr(signal, "market", "") or "").lower()
+    raw_text = (getattr(signal, "raw_text", "") or "").lower()
+    if "second half" in raw_market or "sh goals" in raw_text:
+        return "SH alert / Full Time Goals"
     return "Full Time Goals"
+
+
+def _openai_focus_market_element(
+    driver: webdriver.Remote,
+    signal,
+    profile_label: str,
+    exchange: str,
+    line_str: str,
+) -> bool:
+    """Let vision choose one safe market-navigation DOM candidate."""
+    try:
+        candidates = driver.execute_script(
+            r"""
+            const exchange = arguments[0];
+            const line = String(arguments[1] || '').replace(',', '.');
+            const norm = (value) => (value || '').toLowerCase()
+                .replace(/[^a-z0-9.,]+/g, ' ').replace(/\s+/g, ' ').trim();
+            const rendered = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const cs = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0
+                    && cs.visibility !== 'hidden' && cs.display !== 'none';
+            };
+            document.querySelectorAll('[data-openai-market-action]').forEach(
+                (el) => el.removeAttribute('data-openai-market-action'));
+            const lineSpace = line.replace('.', ' ');
+            const isSafeText = (text) => {
+                const t = norm(text).replace(/,/g, '.');
+                if (!t || t.length > 180) return false;
+                if (t.includes('asian handicap') || t.includes('correct score')
+                    || t.includes('home goals') || t.includes('away goals')
+                    || t.includes('team total')) return false;
+                if (exchange === 'black') {
+                    return t === 'asian total goals' || t.startsWith('asian total goals ')
+                        || t === 'total goals' || t === 'show all lines';
+                }
+                return t === `over under ${lineSpace} goals`
+                    || t === `goals over under ${lineSpace}`
+                    || t === `over under ${line} goals`
+                    || t.includes(`over under ${lineSpace} goals`);
+            };
+            const source = Array.from(document.querySelectorAll(
+                'a,button,[role="button"],[role="tab"],li,h1,h2,h3,h4,div,span'));
+            const seen = new Set();
+            const result = [];
+            for (const el of source) {
+                if (!rendered(el)) continue;
+                const rawText = (el.innerText || el.textContent || '').trim();
+                if (!isSafeText(rawText)) continue;
+                const clickable = el.closest('a,button,[role="button"],[role="tab"],li');
+                const actionEl = clickable || el;
+                if (seen.has(actionEl)) continue;
+                seen.add(actionEl);
+                const rect = actionEl.getBoundingClientRect();
+                let context = '';
+                for (let parent = actionEl.parentElement; parent; parent = parent.parentElement) {
+                    const parentText = (parent.innerText || '').trim().replace(/\s+/g, ' ');
+                    if (parentText.length >= rawText.length && parentText.length <= 420) {
+                        context = parentText;
+                        if (/asian total goals|over\s*\/?\s*under/i.test(parentText)) break;
+                    }
+                }
+                const id = `oa-market-${result.length}`;
+                actionEl.setAttribute('data-openai-market-action', id);
+                result.push({
+                    id,
+                    text: rawText.slice(0, 180),
+                    context: context.slice(0, 260),
+                    clickable: !!clickable,
+                    in_viewport: rect.bottom > 0 && rect.top < window.innerHeight
+                        && rect.right > 0 && rect.left < window.innerWidth,
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                });
+                if (result.length >= 20) break;
+            }
+            return result;
+            """,
+            exchange,
+            line_str,
+        ) or []
+        if not candidates:
+            return False
+        picked = assist_pick_ui_action(
+            driver,
+            signal,
+            candidates,
+            profile_label=profile_label,
+            exchange=exchange,
+            goal=f"open/focus the full-time Over/Under {line_str} market",
+        )
+        if picked is None:
+            return False
+        candidate_id = str(candidates[picked].get("id") or "")
+        result = driver.execute_script(
+            """
+            const id = arguments[0];
+            const el = Array.from(document.querySelectorAll('[data-openai-market-action]'))
+                .find((node) => node.getAttribute('data-openai-market-action') === id);
+            if (!el) return { ok: false };
+            el.scrollIntoView({ block: 'center', inline: 'nearest' });
+            const clickable = el.matches('a,button,[role="button"],[role="tab"],li');
+            if (clickable) {
+                try { el.click(); } catch (e) { return { ok: false }; }
+            }
+            return { ok: true, clicked: clickable };
+            """,
+            candidate_id,
+        ) or {"ok": False}
+        if result.get("ok"):
+            print(
+                f"[{profile_label}] OpenAI focused market DOM element"
+                f"{' and clicked it' if result.get('clicked') else ''}.",
+                flush=True,
+            )
+            if result.get("clicked"):
+                time.sleep(0.8)
+            return True
+    except Exception as exc:
+        print(f"[{profile_label}] OpenAI market DOM action failed (soft fallback): {exc}", flush=True)
+    return False
 
 
 def _click_text_if_visible(driver: webdriver.Remote, text: str, selector: str = "button,a,[role=button]") -> bool:
@@ -1964,13 +2056,16 @@ def _open_black_top_orders(driver: webdriver.Remote, profile_label: str) -> bool
 
 def _normalize_black_order_status(raw_status: str) -> str:
     normalized = (raw_status or '').strip().lower()
-    if normalized in {'reconciled', 'accepted', 'matched', 'confirmed', 'done', 'success'}:
+    if normalized in {
+        'reconciled', 'accepted', 'matched', 'confirmed', 'done', 'success',
+        'completed', 'settled', 'won', 'lost',
+    }:
         return 'accepted'
     if normalized in {'failed', 'rejected', 'declined', 'unplaced'}:
         return 'rejected'
     if normalized in {'cancelled', 'canceled', 'void'}:
         return 'cancelled'
-    if normalized in {'open', 'pending', 'processing'}:
+    if normalized in {'open', 'pending', 'processing', 'active', 'recorded', 'partially matched'}:
         return 'pending'
     return 'unknown'
 
@@ -2001,7 +2096,7 @@ def _read_black_orders_max_id(driver: webdriver.Remote, profile_label: str) -> i
                     && lower.includes('status')
                     && (lower.includes('stake') || lower.includes('profit/loss') || lower.includes('price'));
             };
-            const statusRegex = /\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done|Success|Unplaced)\b/i;
+            const statusRegex = /\b(Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Partially Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced)\b/i;
 
             const containers = Array.from(document.querySelectorAll('table,div,section,main,article'))
                 .filter(isVisible)
@@ -2366,7 +2461,7 @@ def _read_black_order_by_id(
                 .map((element) => ({ element, rect: element.getBoundingClientRect(), text: normalize(textOf(element)).toLowerCase() }))
                 .filter((item) => item.text.includes('selection') && item.text.includes('status') && item.text.includes('stake'))
                 .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-            const statusRegex = /\b(Open|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Accepted|Matched|Confirmed|Done|Success|Unplaced)\b/i;
+            const statusRegex = /\b(Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Partially Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced)\b/i;
             const roots = tables.length
                 ? tables.slice(0, 3).map((item) => item.element)
                 : [document.querySelector('main') || document.body].filter(Boolean);
@@ -2398,7 +2493,15 @@ def _read_black_order_by_id(
                 || filterAnd((item) => /\u20ac/.test(item.text))
                 || filterAnd(() => true);
             const rowText = rowItem.text;
-            const statusMatch = rowText.match(statusRegex);
+            const statusMetadata = Array.from(rowItem.element.querySelectorAll('*'))
+                .concat([rowItem.element])
+                .flatMap((el) => [
+                    el.getAttribute?.('title') || '',
+                    el.getAttribute?.('aria-label') || '',
+                    el.getAttribute?.('alt') || '',
+                    el.getAttribute?.('data-status') || '',
+                ]).join(' ');
+            const statusMatch = `${rowText} ${statusMetadata}`.match(statusRegex);
             const euroMatches = Array.from(rowText.matchAll(/\u20ac\\s*\\d+(?:[.,]\\d+)?/g)).map((m) => m[0]);
             return {
                 ok: true,
@@ -2430,6 +2533,11 @@ def _read_black_order_by_id(
         }
 
     raw_status = row_data.get("status") or "Unknown"
+    if raw_status == "Unknown":
+        # The exact order id is present, but some Black layouts render status as
+        # an icon without accessible text. "Recorded" is more truthful than
+        # "Unknown" and keeps the order pending rather than losing its identity.
+        raw_status = "Recorded"
     stake = row_data.get("stake") or "?"
     normalized_status = _normalize_black_order_status(raw_status)
     print(
@@ -2713,7 +2821,11 @@ def _black_match_context_matches(
             .map((element) => ({ element, rect: element.getBoundingClientRect(), text: textOf(element) }))
             .filter((item) => item.rect.x < window.innerWidth * 0.82)
             .filter((item) => item.rect.y < window.innerHeight * 0.45)
-            .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+            // Related Events may contain both requested teams while another
+            // fixture is open. Validate only a compact top match header/card.
+            .filter((item) => item.text.length <= 900)
+            .filter((item) => !item.text.includes('related events'))
+            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
 
         for (const section of sections.slice(0, 12)) {
             const normalizedText = normalize(section.text);
@@ -2982,10 +3094,10 @@ def _find_black_live_match_candidate(
                     || metrics.teamHits >= Math.max(1, Math.min(teamWords.length || 1, 2));
                 if (!hasTeam) return false;
                 if (!opponentWords.length && !opponentVariants.length) return true;
-            const hasOpponent = metrics.exactOpponent || metrics.opponentHits >= 1;
-            const strongTeamOnly = metrics.teamHits >= Math.max(1, Math.min(teamWords.length || 1, 2));
-            const singleWordTeam = (teamWords.length || 0) <= 1 && metrics.teamHits >= 1;
-            return hasOpponent || (strongTeamOnly && metrics.hasVs) || metrics.exactTeam || singleWordTeam;
+                // Never accept a same-home-team fixture against another opponent.
+                // The previous team-only fallback opened Houston v Austin for a
+                // Houston v DC United signal.
+                return metrics.exactOpponent || metrics.opponentHits >= 1;
             };
 
             const rootCandidates = Array.from(document.querySelectorAll('aside,section,div,main'))
@@ -3156,11 +3268,9 @@ def _open_black_live_match(
                 signal=signal,
                 profile_label=profile_label,
             )
-            before_url = driver.current_url or ""
             attempt(candidate)
-            open_reason = WebDriverWait(driver, 6).until(lambda browser: (
+            open_reason = WebDriverWait(driver, 10).until(lambda browser: (
                 "context" if match_opened(browser)
-                else "url" if (browser.current_url or "") != before_url and _black_current_match_page_open(browser)
                 else False
             ))
             if open_reason:
@@ -3232,10 +3342,14 @@ def _open_black_live_match(
                 el,
                 href: el.href || '',
                 text: textOf(el),
+                normalized: normalize(textOf(el)),
                 score: scoreText(textOf(el)),
                 rect: el.getBoundingClientRect(),
             }))
             .filter((item) => item.href && /\\/sportsbook\\/football\\//i.test(item.href))
+            .filter((item) => !opponentVariants.length
+                || hasVariant(item.normalized, opponentVariants)
+                || opponentWords.some((word) => fuzzyHas(item.normalized, word)))
             .filter((item) => item.score >= 45)
             .sort((a, b) => b.score - a.score || a.rect.y - b.rect.y || a.rect.x - b.rect.x);
         return links[0] ? links[0].href : null;
@@ -3247,7 +3361,7 @@ def _open_black_live_match(
         try:
             driver.get(direct_href)
             _wait_document_ready(driver)
-            if _black_match_context_matches(driver, team_name, opponent_name) or _black_current_match_page_open(driver):
+            if _black_match_context_matches(driver, team_name, opponent_name):
                 print(f"[{profile_label}] Opened Black live match for: {team_name} via direct-url fallback.")
                 return
         except Exception:
@@ -3257,6 +3371,7 @@ def _open_black_live_match(
         team_only = driver.execute_script(
             """
             const teamVariants = arguments[0] || [];
+            const opponentVariants = arguments[1] || [];
             const normalize = (value) => (value || '')
                 .toLowerCase()
                 .normalize('NFD')
@@ -3266,6 +3381,9 @@ def _open_black_live_match(
                 .trim();
             const teamWords = Array.from(new Set(
                 teamVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 2))
+            ));
+            const opponentWords = Array.from(new Set(
+                opponentVariants.flatMap((value) => normalize(value).split(' ').filter((word) => word.length >= 2))
             ));
             const isVisible = (element) => {
                 const style = window.getComputedStyle(element);
@@ -3297,8 +3415,12 @@ def _open_black_live_match(
                 .filter((item) => item.text.length >= 4 && item.text.length <= 220)
                 .filter((item) => {
                     const text = normalize(item.text);
-                    return teamVariants.some((value) => normalize(value) && text.includes(normalize(value)))
+                    const homeOk = teamVariants.some((value) => normalize(value) && text.includes(normalize(value)))
                         || teamWords.filter((word) => fuzzyHas(text, word)).length >= Math.min(2, Math.max(1, teamWords.length));
+                    if (!homeOk) return false;
+                    if (!opponentVariants.length) return true;
+                    return opponentVariants.some((value) => normalize(value) && text.includes(normalize(value)))
+                        || opponentWords.some((word) => fuzzyHas(text, word));
                 })
                 .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
             if (!candidates.length) return false;
@@ -3308,12 +3430,11 @@ def _open_black_live_match(
             return true;
             """,
             team_variants,
+            opponent_variants,
         )
         if team_only:
-            before_url = driver.current_url or ""
-            open_reason = WebDriverWait(driver, 6).until(lambda browser: (
+            open_reason = WebDriverWait(driver, 10).until(lambda browser: (
                 "context" if match_opened(browser)
-                else "url" if (browser.current_url or "") != before_url and _black_current_match_page_open(browser)
                 else False
             ))
             if open_reason:
@@ -3503,7 +3624,7 @@ def _verify_black_betslip_target(
         )
     if verified.get("teamsInTicket"):
         return
-    if _black_match_context_matches(driver, home_team or "", away_team) or _black_current_match_page_open(driver):
+    if _black_match_context_matches(driver, home_team or "", away_team):
         print(
             f"[{profile_label}] Black betslip verified by selection/line; team names are on the match page, not inside the ticket."
         )
@@ -4321,13 +4442,18 @@ def _set_black_betslip_price_and_place(
                     if normalized_stake is not None and value == normalized_stake:
                         found_stake = True
                 values_ok = found_price and found_stake and bool(debug_state.get("placeButton"))
-            if values_ok:
-                print(
-                    f"[{profile_label}] Black betslip Place still marked disabled; "
-                    f"clicking anyway because stake/price match.",
-                    flush=True,
-                )
+            if values_ok and not debug_state.get("placeDisabled"):
                 ready_state = debug_state
+            elif values_ok:
+                short_text = " | ".join(
+                    line.strip()
+                    for line in (debug_state.get("panelText", "") or "").splitlines()
+                    if line.strip()
+                )[:700]
+                raise BlackSelectionMissingError(
+                    "Black Place remained disabled after valid stake/price input; "
+                    f"the order was not submitted. Panel: {short_text}"
+                ) from exc
             else:
                 snapshot = _read_black_betslip_state(driver)
                 panel_text = " | ".join(line.strip() for line in (snapshot.get("text", "") or "").splitlines() if line.strip())[:700]
@@ -4344,6 +4470,23 @@ def _set_black_betslip_price_and_place(
                     f"Panel: {panel_text}"
                 ) from exc
     ready_place_button = ready_state.get("placeButton")
+    if ready_state.get("placeDisabled"):
+        try:
+            ready_state = WebDriverWait(driver, 4).until(
+                lambda browser: (
+                    state
+                    if (state := browser.execute_script(locate_script))
+                    and state.get("ok")
+                    and state.get("placeButton")
+                    and not state.get("placeDisabled")
+                    else False
+                )
+            )
+            ready_place_button = ready_state.get("placeButton")
+        except TimeoutException as exc:
+            raise BlackSelectionMissingError(
+                "Black Place button is disabled; refusing to report an unsubmitted order as pending."
+            ) from exc
     if signal is not None:
         gate = gate_place_bet(
             driver,
@@ -4933,20 +5076,12 @@ def place_black_bet(session: dict, signal) -> dict:
             raise RuntimeError(f"[{profile_label}] Black search dialog is still open after match click; aborting before bet selection.")
         context_ok = _black_match_context_matches(driver, team_name, opponent_name)
         if not context_ok:
-            context_ok = _black_current_match_page_open(driver)
-        if not context_ok:
-            context_ok = _black_loose_match_context_matches(driver, team_name, opponent_name)
-        if not context_ok:
             try:
                 print(f"[{profile_label}] Black context mismatch, retrying match open before abort.")
                 _open_black_live_match(driver, team_name, opponent_name, profile_label, signal=signal)
             except Exception as exc:
                 print(f"[{profile_label}] Black context recovery open failed: {exc}", flush=True)
             context_ok = _black_match_context_matches(driver, team_name, opponent_name)
-            if not context_ok:
-                context_ok = _black_current_match_page_open(driver)
-            if not context_ok:
-                context_ok = _black_loose_match_context_matches(driver, team_name, opponent_name)
         if not context_ok:
             raise RuntimeError(
                 f"[{profile_label}] Required Black match context not reached for {team_name} vs {opponent_name or '?'}; aborting before bet selection."
@@ -4972,6 +5107,13 @@ def place_black_bet(session: dict, signal) -> dict:
                 lambda browser: any(header in _visible_text_lower(browser) for header in market_headers)
             )
             _human_delay()
+            _openai_focus_market_element(
+                driver,
+                signal,
+                profile_label,
+                "black",
+                format(Decimal(str(signal.line)).normalize(), "f"),
+            )
             # Expand collapsed Asian Total Goals lines (e.g. only 1.75/2/2.25 shown).
             try:
                 expanded = driver.execute_script(
@@ -6395,15 +6537,16 @@ function tokens(s) {
     return norm(s).split(' ').filter((w) => w.length >= 3);
 }
 function wordMatch(text, word) {
-    // Word matches if it appears as a substring, OR shares a >=4-char prefix
+    // Word matches if it appears as a substring, OR shares a >=5-char prefix
     // with any whitespace-separated token (covers source typos like "whalen" vs "whale").
+    // Four-character prefix matching confused "Colon" with "Colo Colo".
     if (!word) return false;
     if (text.indexOf(word) !== -1) return true;
     const toks = text.split(' ');
     for (const t of toks) {
         if (!t) continue;
-        const k = Math.min(t.length, word.length, 4);
-        if (k >= 4 && t.slice(0, k) === word.slice(0, k)) return true;
+        const k = Math.min(t.length, word.length, 6);
+        if (k >= 5 && t.slice(0, k) === word.slice(0, k)) return true;
     }
     return false;
 }
@@ -6636,6 +6779,20 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                 flush=True,
             )
             clicked_label = None
+        elif clicked_label:
+            # Exchange autocomplete often reports the current home URL for a live
+            # result while its SPA click is still routing to the event. Give that
+            # navigation time to finish before treating the correct row as a
+            # non-event result and starting another search.
+            try:
+                WebDriverWait(driver, 12).until(
+                    lambda d: _betfair_page_matches_target_event(
+                        d, team_norms, opponent_norms
+                    )
+                    or "/betting-" in (d.current_url or "").lower()
+                )
+            except TimeoutException:
+                pass
 
         if not clicked_label:
             print(f"[{profile_label}] No Betfair autocomplete result for '{search_query}'; submitting search via Enter.")
@@ -6926,6 +7083,7 @@ def _follow_betfair_search_results(
                     || /[?&]eventId=\d+/i.test(href);
                 // Text contains a ' v ' separator (e.g. 'Team A v Team B').
                 const hasVs = /\bv\b/i.test(label || text) || /\bvs\b/i.test(label || text);
+                const resultText = (label || text || '').trim().toLowerCase();
                 return {
                     el: element,
                     clickEl: pickClickTarget(element),
@@ -6939,6 +7097,9 @@ def _follow_betfair_search_results(
                     badHref: isBadHref(href),
                     hrefLooksLikeMatch,
                     hasVs,
+                    resultSummary: resultText.startsWith('0 results')
+                        || resultText.startsWith('search results')
+                        || resultText.includes('unable to find any search results'),
                     interestingText: hasInterestingText(text),
                     interestingLabel: hasInterestingText(label),
                     area: rect.width * rect.height,
@@ -6951,6 +7112,7 @@ def _follow_betfair_search_results(
                 .filter((it) => it.area > 0 && it.area < window.innerWidth * window.innerHeight * 0.92)
                 .filter((it) => it.central || it.hrefLooksLikeMatch)
                 .filter((it) => !it.badHref)
+                .filter((it) => !it.resultSummary)
                 .filter((it) => it.teamHits > 0)
                 .filter((it) => oppNorms.length === 0 || it.oppHits > 0)
                 .filter((it) => it.hrefLooksLikeMatch || it.hasVs || it.interestingLabel || it.interestingText)
@@ -6961,6 +7123,7 @@ def _follow_betfair_search_results(
                     .filter((it) => (it.label || '').length < 260 || it.hrefLooksLikeMatch)
                     .filter((it) => it.central || it.hrefLooksLikeMatch)
                     .filter((it) => !it.badHref)
+                    .filter((it) => !it.resultSummary)
                     .filter((it) => it.teamHits > 0)
                     .filter((it) => oppNorms.length === 0 || it.oppHits > 0)
                     .filter((it) => it.score > 0 && (it.hasVs || it.hrefLooksLikeMatch));
@@ -7244,6 +7407,13 @@ def _select_betfair_overunder_back(
         except Exception:
             raise
 
+    _openai_focus_market_element(
+        driver,
+        signal,
+        profile_label,
+        "betfair",
+        line_str,
+    )
     market_assist = assist_pick_market(
         driver,
         signal,
