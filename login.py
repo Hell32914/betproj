@@ -289,18 +289,15 @@ def connect_to_browser(browser_info: dict, profile_label: str = "") -> webdriver
 
 
 def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str = "") -> None:
-    """Best-effort maximize of the active profile browser window.
+    """Bring the active profile browser window forward without resizing it.
 
     The two AdsPower profiles work strictly one after another; before a profile
-    starts operating we bring its window full-screen so the currently working
-    profile (Asia/Black or Betfair) is the one visible on screen.
+    starts operating we bring its existing OS window to the foreground.  Keep
+    the user's size and position intact so switching profiles does not rearrange
+    overlapping browser and terminal windows.
     """
     try:
         driver.switch_to.window(driver.current_window_handle)
-    except Exception:
-        pass
-    try:
-        driver.maximize_window()
     except Exception:
         pass
     if os.name != "nt":
@@ -336,6 +333,8 @@ def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str =
         ]
         user32.GetWindowTextW.restype = ctypes.c_int
         user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
         user32.SetWindowPos.argtypes = [
             wintypes.HWND, wintypes.HWND,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -370,6 +369,7 @@ def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str =
 
         if hwnd:
             SW_RESTORE = 9
+            SW_SHOW = 5
             HWND_TOPMOST = wintypes.HWND(-1)
             HWND_NOTOPMOST = wintypes.HWND(-2)
             SWP_NOSIZE = 0x0001
@@ -378,7 +378,10 @@ def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str =
             flags = SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
 
             window_handle = wintypes.HWND(hwnd)
-            user32.ShowWindow(window_handle, SW_RESTORE)
+            # SW_RESTORE also unmaximizes a maximized window.  Use it only for
+            # an actually minimized window; otherwise show/focus in place.
+            show_command = SW_RESTORE if user32.IsIconic(window_handle) else SW_SHOW
+            user32.ShowWindow(window_handle, show_command)
             # Brief topmost toggle reliably moves an AdsPower Firefox window
             # above the other profile, without leaving it permanently pinned.
             user32.SetWindowPos(window_handle, HWND_TOPMOST, 0, 0, 0, 0, flags)
