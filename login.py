@@ -1986,7 +1986,7 @@ def _fill_black_search(driver: webdriver.Remote, query: str, profile_label: str)
     if not search_state or not search_state.get("ok"):
         raise RuntimeError(f"Black search returned no visible match rows for {normalized_query!r}. State: {search_state!r}")
     time.sleep(1.2)
-    print(f"[{profile_label}] Searched Black live events for first team: {normalized_query}")
+    print(f"[{profile_label}] Searched Black live events for query: {normalized_query}")
 
 
 def _search_black_live_events(
@@ -5169,32 +5169,37 @@ def place_black_bet(session: dict, signal) -> dict:
             )
 
         search_attempt_teams = [team_name]
-        if has_exchange_match and opponent_name:
+        if opponent_name and opponent_name.lower() != team_name.lower():
             search_attempt_teams.append(opponent_name)
 
         open_match_error = None
         for attempt_index, search_team in enumerate(search_attempt_teams, start=1):
-            if attempt_index > 1:
-                driver.get(BLACK_SPORTSBOOK_URL)
-                _wait_document_ready(driver)
-                time.sleep(2)
-                try:
-                    driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-                except Exception:
-                    pass
-            print(f"[{profile_label}] Searching Black by normalized team: {search_team}")
-            _human_delay()
-            _open_black_search(driver, profile_label)
-            alternate_names = [name for name in (team_name, opponent_name) if name and name != search_team]
-            used_query = _search_black_live_events(driver, search_team, profile_label, alternate_names)
-            print(f"[{profile_label}] Using Black search query: {used_query}")
             try:
+                if attempt_index > 1:
+                    driver.get(BLACK_SPORTSBOOK_URL)
+                    _wait_document_ready(driver)
+                    time.sleep(2)
+                    try:
+                        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                    except Exception:
+                        pass
+                print(f"[{profile_label}] Searching Black by normalized team: {search_team}")
+                _human_delay()
+                _open_black_search(driver, profile_label)
+                alternate_names = [
+                    name for name in (team_name, opponent_name)
+                    if name and name != search_team
+                ]
+                used_query = _search_black_live_events(
+                    driver, search_team, profile_label, alternate_names
+                )
+                print(f"[{profile_label}] Using Black search query: {used_query}")
                 _open_black_live_match(driver, team_name, opponent_name, profile_label, signal=signal)
                 open_match_error = None
                 break
             except Exception as exc:
                 open_match_error = exc
-                if not has_exchange_match or attempt_index >= len(search_attempt_teams):
+                if attempt_index >= len(search_attempt_teams):
                     raise
                 print(
                     f"[{profile_label}] Black match search retry {attempt_index}/{len(search_attempt_teams)} failed: {exc}",
@@ -6780,14 +6785,20 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
         seen_queries.add(key)
         search_queries.append(value)
 
-    if opponent_name:
-        opponent_queries = _team_search_queries(opponent_name)
-        team_queries = _team_search_queries(team_name)
-        if team_queries and opponent_queries:
-            add_search_query(f"{team_queries[0]} {opponent_queries[0]}")
-            add_search_query(f"{team_queries[0]} vs {opponent_queries[0]}")
-    for query in _team_search_queries(team_name):
+    team_queries = _team_search_queries(team_name)
+    opponent_queries = _team_search_queries(opponent_name) if opponent_name else []
+    # Search each side independently because exchanges frequently use a
+    # different alias for one of the teams. Result validation still requires
+    # both teams, so an unrelated fixture cannot be accepted.
+    for query in team_queries[:1]:
         add_search_query(query)
+    for query in opponent_queries:
+        add_search_query(query)
+    for query in team_queries[1:]:
+        add_search_query(query)
+    if team_queries and opponent_queries:
+        add_search_query(f"{team_queries[0]} {opponent_queries[0]}")
+        add_search_query(f"{team_queries[0]} vs {opponent_queries[0]}")
 
     clicked_label = None
     for search_query in search_queries or [team_name]:
