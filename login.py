@@ -75,6 +75,10 @@ TEAM_SEARCH_ALIASES = {
     "fk siauliai ii": ["siauliai", "fk siauliai reserves", "siauliai reserves"],
     "sportivo ac las parejas": ["sportivo las parejas", "las parejas"],
     "def belgrano vr": ["defensores de belgrano", "belgrano villa ramallo", "def belgrano"],
+    "ca sarmiento": ["sarmiento de junin", "sarmiento junin"],
+    "dc utd": ["dc united"],
+    "new york red bulls": ["new york rb"],
+    "carlos manucci": ["carlos mannucci"],
 }
 
 
@@ -299,6 +303,101 @@ def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str =
         driver.maximize_window()
     except Exception:
         pass
+    if os.name != "nt":
+        return
+
+    original_title = None
+    marker = f"BETBOT_FOCUS_{os.getpid()}_{time.time_ns()}"
+    try:
+        original_title = driver.execute_script(
+            "const previous = document.title; document.title = arguments[0]; return previous;",
+            marker,
+        )
+    except Exception:
+        return
+
+    hwnd = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        enum_callback_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
+        user32.EnumWindows.argtypes = [enum_callback_type, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [
+            wintypes.HWND, wintypes.LPWSTR, ctypes.c_int
+        ]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.BringWindowToTop.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not hwnd:
+            matches: list[int] = []
+
+            @enum_callback_type
+            def enum_window(window_handle, _lparam):
+                if not user32.IsWindowVisible(window_handle):
+                    return True
+                length = user32.GetWindowTextLengthW(window_handle)
+                if length <= 0:
+                    return True
+                title_buffer = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(window_handle, title_buffer, length + 1)
+                if marker in title_buffer.value:
+                    matches.append(int(window_handle))
+                    return False
+                return True
+
+            user32.EnumWindows(enum_window, 0)
+            if matches:
+                hwnd = matches[0]
+                break
+            time.sleep(0.08)
+
+        if hwnd:
+            SW_RESTORE = 9
+            HWND_TOPMOST = wintypes.HWND(-1)
+            HWND_NOTOPMOST = wintypes.HWND(-2)
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_SHOWWINDOW = 0x0040
+            flags = SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
+
+            window_handle = wintypes.HWND(hwnd)
+            user32.ShowWindow(window_handle, SW_RESTORE)
+            # Brief topmost toggle reliably moves an AdsPower Firefox window
+            # above the other profile, without leaving it permanently pinned.
+            user32.SetWindowPos(window_handle, HWND_TOPMOST, 0, 0, 0, 0, flags)
+            user32.SetWindowPos(window_handle, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+            user32.BringWindowToTop(window_handle)
+            user32.SetForegroundWindow(window_handle)
+            print(f"[{profile_label}] Brought browser window to foreground.", flush=True)
+        else:
+            print(
+                f"[{profile_label}] Could not identify the AdsPower OS window for foreground focus.",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[{profile_label}] Browser foreground focus failed: {exc}", flush=True)
+    finally:
+        try:
+            driver.execute_script("document.title = arguments[0];", original_title or "")
+        except Exception:
+            pass
 
 
 def _find_first_visible(driver: webdriver.Remote, selectors: list[tuple[str, str]], timeout: int = 30):
@@ -2900,6 +2999,17 @@ def _black_loose_match_context_matches(
         return False
 
 
+def _black_trusted_search_result_open(driver: webdriver.Remote) -> bool:
+    """Confirm the current URL came from a strict two-team search result click."""
+    trusted_url = (getattr(driver, "_black_verified_event_url", "") or "").split("#", 1)[0].rstrip("/")
+    current_url = (driver.current_url or "").split("#", 1)[0].rstrip("/")
+    return bool(
+        trusted_url
+        and current_url == trusted_url
+        and "/sportsbook/football/" in current_url.lower()
+    )
+
+
 def _ensure_black_betslip_safe_to_use(driver: webdriver.Remote, profile_label: str) -> None:
     try:
         _activate_black_order_tab(driver, "Betslip", profile_label)
@@ -3131,9 +3241,16 @@ def _find_black_live_match_candidate(
             }
             candidates.sort((a, b) => b.metrics.score - a.metrics.score || a.area - b.area || a.rect.y - b.rect.y);
             const pick = candidates[0] || null;
+            const clickTarget = pick ? (
+                (pick.row.matches?.('a[href*="/sportsbook/football/"]') ? pick.row : null)
+                || pick.row.querySelector?.('a[href*="/sportsbook/football/"]')
+                || pick.row.querySelector?.('button,[role="button"],[role="option"],[role="listitem"]')
+                || pick.row.closest?.('a,button,[role="button"],[role="option"],[role="listitem"],li,article')
+                || pick.row
+            ) : null;
             return {
                 ok: !!pick,
-                candidate: pick ? pick.row : null,
+                candidate: clickTarget,
                 reason: pick ? 'candidate-found' : (noResults ? 'no-results' : 'no-candidate'),
                 noResults,
                 rootText: rootText.split('\\n').map((line) => line.trim()).filter(Boolean).slice(0, 12).join(' | ').slice(0, 700),
@@ -3231,6 +3348,15 @@ def _open_black_live_match(
     def match_opened(browser: webdriver.Remote) -> bool:
         return _black_match_context_matches(browser, team_name, opponent_name)
 
+    def event_url_changed(browser: webdriver.Remote, before_url: str) -> bool:
+        current = (browser.current_url or "").split("#", 1)[0].rstrip("/")
+        before = (before_url or "").split("#", 1)[0].rstrip("/")
+        return (
+            current != before
+            and "/sportsbook/football/" in current.lower()
+            and current.lower() != BLACK_SPORTSBOOK_URL.lower()
+        )
+
     click_attempts = [
         ("native", lambda candidate: candidate.click()),
         ("actions", lambda candidate: ActionChains(driver).move_to_element(candidate).pause(0.1).click(candidate).perform()),
@@ -3268,12 +3394,16 @@ def _open_black_live_match(
                 signal=signal,
                 profile_label=profile_label,
             )
+            before_url = driver.current_url
             attempt(candidate)
             open_reason = WebDriverWait(driver, 10).until(lambda browser: (
                 "context" if match_opened(browser)
+                else "strict-result-url" if event_url_changed(browser, before_url)
                 else False
             ))
             if open_reason:
+                if open_reason == "strict-result-url":
+                    driver._black_verified_event_url = driver.current_url
                 print(f"[{profile_label}] Opened Black live match for: {team_name} via {attempt_name} ({open_reason}).")
                 return
         except Exception:
@@ -3624,7 +3754,10 @@ def _verify_black_betslip_target(
         )
     if verified.get("teamsInTicket"):
         return
-    if _black_match_context_matches(driver, home_team or "", away_team):
+    if (
+        _black_match_context_matches(driver, home_team or "", away_team)
+        or _black_trusted_search_result_open(driver)
+    ):
         print(
             f"[{profile_label}] Black betslip verified by selection/line; team names are on the match page, not inside the ticket."
         )
@@ -5074,14 +5207,20 @@ def place_black_bet(session: dict, signal) -> dict:
             _dismiss_black_search_dialog(driver, profile_label)
         if _black_search_dialog_open(driver):
             raise RuntimeError(f"[{profile_label}] Black search dialog is still open after match click; aborting before bet selection.")
-        context_ok = _black_match_context_matches(driver, team_name, opponent_name)
+        context_ok = (
+            _black_match_context_matches(driver, team_name, opponent_name)
+            or _black_trusted_search_result_open(driver)
+        )
         if not context_ok:
             try:
                 print(f"[{profile_label}] Black context mismatch, retrying match open before abort.")
                 _open_black_live_match(driver, team_name, opponent_name, profile_label, signal=signal)
             except Exception as exc:
                 print(f"[{profile_label}] Black context recovery open failed: {exc}", flush=True)
-            context_ok = _black_match_context_matches(driver, team_name, opponent_name)
+            context_ok = (
+                _black_match_context_matches(driver, team_name, opponent_name)
+                or _black_trusted_search_result_open(driver)
+            )
         if not context_ok:
             raise RuntimeError(
                 f"[{profile_label}] Required Black match context not reached for {team_name} vs {opponent_name or '?'}; aborting before bet selection."
@@ -6792,7 +6931,15 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                     or "/betting-" in (d.current_url or "").lower()
                 )
             except TimeoutException:
-                pass
+                # Some home-page live rows look clickable but do not route in
+                # the current SPA state. Fall through to the canonical search
+                # results URL instead of treating the inert row as success.
+                print(
+                    f"[{profile_label}] Betfair live row did not navigate; "
+                    f"falling back to search results.",
+                    flush=True,
+                )
+                clicked_label = None
 
         if not clicked_label:
             print(f"[{profile_label}] No Betfair autocomplete result for '{search_query}'; submitting search via Enter.")
@@ -7890,6 +8037,19 @@ def _select_betfair_overunder_back(
             }
             function txt(el) { return ((el.innerText || el.textContent || '')).trim(); }
             function normalizedTxt(el) { return txt(el).toLowerCase().replace(/\s+/g, ' ').trim(); }
+            function unavailable(el) {
+                let node = el;
+                for (let depth = 0; depth < 5 && node; depth += 1, node = node.parentElement) {
+                    const cls = (node.className && node.className.toString
+                        ? node.className.toString().toLowerCase() : '');
+                    const ariaDisabled = (node.getAttribute?.('aria-disabled') || '').toLowerCase();
+                    if (node.disabled || ariaDisabled === 'true'
+                        || /\bsuspended\b|\bdisabled\b|\bunavailable\b|\blocked\b/.test(cls)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
             function parseRgb(s) {
                 const m = (s || '').match(/rgba?\(([^)]+)\)/);
                 if (!m) return null;
@@ -7899,6 +8059,7 @@ def _select_betfair_overunder_back(
             function numericCells(root) {
                 let cells = Array.from(root.querySelectorAll("button, [role='button'], a, td, div, span"))
                     .filter(visible)
+                    .filter((el) => !unavailable(el))
                     .filter((el) => {
                         const t = txt(el);
                         if (!t || t.length > 50) return false;
@@ -7955,29 +8116,31 @@ def _select_betfair_overunder_back(
                         pushUnique(parent);
                     }
                 }
-                const clickSummaries = [];
-                for (const target of targets.slice(0, 8)) {
-                    target.scrollIntoView({ block: 'center', inline: 'center' });
-                    const rect = target.getBoundingClientRect();
-                    const x = rect.left + rect.width / 2;
-                    const y = rect.top + rect.height / 2;
-                    const liveTarget = document.elementFromPoint(x, y) || target;
-                    for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                        const EventCtor = name.startsWith('pointer') ? (window.PointerEvent || MouseEvent) : MouseEvent;
-                        try {
-                            liveTarget.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
-                        } catch (e) {
-                            liveTarget.dispatchEvent(new MouseEvent(name.replace('pointer', 'mouse'), { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
-                        }
+                // Clicking every ancestor toggles/removes the selection on some
+                // Betfair layouts. Click exactly one actionable odds control.
+                const target = targets.find((element) =>
+                    ['button', 'a'].includes((element.tagName || '').toLowerCase())
+                    || (element.getAttribute?.('role') || '').toLowerCase() === 'button'
+                ) || targets[0];
+                if (!target || unavailable(target)) return [];
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+                const rect = target.getBoundingClientRect();
+                const x = rect.left + rect.width / 2;
+                const y = rect.top + rect.height / 2;
+                const liveTarget = document.elementFromPoint(x, y) || target;
+                for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    const EventCtor = name.startsWith('pointer') ? (window.PointerEvent || MouseEvent) : MouseEvent;
+                    try {
+                        liveTarget.dispatchEvent(new EventCtor(name, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse' }));
+                    } catch (e) {
+                        liveTarget.dispatchEvent(new MouseEvent(name.replace('pointer', 'mouse'), { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
                     }
-                    try { target.click?.(); } catch (e) {}
-                    clickSummaries.push({
-                        tag: (target.tagName || '').toLowerCase(),
-                        text: txt(target).slice(0, 40),
-                        cls: (target.className && target.className.toString ? target.className.toString() : '').slice(0, 80),
-                    });
                 }
-                return clickSummaries;
+                return [{
+                    tag: (target.tagName || '').toLowerCase(),
+                    text: txt(target).slice(0, 40),
+                    cls: (target.className && target.className.toString ? target.className.toString() : '').slice(0, 80),
+                }];
             }
             function pickBackCell(cells) {
                 const scored = cells.map(scoreBackCell);

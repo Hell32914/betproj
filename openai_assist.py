@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
-load_dotenv()
+_ENV_PATH = Path(__file__).resolve().with_name(".env")
+load_dotenv(dotenv_path=_ENV_PATH, override=False)
 
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o").strip()
@@ -27,19 +29,47 @@ GATE_MIN_CONFIDENCE = 0.70
 _STATUS_REPORTED = False
 
 
+def _refresh_runtime_config() -> None:
+    """Reload local configuration so launch cwd/import order cannot hide the key."""
+    global OPENAI_API_KEY, OPENAI_MODEL, OPENAI_ASSIST_ENABLED
+    load_dotenv(dotenv_path=_ENV_PATH, override=False)
+    file_values = dotenv_values(_ENV_PATH) if _ENV_PATH.is_file() else {}
+    OPENAI_API_KEY = (
+        os.getenv("OPENAI_API_KEY") or file_values.get("OPENAI_API_KEY") or ""
+    ).strip()
+    OPENAI_MODEL = (
+        os.getenv("OPENAI_MODEL") or file_values.get("OPENAI_MODEL") or "gpt-4o"
+    ).strip()
+    enabled_value = (
+        os.getenv("OPENAI_ASSIST_ENABLED")
+        or file_values.get("OPENAI_ASSIST_ENABLED")
+        or "1"
+    )
+    OPENAI_ASSIST_ENABLED = str(enabled_value).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def is_openai_assist_enabled() -> bool:
+    _refresh_runtime_config()
     return bool(OPENAI_ASSIST_ENABLED and OPENAI_API_KEY)
 
 
 def _report_status_once(profile_label: str) -> None:
     global _STATUS_REPORTED
+    _refresh_runtime_config()
     if _STATUS_REPORTED:
         return
     _STATUS_REPORTED = True
     if not OPENAI_ASSIST_ENABLED:
         detail = "disabled by OPENAI_ASSIST_ENABLED"
     elif not OPENAI_API_KEY:
-        detail = "unavailable: OPENAI_API_KEY missing"
+        env_detail = (
+            f"key absent in {_ENV_PATH}"
+            if _ENV_PATH.is_file()
+            else f".env not found at {_ENV_PATH}"
+        )
+        detail = f"unavailable: OPENAI_API_KEY missing ({env_detail})"
     else:
         detail = f"enabled, model={OPENAI_MODEL}"
     print(f"[{profile_label}] OpenAI assist: {detail}.", flush=True)

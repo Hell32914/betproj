@@ -465,13 +465,22 @@ async def main():
                                             message = f"{message} Причина: {result_error}"
                                         await event.reply(message)
                                     elif result.get("selection_error"):
-                                        betfair_state = "missing"
+                                        selection_error = str(result.get("selection_error") or "")
+                                        deterministic_gate_error = (
+                                            "OPENAI_API_KEY missing" in selection_error
+                                            or "OpenAI place gate недоступен" in selection_error
+                                        )
+                                        betfair_state = "error" if deterministic_gate_error else "missing"
                                         print(
                                             f"Betfair attempt {round_index}/{max_rounds} for "
-                                            f"{signal_teams} did not find the line: {result.get('selection_error')}",
+                                            f"{signal_teams} did not find the line: {selection_error}",
                                             flush=True,
                                         )
-                                        if is_last_round:
+                                        if deterministic_gate_error:
+                                            await event.reply(
+                                                f"Betfair: ставка заблокирована настройкой OpenAI — {selection_error}"
+                                            )
+                                        elif is_last_round:
                                             await event.reply(
                                                 "Betfair: 3 раза проверено, нужная ставка так и не появилась на сайте."
                                             )
