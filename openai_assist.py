@@ -80,6 +80,8 @@ def signal_brief(signal: Any) -> dict[str, Any]:
     market = getattr(signal, "market", None) or ""
     raw_text = (getattr(signal, "raw_text", None) or "").lower()
     is_sh_alert = "second half" in market.lower() or "sh goals" in raw_text
+    is_next_goal_alert = "next goal" in market.lower() or "next goal" in raw_text
+    is_strategy_alert = is_sh_alert or is_next_goal_alert
     return {
         "home_team": getattr(signal, "home_team", None),
         "away_team": getattr(signal, "away_team", None),
@@ -89,8 +91,15 @@ def signal_brief(signal: Any) -> dict[str, Any]:
         "market": market,
         "placement_intent": (
             "full_time_absolute_line"
-            if is_sh_alert
+            if is_strategy_alert
             else "ordinary_over_under_line"
+        ),
+        "alert_strategy": (
+            "next_goal_timing_trigger"
+            if is_next_goal_alert
+            else "sh_goals_timing_trigger"
+            if is_sh_alert
+            else None
         ),
         "selection": getattr(signal, "selection", None),
         "line": str(getattr(signal, "line", "")),
@@ -291,10 +300,11 @@ def assist_pick_market(
             task=(
                 "Confirm whether the target Over/Under market and line from the signal "
                 "are visible and selectable on this page. IMPORTANT: InPlayGuru text "
-                "'SH Goals' is only an alert strategy label; its numeric line is the "
+                "'SH Goals' and 'Next goal before 70' are only alert strategy/timing "
+                "labels; their numeric line is the "
                 "absolute FULL-TIME match total shown by the exchange. Therefore use "
                 "ordinary Asian Total Goals / Over-Under X Goals and do not require a "
-                "Second Half tab. "
+                "Second Half or Next Goal market. "
                 "Return JSON: "
                 '{"ok": true|false, "index": <candidate index or null>, '
                 '"header": "<visible market header or null>", '
@@ -343,7 +353,8 @@ def assist_pick_ui_action(
             task=(
                 f"Choose the safest UI element to {goal}. Candidates are a whitelist "
                 "collected from the current DOM; return only one candidate index. "
-                "For an InPlayGuru 'SH Goals' alert, choose the ordinary absolute "
+                "For an InPlayGuru 'SH Goals' or 'Next goal before 70' alert, choose "
+                "the ordinary absolute "
                 "FULL-TIME Asian Total Goals / Over-Under X Goals element. Never "
                 "choose Asian Handicap, team totals, correct score, or another line. "
                 "Return JSON: "
@@ -417,15 +428,16 @@ def gate_place_bet(
                 "Hard verification before clicking Place. Approve only if the betslip "
                 "clearly matches the signal: correct match/teams, selection Over/Under, line, "
                 "and odds at least the target when visible. Stake must not be empty. "
-                "IMPORTANT: InPlayGuru 'SH Goals' is a strategy label and maps to the "
+                "IMPORTANT: InPlayGuru 'SH Goals' and 'Next goal before 70' are "
+                "strategy/timing labels and map to the "
                 "ordinary absolute FULL-TIME Over/Under line on the exchange; do not "
-                "require or expect a Second Half market. "
+                "require or expect a Second Half or Next Goal market. "
                 "For Black/BetInAsia, 'Asian Total Goals' is the correct full-time "
                 "Over/Under market. A betslip suffix such as '(Asian, 0-1)' describes "
                 "the Asian market/current live score and is NOT a different goal line "
                 "or a second-half market. For Betfair, 'Over/Under X Goals' is the "
                 "correct equivalent. Do not reject either solely because the signal "
-                "contains SH Goals or because the Black slip contains the word Asian. "
+                "contains SH Goals/Next goal or because the Black slip contains the word Asian. "
                 "Reject To Score / team totals / wrong period. "
                 "Return JSON: "
                 '{"ok": true|false, "confidence": <0..1>, "reason": "<short Russian>"}'
@@ -468,7 +480,8 @@ def gate_place_bet(
                     "numeric line before this visual gate. On Black, Asian Total Goals "
                     "is the required full-time totals market and '(Asian, current-score)' "
                     "does not change the requested line. On Betfair, Over/Under X Goals "
-                    "is its equivalent. SH Goals is only the alert strategy label. "
+                    "is its equivalent. SH Goals and Next goal before 70 are only "
+                    "alert strategy/timing labels, not exchange market names. "
                     "Approve if the visible betslip agrees; reject only when the screenshot "
                     "shows a concrete contradictory team, runner, numeric line, team-total/"
                     "To Score market, empty stake, or wrong period. Return JSON only: "

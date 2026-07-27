@@ -690,14 +690,18 @@ def _normalized_team_aliases(team_name: str | None) -> list[str]:
 def _signal_market_key(signal) -> str:
     market = (getattr(signal, "market", "") or "").lower()
     raw_text = (getattr(signal, "raw_text", "") or "").lower()
-    # InPlayGuru's "SH Goals" alert carries the absolute match total displayed
-    # by the exchanges (for example score 1-0 -> Over 1.5).  Betfair and Black
-    # do not expose that alert as a separately named "Second Half Over 1.5"
-    # market.  Select the normal full-time Over/Under / Asian Total Goals line.
-    if "second half" in market or "sh goals" in raw_text or "second half" in raw_text:
+    # InPlayGuru's "SH Goals" and "Next goal before 70" are strategy/timing
+    # labels. Their numeric line is the absolute full-time match total displayed
+    # by the exchanges (for example score 0-1 -> Over 1.5). Never navigate to
+    # separately named Second Half or Next Goal markets for these alerts.
+    if (
+        "second half" in market
+        or "sh goals" in raw_text
+        or "second half" in raw_text
+        or "next goal" in market
+        or "next goal" in raw_text
+    ):
         return "full_time_goals"
-    if "next goal" in market or "next goal" in raw_text:
-        return "next_goal"
     return "full_time_goals"
 
 
@@ -841,10 +845,10 @@ def _select_betfair_left_market(
 
 def _signal_market_label(signal) -> str:
     market_key = _signal_market_key(signal)
-    if market_key == "next_goal":
-        return "Next Goal / Full Time Goals"
     raw_market = (getattr(signal, "market", "") or "").lower()
     raw_text = (getattr(signal, "raw_text", "") or "").lower()
+    if "next goal" in raw_market or "next goal" in raw_text:
+        return "Next Goal alert / Full Time Goals"
     if "second half" in raw_market or "sh goals" in raw_text:
         return "SH alert / Full Time Goals"
     return "Full Time Goals"
