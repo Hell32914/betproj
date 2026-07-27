@@ -477,6 +477,41 @@ def gate_place_bet(
         confidence = 0.0
     approved = bool(result.get("ok")) and confidence >= GATE_MIN_CONFIDENCE
     reason = str(result.get("reason") or ("ok" if approved else "отклонено"))
+    if not approved:
+        reason_lower = reason.lower()
+        verified_field_rejection = bool(
+            re.search(
+                r"лини|коэфф|цен|line|odds|price",
+                reason_lower,
+                re.IGNORECASE,
+            )
+        )
+        visual_safety_rejection = bool(
+            re.search(
+                r"матч|команд|рынок|выбор|период|тайм|пуст|"
+                r"match|team|market|selection|runner|period|half|empty|"
+                r"team total|to score",
+                reason_lower,
+                re.IGNORECASE,
+            )
+        )
+        if verified_field_rejection and not visual_safety_rejection:
+            # The caller reaches this gate only after exact DOM checks have
+            # confirmed the selected numeric line, filled limit price and
+            # non-empty stake. Vision is useful for the visual match/market
+            # context, but must not overrule those exact values after confusing
+            # a better live quote with the minimum limit price.
+            print(
+                f"[{profile_label}] OpenAI place gate: APPROVE deterministic "
+                f"DOM override for verified line/price/stake "
+                f"(vision reason={reason!r})",
+                flush=True,
+            )
+            return {
+                "ok": True,
+                "reason": "verified-line-price-stake-dom-override",
+                "confidence": 1.0,
+            }
     if not approved and re.search(
         r"рынок|лини|коэфф|цен|market|line|period|odds|price",
         reason,
