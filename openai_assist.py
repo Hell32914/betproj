@@ -438,6 +438,11 @@ def gate_place_bet(
                 "or a second-half market. For Betfair, 'Over/Under X Goals' is the "
                 "correct equivalent. Do not reject either solely because the signal "
                 "contains SH Goals/Next goal or because the Black slip contains the word Asian. "
+                "ODDS RULE: target_odds/filled_odds is the minimum limit price entered "
+                "in the betslip. The currently available market odds may be HIGHER and "
+                "do not need to equal that limit. For example, available 2.225 with "
+                "Price 1.76 is valid and better than target 1.76. Ignore bookmaker-list "
+                "prices and 'Stake At Price' monetary amounts when checking this. "
                 "Reject To Score / team totals / wrong period. "
                 "Return JSON: "
                 '{"ok": true|false, "confidence": <0..1>, "reason": "<short Russian>"}'
@@ -452,6 +457,7 @@ def gate_place_bet(
                 "target_odds": target_odds or str(brief.get("odds") or ""),
                 "filled_odds": filled_odds,
                 "dom_verified_before_gate": True,
+                "price_and_stake_verified_by_dom": True,
                 "expected_market": (
                     f"Asian Total Goals {brief.get('selection')} {brief.get('line')}"
                     if exchange.lower() == "black"
@@ -471,7 +477,11 @@ def gate_place_bet(
         confidence = 0.0
     approved = bool(result.get("ok")) and confidence >= GATE_MIN_CONFIDENCE
     reason = str(result.get("reason") or ("ok" if approved else "отклонено"))
-    if not approved and re.search(r"рынок|лини|market|line|period", reason, re.IGNORECASE):
+    if not approved and re.search(
+        r"рынок|лини|коэфф|цен|market|line|period|odds|price",
+        reason,
+        re.IGNORECASE,
+    ):
         try:
             reviewed = ask_vision(
                 task=(
@@ -482,6 +492,11 @@ def gate_place_bet(
                     "does not change the requested line. On Betfair, Over/Under X Goals "
                     "is its equivalent. SH Goals and Next goal before 70 are only "
                     "alert strategy/timing labels, not exchange market names. "
+                    "The filled Price is a minimum limit, not the live market quote: "
+                    "available odds above the filled/target odds are valid and better. "
+                    "Do not demand equality between a highlighted market quote and the "
+                    "betslip Price. DOM verification already confirmed the exact Price "
+                    "and non-empty Stake. "
                     "Approve if the visible betslip agrees; reject only when the screenshot "
                     "shows a concrete contradictory team, runner, numeric line, team-total/"
                     "To Score market, empty stake, or wrong period. Return JSON only: "
@@ -497,6 +512,7 @@ def gate_place_bet(
                     "filled_odds": filled_odds,
                     "previous_rejection": result,
                     "dom_verified_before_gate": True,
+                    "price_and_stake_verified_by_dom": True,
                 },
             )
             result = reviewed
