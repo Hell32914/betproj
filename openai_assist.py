@@ -420,6 +420,12 @@ def gate_place_bet(
                 "IMPORTANT: InPlayGuru 'SH Goals' is a strategy label and maps to the "
                 "ordinary absolute FULL-TIME Over/Under line on the exchange; do not "
                 "require or expect a Second Half market. "
+                "For Black/BetInAsia, 'Asian Total Goals' is the correct full-time "
+                "Over/Under market. A betslip suffix such as '(Asian, 0-1)' describes "
+                "the Asian market/current live score and is NOT a different goal line "
+                "or a second-half market. For Betfair, 'Over/Under X Goals' is the "
+                "correct equivalent. Do not reject either solely because the signal "
+                "contains SH Goals or because the Black slip contains the word Asian. "
                 "Reject To Score / team totals / wrong period. "
                 "Return JSON: "
                 '{"ok": true|false, "confidence": <0..1>, "reason": "<short Russian>"}'
@@ -433,6 +439,12 @@ def gate_place_bet(
                 "stake": stake,
                 "target_odds": target_odds or str(brief.get("odds") or ""),
                 "filled_odds": filled_odds,
+                "dom_verified_before_gate": True,
+                "expected_market": (
+                    f"Asian Total Goals {brief.get('selection')} {brief.get('line')}"
+                    if exchange.lower() == "black"
+                    else f"Over/Under {brief.get('line')} Goals — {brief.get('selection')}"
+                ),
             },
         )
     except Exception as exc:
@@ -447,6 +459,50 @@ def gate_place_bet(
         confidence = 0.0
     approved = bool(result.get("ok")) and confidence >= GATE_MIN_CONFIDENCE
     reason = str(result.get("reason") or ("ok" if approved else "отклонено"))
+    if not approved and re.search(r"рынок|лини|market|line|period", reason, re.IGNORECASE):
+        try:
+            reviewed = ask_vision(
+                task=(
+                    "Re-check the previous market/line rejection using the screenshot. "
+                    "The DOM has already verified the exact match, selected runner and "
+                    "numeric line before this visual gate. On Black, Asian Total Goals "
+                    "is the required full-time totals market and '(Asian, current-score)' "
+                    "does not change the requested line. On Betfair, Over/Under X Goals "
+                    "is its equivalent. SH Goals is only the alert strategy label. "
+                    "Approve if the visible betslip agrees; reject only when the screenshot "
+                    "shows a concrete contradictory team, runner, numeric line, team-total/"
+                    "To Score market, empty stake, or wrong period. Return JSON only: "
+                    '{"ok": true|false, "confidence": <0..1>, "reason": "<short Russian>"}'
+                ),
+                brief=brief,
+                image_b64=image,
+                candidates=None,
+                extra={
+                    "exchange": exchange,
+                    "stake": stake,
+                    "target_odds": target_odds or str(brief.get("odds") or ""),
+                    "filled_odds": filled_odds,
+                    "previous_rejection": result,
+                    "dom_verified_before_gate": True,
+                },
+            )
+            result = reviewed
+            try:
+                confidence = float(result.get("confidence") or 0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            approved = bool(result.get("ok")) and confidence >= GATE_MIN_CONFIDENCE
+            reason = str(result.get("reason") or ("ok" if approved else "отклонено"))
+            print(
+                f"[{profile_label}] OpenAI place gate recheck: "
+                f"{'APPROVE' if approved else 'REJECT'} confidence={confidence:.2f} "
+                f"reason={reason!r}",
+                flush=True,
+            )
+        except Exception as exc:
+            reason = f"OpenAI place gate повторная проверка недоступна: {exc}"
+            confidence = 0.0
+            approved = False
     if approved:
         print(
             f"[{profile_label}] OpenAI place gate: APPROVE confidence={confidence:.2f} "

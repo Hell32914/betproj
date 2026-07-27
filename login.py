@@ -55,8 +55,8 @@ BETINASIA_EMAIL = os.getenv("BETINASIA_EMAIL")
 BETINASIA_PASSWORD = os.getenv("BETINASIA_PASSWORD")
 BLACK_USERNAME = os.getenv("BLACK_USERNAME")
 BLACK_PASSWORD = os.getenv("BLACK_PASSWORD")
-BETFAIR_USERNAME = os.getenv("BETFAIR_USERNAME", "asint2018")
-BETFAIR_PASSWORD = os.getenv("BETFAIR_PASSWORD", ";4m/TyS7-u-bY?*")
+BETFAIR_USERNAME = (os.getenv("BETFAIR_USERNAME") or "").strip()
+BETFAIR_PASSWORD = (os.getenv("BETFAIR_PASSWORD") or "").strip()
 BETFAIR_LOGIN_URL = "https://www.betfair.com/exchange/plus/"
 BETFAIR_URL_PART = "betfair.com"
 STAKE_PERCENT = Decimal(os.getenv("STAKE_PERCENT", "5"))
@@ -6047,29 +6047,52 @@ def _is_betfair_logged_in(driver: webdriver.Remote) -> bool:
                 const cs = window.getComputedStyle(el);
                 return cs.visibility !== 'hidden' && cs.display !== 'none';
             }
-            const pwds = Array.from(document.querySelectorAll("input[type='password']"))
-                .filter(visible);
-            // If a visible password field exists, we are NOT logged in.
-            if (pwds.length > 0) return false;
+            const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
+            const loginInputs = inputs.filter((el) => {
+                const marker = [
+                    el.type || '',
+                    el.name || '',
+                    el.id || '',
+                    el.placeholder || '',
+                    el.getAttribute('aria-label') || '',
+                    el.autocomplete || '',
+                ].join(' ').toLowerCase();
+                return /password|username|email|login/.test(marker);
+            });
+            const loginButtons = Array.from(document.querySelectorAll(
+                "button, a, input[type='submit'], [role='button']"
+            )).filter(visible).filter((el) => {
+                const text = (el.innerText || el.value || el.getAttribute('aria-label') || '')
+                    .toLowerCase().replace(/\s+/g, ' ').trim();
+                return text === 'log in' || text === 'login' || text === 'join now';
+            });
+            // Betfair's top-bar password input is sometimes rendered as type=text.
+            if (loginInputs.length >= 2 || (loginInputs.length && loginButtons.length)) return false;
             const text = (document.body?.innerText || '').toLowerCase();
-            if (text.includes('log out') || text.includes('logout') || text.includes('my account')) return true;
+            if (text.includes('invalid_username_or_password')
+                || text.includes("don't recognise that username")
+                || text.includes('invalid username or password')) return false;
+            if (text.includes('log out') || text.includes('logout')) return true;
+            const accountSignals = [
+                text.includes('my account'),
+                text.includes('deposit'),
+                /\bmain\s*[€£$]\s*\d/.test(text),
+                /\bexchange bonus\s*[€£$]\s*\d/.test(text),
+            ].filter(Boolean).length;
+            if (accountSignals >= 2) return true;
             const candidates = Array.from(document.querySelectorAll(
                 "input[type='search'], input[type='text'], input:not([type]), [contenteditable='true'], [role='searchbox'], [role='combobox']"
             )).filter(visible).filter((el) => {
                 const form = el.closest('form');
                 return !(form && form.querySelector("input[type='password']"));
             });
-            // The Exchange shell itself is enough once no login form is visible.
-            // Search controls and the betslip may render asynchronously.
-            const exchangePage = (window.location.pathname || '').includes('/exchange/plus/');
-            const hasAccountChrome = /my bets|open bets|betslip|bet slip|cash out|place bets/.test(text);
-            return exchangePage || hasAccountChrome || candidates.length > 0;
+            // Search, market and betslip controls are also visible anonymously;
+            // they are not proof of authentication.
+            return false;
             """
         ))
     except Exception:
-        # Navigation can replace the DOM between Selenium calls. Do not erase an
-        # otherwise live session merely because authentication cannot be sampled.
-        return True
+        return False
 
 
 def _dismiss_betfair_blocking_overlays(driver: webdriver.Remote, profile_label: str) -> dict:
@@ -6151,11 +6174,6 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
 
     Idempotent: returns immediately when the account is already authenticated.
     """
-    if not BETFAIR_USERNAME or not BETFAIR_PASSWORD:
-        raise RuntimeError(
-            "Missing BETFAIR_USERNAME / BETFAIR_PASSWORD; cannot log into Betfair."
-        )
-
     def wait_ready(timeout: int = 20) -> None:
         try:
             WebDriverWait(driver, timeout).until(
@@ -6223,6 +6241,11 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
     if _is_betfair_logged_in(driver) and not overlay_state.get("requiresLogin"):
         print(f"[{profile_label}] Betfair already logged in; skipping form fill.")
         return
+    if not BETFAIR_USERNAME or not BETFAIR_PASSWORD:
+        raise RuntimeError(
+            "Missing BETFAIR_USERNAME / BETFAIR_PASSWORD in .env; "
+            "cannot restore the logged-out Betfair session."
+        )
 
     user_el = pwd_el = btn_el = None
     for attempt_name, reopen_home, timeout in (
@@ -6295,11 +6318,22 @@ def login_betfair(driver: webdriver.Remote, profile_label: str) -> None:
         if _is_betfair_logged_in(driver):
             print(f"[{profile_label}] Betfair login successful.")
             return
+        current_url = (driver.current_url or "").lower()
+        page_text = (_visible_page_text(driver) or "").lower()
+        if (
+            "errorcode=invalid_username_or_password" in current_url
+            or "don't recognise that username" in page_text
+            or "invalid username or password" in page_text
+        ):
+            raise RuntimeError(
+                "Betfair rejected BETFAIR_USERNAME/BETFAIR_PASSWORD. "
+                "Update the valid credentials in .env."
+            )
         time.sleep(1)
 
-    print(
-        f"[{profile_label}] WARNING: Could not confirm Betfair login state within 30s. "
-        "Check the browser manually."
+    raise RuntimeError(
+        f"[{profile_label}] Could not confirm Betfair login state within 30s. "
+        "The session remains logged out."
     )
 
 
