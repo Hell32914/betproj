@@ -405,7 +405,12 @@ async def main():
                                     f"gave up on missing line: {exc}",
                                     flush=True,
                                 )
-                                if is_last_round:
+                                if round_index == 1:
+                                    await event.reply(
+                                        "Asia: матч открыт, но нужной линии сейчас нет; "
+                                        "проверю ещё 2 раза."
+                                    )
+                                elif is_last_round:
                                     await event.reply(
                                         "Asia: Ставка проверена 3 раза, нужная линия так и не появилась на сайте."
                                     )

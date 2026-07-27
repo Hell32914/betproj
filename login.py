@@ -6611,8 +6611,10 @@ def _betfair_page_matches_target_event(
                 .filter((value) => value && value.length <= 180)
                 .slice(0, 20)
                 .join(' ');
+            let decodedPath = window.location.pathname || '';
+            try { decodedPath = decodeURIComponent(decodedPath); } catch (error) {}
             const focusText = norm([
-                window.location.pathname || '',
+                decodedPath,
                 window.location.search || '',
                 document.title || '',
                 headingText,
@@ -7061,6 +7063,24 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
                 pass
 
         event_ok = _betfair_page_matches_target_event(driver, team_norms, opponent_norms)
+        if (
+            not event_ok
+            and _is_betfair_event_url(driver.current_url)
+            and clicked_label
+            and _betfair_label_matches_target(
+                driver, clicked_label, team_norms, opponent_norms
+            )
+        ):
+            # Search results supplied an exact two-team label and a canonical
+            # Exchange event URL. The SPA title/heading can lag behind the URL,
+            # especially when the slug contains percent-encoded characters
+            # such as Våg. Do not throw away this already verified event.
+            event_ok = True
+            print(
+                f"[{profile_label}] Betfair accepted verified search-result event "
+                f"before delayed SPA headings rendered: {clicked_label!r}",
+                flush=True,
+            )
         if not event_ok:
             candidate = _find_betfair_event_href_in_dom(driver, team_norms, opponent_norms)
             if candidate and candidate.get("href"):
@@ -9417,8 +9437,26 @@ def update_betfair_default_stake(session: dict) -> dict:
         print(f"[{profile_label}] Betfair balance: EUR {balance}")
         stake_amount = _calculate_stake_from_balance(balance)
         stake = _format_stake_amount(stake_amount)
-        _set_betfair_default_stake(driver, stake, profile_label)
-        return {"balance": str(balance), "stake": stake, "percent": str(STAKE_PERCENT)}
+        default_set = True
+        try:
+            _set_betfair_default_stake(driver, stake, profile_label)
+        except Exception as exc:
+            # The placement flow fills its own stake input, so failure to open
+            # the optional Settings panel must not discard the correctly
+            # calculated Betfair stake or borrow Profile-1's larger stake.
+            default_set = False
+            print(
+                f"[{profile_label}] Betfair stake calculated as EUR {stake}, "
+                f"but the Settings default was not updated: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return {
+            "balance": str(balance),
+            "stake": stake,
+            "percent": str(STAKE_PERCENT),
+            "default_set": default_set,
+        }
     finally:
         close_driver_bridge(driver)
 
@@ -9486,10 +9524,11 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
                     "profile_label": profile_label,
                 })
                 print(
-                    f"[{profile_label}] Betfair default stake refreshed on startup: "
+                    f"[{profile_label}] Betfair stake prepared on startup: "
                     f"balance EUR {betfair_stake_result['balance']}, "
                     f"stake EUR {betfair_stake_result['stake']} "
-                    f"({betfair_stake_result['percent']}%)."
+                    f"({betfair_stake_result['percent']}%), settings updated="
+                    f"{betfair_stake_result.get('default_set', True)}."
                 )
             except Exception as st_exc:
                 print(
