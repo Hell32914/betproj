@@ -529,8 +529,8 @@ async def main():
                     return
 
                 print(
-                    f"Black bet placed, order #{black_order_id}. Sleeping {deferred_check_delay}s "
-                    f"before final status check.",
+                    f"Black order #{black_order_id} submitted. Sleeping "
+                    f"{deferred_check_delay}s before final status check.",
                     flush=True,
                 )
                 await asyncio.sleep(deferred_check_delay)
@@ -662,4 +662,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by user.", flush=True)

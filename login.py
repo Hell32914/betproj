@@ -2202,7 +2202,7 @@ def _read_black_orders_max_id(driver: webdriver.Remote, profile_label: str) -> i
                     && lower.includes('status')
                     && (lower.includes('stake') || lower.includes('profit/loss') || lower.includes('price'));
             };
-            const statusRegex = /\b(Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Partially Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced)\b/i;
+            const statusRegex = /\b(Partially Matched|Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced)\b/i;
 
             const containers = Array.from(document.querySelectorAll('table,div,section,main,article'))
                 .filter(isVisible)
@@ -2567,7 +2567,7 @@ def _read_black_order_by_id(
                 .map((element) => ({ element, rect: element.getBoundingClientRect(), text: normalize(textOf(element)).toLowerCase() }))
                 .filter((item) => item.text.includes('selection') && item.text.includes('status') && item.text.includes('stake'))
                 .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-            const statusRegex = /\b(Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Partially Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced)\b/i;
+            const statusRegex = /\b(Partially Matched|Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced)\b/i;
             const roots = tables.length
                 ? tables.slice(0, 3).map((item) => item.element)
                 : [document.querySelector('main') || document.body].filter(Boolean);
@@ -2606,6 +2606,8 @@ def _read_black_order_by_id(
                     el.getAttribute?.('aria-label') || '',
                     el.getAttribute?.('alt') || '',
                     el.getAttribute?.('data-status') || '',
+                    el.getAttribute?.('data-testid') || '',
+                    typeof el.className === 'string' ? el.className : '',
                 ]).join(' ');
             const statusMatch = `${rowText} ${statusMetadata}`.match(statusRegex);
             const euroMatches = Array.from(rowText.matchAll(/\u20ac\\s*\\d+(?:[.,]\\d+)?/g)).map((m) => m[0]);
@@ -2639,11 +2641,6 @@ def _read_black_order_by_id(
         }
 
     raw_status = row_data.get("status") or "Unknown"
-    if raw_status == "Unknown":
-        # The exact order id is present, but some Black layouts render status as
-        # an icon without accessible text. "Recorded" is more truthful than
-        # "Unknown" and keeps the order pending rather than losing its identity.
-        raw_status = "Recorded"
     stake = row_data.get("stake") or "?"
     normalized_status = _normalize_black_order_status(raw_status)
     print(
@@ -2669,6 +2666,26 @@ def check_black_order_by_id(session: dict, order_id: int, signal=None) -> dict:
         driver = connect_to_browser(session["browser_info"], profile_label)
         bring_profile_window_to_front(driver, profile_label)
         result = _read_black_order_by_id(driver, profile_label, int(order_id))
+        if signal is not None and result.get("order_status") == "Unknown":
+            fallback = _read_black_top_order_row(
+                driver,
+                profile_label,
+                timeout=12,
+                home_team=getattr(signal, "home_team", None),
+            )
+            fallback_id = fallback.get("order_id")
+            fallback_status = fallback.get("status")
+            if (
+                fallback_status in {"accepted", "rejected", "cancelled", "pending"}
+                and (fallback_id in (None, int(order_id)))
+            ):
+                fallback["order_id"] = int(order_id)
+                fallback["detail"] = (
+                    f"Exact order id was present without accessible status; "
+                    f"status recovered from the matching fixture row. "
+                    f"{fallback.get('detail') or ''}"
+                ).strip()
+                result = fallback
     finally:
         close_driver_bridge(driver)
     if signal is not None:
@@ -3008,11 +3025,24 @@ def _black_loose_match_context_matches(
 
 def _black_trusted_search_result_open(driver: webdriver.Remote) -> bool:
     """Confirm the current URL came from a strict two-team search result click."""
-    trusted_url = (getattr(driver, "_black_verified_event_url", "") or "").split("#", 1)[0].rstrip("/")
-    current_url = (driver.current_url or "").split("#", 1)[0].rstrip("/")
+    def event_identity(value: str | None) -> tuple[str, str, str]:
+        try:
+            parts = urlsplit(value or "")
+            return (
+                (parts.scheme or "").lower(),
+                (parts.netloc or "").lower(),
+                (parts.path or "").rstrip("/").lower(),
+            )
+        except ValueError:
+            return ("", "", "")
+
+    trusted_url = getattr(driver, "_black_verified_event_url", "") or ""
+    current_url = driver.current_url or ""
+    trusted_identity = event_identity(trusted_url)
+    current_identity = event_identity(current_url)
     return bool(
         trusted_url
-        and current_url == trusted_url
+        and trusted_identity == current_identity
         and "/sportsbook/football/" in current_url.lower()
     )
 
@@ -3409,8 +3439,11 @@ def _open_black_live_match(
                 else False
             ))
             if open_reason:
-                if open_reason == "strict-result-url":
-                    driver._black_verified_event_url = driver.current_url
+                # The candidate itself passed strict two-team validation. Keep
+                # that event identity for the later betslip check even if the
+                # SPA subsequently changes query/hash or omits team names from
+                # the compact ticket.
+                driver._black_verified_event_url = driver.current_url
                 print(f"[{profile_label}] Opened Black live match for: {team_name} via {attempt_name} ({open_reason}).")
                 return
         except Exception:
@@ -3499,6 +3532,7 @@ def _open_black_live_match(
             driver.get(direct_href)
             _wait_document_ready(driver)
             if _black_match_context_matches(driver, team_name, opponent_name):
+                driver._black_verified_event_url = driver.current_url
                 print(f"[{profile_label}] Opened Black live match for: {team_name} via direct-url fallback.")
                 return
         except Exception:
@@ -3575,6 +3609,7 @@ def _open_black_live_match(
                 else False
             ))
             if open_reason:
+                driver._black_verified_event_url = driver.current_url
                 print(f"[{profile_label}] Opened Black live match for: {team_name} via team-only fallback ({open_reason}).")
                 return
     except Exception:
@@ -5305,24 +5340,6 @@ def place_black_bet(session: dict, signal) -> dict:
             except Exception:
                 pass
             _ensure_black_betslip_safe_to_use(driver, profile_label)
-            market_assist = assist_pick_market(
-                driver,
-                signal,
-                profile_label=profile_label,
-                exchange="black",
-                candidates=[{"header": header} for header in market_headers],
-            )
-            if market_assist is not None:
-                if market_assist.get("ok") is False and market_key == "second_half_goals":
-                    raise BlackSelectionMissingError(
-                        f"{market_label} {signal.selection} {signal.line} not available for "
-                        f"{team_name} vs {opponent_name or '?'}: OpenAI market assist — "
-                        f"{market_assist.get('reason')}"
-                    )
-                suggested = str(market_assist.get("header") or "").strip().lower()
-                if suggested:
-                    ordered = [suggested] + [h for h in market_headers if h != suggested]
-                    market_headers = ordered
             _select_black_asian_total_goals(
                 driver,
                 signal.selection,
@@ -5348,7 +5365,7 @@ def place_black_bet(session: dict, signal) -> dict:
         new_order_id = _capture_new_black_order_id(driver, profile_label, pre_bet_max_order_id)
         return {
             "profile_label": profile_label,
-            "status": "placed" if new_order_id else "pending",
+            "status": "submitted" if new_order_id else "pending",
             "accepted": False,
             "detail": "",
             "fills": [],
@@ -6793,9 +6810,9 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
         except Exception:
             pass
 
-    _dismiss_betfair_blocking_overlays(driver, profile_label)
+    overlay_state = _dismiss_betfair_blocking_overlays(driver, profile_label)
 
-    if not _is_betfair_logged_in(driver):
+    if overlay_state.get("requiresLogin") or not _is_betfair_logged_in(driver):
         print(f"[{profile_label}] Betfair session is not logged in before search; logging in again.")
         login_betfair(driver, profile_label)
         if not _is_betfair_logged_in(driver):
