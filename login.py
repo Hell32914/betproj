@@ -23,6 +23,7 @@ from openai_assist import (
     assist_pick_market,
     assist_pick_match,
     assist_pick_ui_action,
+    assist_read_score,
     gate_place_bet,
 )
 from selenium import webdriver
@@ -60,6 +61,8 @@ BETFAIR_PASSWORD = (os.getenv("BETFAIR_PASSWORD") or "").strip()
 BETFAIR_LOGIN_URL = "https://www.betfair.com/exchange/plus/"
 BETFAIR_URL_PART = "betfair.com"
 STAKE_PERCENT = Decimal(os.getenv("STAKE_PERCENT", "5"))
+# Keep both AdsPower windows maximized (Black's narrow layout hides the Orders tab).
+BROWSER_MAXIMIZE = (os.getenv("BROWSER_MAXIMIZE") or "1").strip().lower() in {"1", "true", "yes", "on"}
 EURO_SYMBOL = "\u20ac"
 TEAM_SUFFIXES = {
     "fc", "afc", "cf", "sc", "ac", "fk", "bk", "ik", "if", "sv", "jk",
@@ -289,12 +292,14 @@ def connect_to_browser(browser_info: dict, profile_label: str = "") -> webdriver
 
 
 def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str = "") -> None:
-    """Bring the active profile browser window forward without resizing it.
+    """Bring the active profile browser window forward and keep it maximized.
 
     The two AdsPower profiles work strictly one after another; before a profile
-    starts operating we bring its existing OS window to the foreground.  Keep
-    the user's size and position intact so switching profiles does not rearrange
-    overlapping browser and terminal windows.
+    starts operating we bring its existing OS window to the foreground.  Both
+    windows are kept maximized (BROWSER_MAXIMIZE=1, default): in a half-screen
+    window Black switches to its narrow layout, hides the top "Orders" tab and
+    the bot loses order ids.  Overlapping windows are fine because Selenium
+    reads each browser's DOM directly, not the screen.
     """
     try:
         driver.switch_to.window(driver.current_window_handle)
@@ -335,6 +340,8 @@ def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str =
         user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         user32.IsIconic.argtypes = [wintypes.HWND]
         user32.IsIconic.restype = wintypes.BOOL
+        user32.IsZoomed.argtypes = [wintypes.HWND]
+        user32.IsZoomed.restype = wintypes.BOOL
         user32.SetWindowPos.argtypes = [
             wintypes.HWND, wintypes.HWND,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -368,6 +375,7 @@ def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str =
             time.sleep(0.08)
 
         if hwnd:
+            SW_MAXIMIZE = 3
             SW_RESTORE = 9
             SW_SHOW = 5
             HWND_TOPMOST = wintypes.HWND(-1)
@@ -378,10 +386,15 @@ def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str =
             flags = SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
 
             window_handle = wintypes.HWND(hwnd)
-            # SW_RESTORE also unmaximizes a maximized window.  Use it only for
-            # an actually minimized window; otherwise show/focus in place.
-            show_command = SW_RESTORE if user32.IsIconic(window_handle) else SW_SHOW
-            user32.ShowWindow(window_handle, show_command)
+            if BROWSER_MAXIMIZE and not user32.IsZoomed(window_handle):
+                # Also restores a minimized window straight into maximized state.
+                user32.ShowWindow(window_handle, SW_MAXIMIZE)
+                print(f"[{profile_label}] Maximized browser window.", flush=True)
+            else:
+                # SW_RESTORE also unmaximizes a maximized window.  Use it only for
+                # an actually minimized window; otherwise show/focus in place.
+                show_command = SW_RESTORE if user32.IsIconic(window_handle) else SW_SHOW
+                user32.ShowWindow(window_handle, show_command)
             # Brief topmost toggle reliably moves an AdsPower Firefox window
             # above the other profile, without leaving it permanently pinned.
             user32.SetWindowPos(window_handle, HWND_TOPMOST, 0, 0, 0, 0, flags)
@@ -394,6 +407,12 @@ def bring_profile_window_to_front(driver: webdriver.Remote, profile_label: str =
                 f"[{profile_label}] Could not identify the AdsPower OS window for foreground focus.",
                 flush=True,
             )
+            if BROWSER_MAXIMIZE:
+                try:
+                    driver.maximize_window()
+                    print(f"[{profile_label}] Maximized browser window via WebDriver.", flush=True)
+                except Exception as exc:
+                    print(f"[{profile_label}] WebDriver maximize failed: {exc}", flush=True)
     except Exception as exc:
         print(f"[{profile_label}] Browser foreground focus failed: {exc}", flush=True)
     finally:
@@ -2118,9 +2137,32 @@ def _open_black_top_orders(driver: webdriver.Remote, profile_label: str) -> bool
         return orders ? (orders.element.closest('button,a,[role="button"],li') || orders.element) : null;
         """
     )
-    if not target:
-        print(f"[{profile_label}] Could not find top Black Orders tab.")
+    def orders_view_open(browser: webdriver.Remote) -> bool:
+        return bool(browser.execute_script(
+            """
+            const text = (document.body?.innerText || '').toLowerCase();
+            if ((window.location.pathname || '').toLowerCase().includes('/orders')) return true;
+            return text.includes('selection') && text.includes('status') && text.includes('stake') && text.includes('profit/loss');
+            """
+        ))
+
+    def open_orders_by_url(reason: str) -> bool:
+        # In a narrow window (half-screen / small RDP resolution) Black folds the
+        # top navigation and the "Orders" tab is not in the header strip. The tab
+        # only routes to /orders/all, so open that page directly.
+        try:
+            driver.get(f"{BLACK_URL}/orders/all")
+            _wait_document_ready(driver)
+            if WebDriverWait(driver, 10).until(orders_view_open):
+                print(f"[{profile_label}] Opened Black Orders view via direct URL ({reason}).")
+                return True
+        except Exception as exc:
+            print(f"[{profile_label}] Black Orders direct URL failed: {exc}", flush=True)
         return False
+
+    if not target:
+        print(f"[{profile_label}] Could not find top Black Orders tab; trying direct URL.")
+        return open_orders_by_url("tab not in header")
 
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", target)
@@ -2134,30 +2176,14 @@ def _open_black_top_orders(driver: webdriver.Remote, profile_label: str) -> bool
     ):
         try:
             attempt()
-            if WebDriverWait(driver, 6).until(lambda browser: browser.execute_script(
-                """
-                const isVisible = (element) => {
-                    const style = window.getComputedStyle(element);
-                    const rect = element.getBoundingClientRect();
-                    return style.display !== 'none'
-                        && style.visibility !== 'hidden'
-                        && rect.width > 0
-                        && rect.height > 0
-                        && rect.bottom > 0
-                        && rect.right > 0;
-                };
-                const text = (document.body?.innerText || '').toLowerCase();
-                if ((window.location.pathname || '').toLowerCase().includes('/orders')) return true;
-                return text.includes('selection') && text.includes('status') && text.includes('stake') && text.includes('profit/loss');
-                """
-            )):
+            if WebDriverWait(driver, 6).until(orders_view_open):
                 print(f"[{profile_label}] Opened Black top Orders view.")
                 return True
         except Exception:
             continue
 
-    print(f"[{profile_label}] Could not open Black top Orders view.")
-    return False
+    print(f"[{profile_label}] Could not open Black top Orders view by click; trying direct URL.")
+    return open_orders_by_url("tab click failed")
 
 
 def _normalize_black_order_status(raw_status: str) -> str:
@@ -2178,6 +2204,101 @@ def _normalize_black_order_status(raw_status: str) -> str:
 
 class BlackSelectionMissingError(RuntimeError):
     """Raised when the requested Asian Total Goals selection never shows up on the match page after retries."""
+
+
+class MatchScoreChangedError(RuntimeError):
+    """Raised when the live score differs from the signal score: a goal went in, the alert is stale."""
+
+    def __init__(self, exchange: str, signal_score: str, live_score: str, source: str) -> None:
+        self.exchange = exchange
+        self.signal_score = signal_score
+        self.live_score = live_score
+        self.source = source
+        super().__init__(
+            f"{exchange}: score changed since signal ({signal_score} -> {live_score}, via {source}); bet skipped."
+        )
+
+
+def _normalize_score(value: str | None) -> str | None:
+    match = re.search(r"(\d{1,2})\s*[-:]\s*(\d{1,2})", value or "")
+    return f"{int(match.group(1))}-{int(match.group(2))}" if match else None
+
+
+def _read_black_live_score(driver: webdriver.Remote) -> str | None:
+    """Read the current score from the Black match header, e.g. "2nd | 66:12 1 : 0 HT 1 : 0"."""
+    try:
+        header_text = driver.execute_script(
+            r"""
+            const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const cs = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+            };
+            return Array.from(document.querySelectorAll('main,section,div'))
+                .filter(isVisible)
+                .filter((el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.y < window.innerHeight * 0.6 && r.x < window.innerWidth * 0.82;
+                })
+                .map((el) => (el.innerText || '').replace(/\s+/g, ' ').trim())
+                .filter((t) => t.length <= 400 && /(1st|2nd|ht|et)\s*\|/i.test(t))
+                .sort((a, b) => a.length - b.length)[0] || '';
+            """
+        ) or ""
+    except Exception:
+        return None
+    match = re.search(
+        r"(?:1st|2nd|et|ht)\s*\|\s*\d{1,3}:\d{2}\s+(\d{1,2})\s*:\s*(\d{1,2})",
+        header_text,
+        re.IGNORECASE,
+    )
+    return f"{int(match.group(1))}-{int(match.group(2))}" if match else None
+
+
+def _read_black_ticket_score(driver: webdriver.Remote) -> str | None:
+    """Black writes the live score into the ticket: "over 1.5 (asian, 1-0)"."""
+    try:
+        text = _visible_page_text(driver)
+    except Exception:
+        return None
+    match = re.search(r"\(asian,\s*(\d{1,2})\s*-\s*(\d{1,2})\)", text or "", re.IGNORECASE)
+    return f"{int(match.group(1))}-{int(match.group(2))}" if match else None
+
+
+def ensure_signal_score_unchanged(
+    driver: webdriver.Remote,
+    signal,
+    profile_label: str,
+    exchange: str,
+    *,
+    dom_score: str | None = None,
+    use_vision: bool = True,
+) -> str | None:
+    """Abort with MatchScoreChangedError when a goal has been scored since the signal.
+
+    The DOM score is preferred; vision is a fallback when the DOM gave nothing.
+    Returns the live score that was checked, or None when it could not be read
+    (in that case the bet is allowed: the other guards still apply).
+    """
+    signal_score = _normalize_score(getattr(signal, "score", None))
+    if not signal_score:
+        return None
+    live_score, source = _normalize_score(dom_score), "page"
+    if not live_score and use_vision:
+        live_score, source = assist_read_score(
+            driver, signal, profile_label=profile_label, exchange=exchange
+        ), "vision"
+    if not live_score:
+        print(f"[{profile_label}] {exchange} live score not readable; signal score {signal_score}.", flush=True)
+        return None
+    if live_score != signal_score:
+        print(
+            f"[{profile_label}] {exchange} score changed: signal {signal_score}, live {live_score} ({source}).",
+            flush=True,
+        )
+        raise MatchScoreChangedError(exchange, signal_score, live_score, source)
+    print(f"[{profile_label}] {exchange} score still {live_score} ({source}); signal valid.", flush=True)
+    return live_score
 
 
 def _read_black_orders_max_id(driver: webdriver.Remote, profile_label: str) -> int | None:
@@ -3040,10 +3161,18 @@ def _black_trusted_search_result_open(driver: webdriver.Remote) -> bool:
     current_url = driver.current_url or ""
     trusted_identity = event_identity(trusted_url)
     current_identity = event_identity(current_url)
+    if not trusted_url or "/sportsbook/football/" not in current_url.lower():
+        return False
+    if trusted_identity == current_identity:
+        return True
+    # Event pages end with "<date>,<home id>,<away id>"; the SPA may rewrite
+    # the league/market part of the path while staying on the same fixture.
+    trusted_key = trusted_identity[2].rsplit("/", 1)[-1]
+    current_key = current_identity[2].rsplit("/", 1)[-1]
     return bool(
-        trusted_url
-        and trusted_identity == current_identity
-        and "/sportsbook/football/" in current_url.lower()
+        re.fullmatch(r"\d{4}-\d{2}-\d{2},\d+,\d+", trusted_key)
+        and trusted_key == current_key
+        and trusted_identity[1] == current_identity[1]
     )
 
 
@@ -3804,6 +3933,24 @@ def _verify_black_betslip_target(
             f"[{profile_label}] Black betslip verified by selection/line; team names are on the match page, not inside the ticket."
         )
         return
+    # Market focus / "show all lines" scroll the totals block to the viewport
+    # centre, which pushes the match header out of the top area that
+    # _black_match_context_matches inspects. Scroll back up and re-check once.
+    try:
+        driver.execute_script("window.scrollTo(0, 0); document.querySelectorAll('main,[class*=scroll]').forEach((el) => { try { el.scrollTop = 0; } catch (e) {} });")
+        time.sleep(0.6)
+    except Exception:
+        pass
+    if _black_match_context_matches(driver, home_team or "", away_team):
+        print(
+            f"[{profile_label}] Black betslip verified by selection/line after scrolling match header back into view."
+        )
+        return
+    print(
+        f"[{profile_label}] Black context check failed: current_url={driver.current_url!r}, "
+        f"trusted_url={getattr(driver, '_black_verified_event_url', '')!r}",
+        flush=True,
+    )
     raise RuntimeError(
         f"[{profile_label}] Black betslip has {selection} {line}, but match context is not confirmed. "
         f"Ticket: {verified.get('text', '')}"
@@ -3849,6 +3996,74 @@ def _click_black_period_tab(driver: webdriver.Remote, preferred_tabs: list[str])
         time.sleep(0.8)
     except Exception:
         pass
+
+
+def _expand_black_total_goals_market(
+    driver: webdriver.Remote,
+    market_headers: list[str] | None,
+    profile_label: str,
+) -> str:
+    """Press "Show all lines" inside the Asian Total Goals block only.
+
+    Returns "expanded", "already-expanded", "no-toggle" or "not-found".
+    """
+    headers = [h.lower() for h in (market_headers or ["asian total goals", "total goals"])]
+    script = r"""
+        const headers = (arguments[0] || []).map((v) => v.toLowerCase().replace(/\s+/g, ' ').trim());
+        const norm = (v) => (v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const isVisible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const cs = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+        };
+        // Leaf-ish nodes whose own text is exactly the market title.
+        const titleNodes = Array.from(document.querySelectorAll('div,span,h1,h2,h3,h4,h5,p,button,[role="button"]'))
+            .filter(isVisible)
+            .filter((el) => headers.includes(norm(el.innerText || el.textContent)))
+            .filter((el) => !Array.from(el.children).some((c) => headers.includes(norm(c.innerText || c.textContent))));
+        const otherMarket = /asian handicap|correct score|1 x 2|double chance|total home goals|total away goals|odd\/even|win margin/;
+        const toggleIn = (root) => {
+            const nodes = Array.from(root.querySelectorAll('button,a,[role="button"],div,span'))
+                .filter(isVisible)
+                .filter((el) => {
+                    const t = norm(el.innerText || el.textContent);
+                    return t === 'show all lines' || t === 'collapse lines';
+                });
+            // Innermost node only.
+            return nodes.filter((el) => !nodes.some((o) => o !== el && el.contains(o)))[0] || null;
+        };
+        for (const title of titleNodes) {
+            for (let node = title.parentElement; node && node !== document.body; node = node.parentElement) {
+                const text = norm(node.innerText || node.textContent);
+                // Stop once the container spills into a neighbouring market.
+                const withoutTitle = text.replace(norm(title.innerText || title.textContent), '');
+                if (otherMarket.test(withoutTitle)) break;
+                const toggle = toggleIn(node);
+                if (!toggle) continue;
+                const label = norm(toggle.innerText || toggle.textContent);
+                title.scrollIntoView({ block: 'center', inline: 'nearest' });
+                if (label === 'collapse lines') return 'already-expanded';
+                const clickable = toggle.closest('button,a,[role="button"]') || toggle;
+                try { clickable.click(); } catch (e) { return 'click-failed'; }
+                return 'expanded';
+            }
+        }
+        return titleNodes.length ? 'no-toggle' : 'not-found';
+    """
+    try:
+        status = driver.execute_script(script, headers) or "not-found"
+    except Exception as exc:
+        print(f"[{profile_label}] Black Asian Total Goals expand failed: {exc}", flush=True)
+        return "not-found"
+    if status == "expanded":
+        print(f"[{profile_label}] Expanded Black Asian Total Goals (show all lines).", flush=True)
+        time.sleep(0.8)
+    elif status == "already-expanded":
+        print(f"[{profile_label}] Black Asian Total Goals already fully expanded.", flush=True)
+    else:
+        print(f"[{profile_label}] Black Asian Total Goals expand: {status}.", flush=True)
+    return status
 
 
 def _select_black_asian_total_goals(
@@ -5274,6 +5489,11 @@ def place_black_bet(session: dict, signal) -> dict:
             )
         _wait_document_ready(driver)
         time.sleep(2)
+        # A goal right after the alert makes the signal stale: stop here instead
+        # of hunting for the line (and retrying for minutes like a robot).
+        ensure_signal_score_unchanged(
+            driver, signal, profile_label, "Black", dom_score=_read_black_live_score(driver)
+        )
         prefer_left = "loss" in getattr(signal, "raw_text", "").lower()
         # Single attempt at picking the Asian Total Goals line. If the market or the
         # requested line isn't on the page yet, raise BlackSelectionMissingError so the
@@ -5293,67 +5513,49 @@ def place_black_bet(session: dict, signal) -> dict:
                 lambda browser: any(header in _visible_text_lower(browser) for header in market_headers)
             )
             _human_delay()
-            _openai_focus_market_element(
-                driver,
-                signal,
-                profile_label,
-                "black",
-                format(Decimal(str(signal.line)).normalize(), "f"),
-            )
-            # Expand collapsed Asian Total Goals lines (e.g. only 1.75/2/2.25 shown).
-            try:
-                expanded = driver.execute_script(
-                    r"""
-                    const isVisible = (el) => {
-                        if (!el) return false;
-                        const r = el.getBoundingClientRect();
-                        const cs = window.getComputedStyle(el);
-                        return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
-                    };
-                    const norm = (v) => (v || '').toLowerCase().replace(/\s+/g, ' ').trim();
-                    const buttons = Array.from(document.querySelectorAll('button,a,[role="button"],div,span'))
-                        .filter(isVisible)
-                        .map((el) => ({ el, text: norm(el.innerText || el.textContent || ''), rect: el.getBoundingClientRect() }))
-                        .filter((item) => item.text === 'show all lines' || item.text.startsWith('show all lines'));
-                    if (!buttons.length) return false;
-                    // Prefer the one nearest an Asian Total Goals header.
-                    const headers = Array.from(document.querySelectorAll('div,section,span,h2,h3,h4'))
-                        .filter(isVisible)
-                        .map((el) => ({ text: norm(el.innerText || el.textContent || ''), rect: el.getBoundingClientRect() }))
-                        .filter((item) => item.text.includes('asian total goals') || item.text === 'total goals');
-                    buttons.sort((a, b) => {
-                        const dist = (btn) => {
-                            if (!headers.length) return btn.rect.y;
-                            return Math.min.apply(null, headers.map((h) => Math.abs(btn.rect.y - h.rect.y)));
-                        };
-                        return dist(a) - dist(b) || a.rect.y - b.rect.y;
-                    });
-                    const pick = buttons[0].el.closest('button,a,[role="button"]') || buttons[0].el;
-                    pick.scrollIntoView({ block: 'center' });
-                    try { pick.click(); } catch (e) {}
-                    return true;
-                    """
-                )
-                if expanded:
-                    print(f"[{profile_label}] Expanded Black 'show all lines' for totals.", flush=True)
-                    time.sleep(0.6)
-            except Exception:
-                pass
+            # Deterministically open only the Asian Total Goals block. Low-odds
+            # lines (e.g. Over 1.5 at 1.2) are hidden until "Show all lines" is
+            # pressed inside that block; Asian Handicap must stay untouched.
+            _expand_black_total_goals_market(driver, market_headers, profile_label)
             _ensure_black_betslip_safe_to_use(driver, profile_label)
-            _select_black_asian_total_goals(
-                driver,
-                signal.selection,
-                signal.line,
-                profile_label,
-                market_headers=market_headers,
-                prefer_left=prefer_left,
-            )
+            try:
+                _select_black_asian_total_goals(
+                    driver,
+                    signal.selection,
+                    signal.line,
+                    profile_label,
+                    market_headers=market_headers,
+                    prefer_left=prefer_left,
+                )
+            except Exception as first_exc:
+                # The block may have re-rendered collapsed (live odds refresh).
+                # Re-expand once on the same page instead of a full search loop.
+                print(
+                    f"[{profile_label}] Black line not visible on first pass ({str(first_exc)[:160]}); "
+                    f"re-expanding Asian Total Goals and retrying.",
+                    flush=True,
+                )
+                time.sleep(1.0)
+                _expand_black_total_goals_market(driver, market_headers, profile_label)
+                _select_black_asian_total_goals(
+                    driver,
+                    signal.selection,
+                    signal.line,
+                    profile_label,
+                    market_headers=market_headers,
+                    prefer_left=prefer_left,
+                )
         except Exception as exc:
             raise BlackSelectionMissingError(
                 f"{market_label} {signal.selection} {signal.line} not available for "
                 f"{team_name} vs {opponent_name or '?'}: {exc}"
             ) from exc
         _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
+        ticket_score = _read_black_ticket_score(driver)
+        if ticket_score:
+            ensure_signal_score_unchanged(
+                driver, signal, profile_label, "Black", dom_score=ticket_score, use_vision=False
+            )
         _human_delay()
         _set_black_betslip_price_and_place(
             driver, signal.odds, profile_label, stake=stake_value, signal=signal
@@ -6703,6 +6905,15 @@ def open_betfair_match(session: dict, signal) -> dict:
         _human_delay()
         open_result = _betfair_search_and_open(driver, signal, profile_label)
         if not open_result.get("opened"):
+            return open_result
+        try:
+            ensure_signal_score_unchanged(driver, signal, profile_label, "Betfair")
+        except MatchScoreChangedError as exc:
+            open_result["score_changed"] = {
+                "signal": exc.signal_score,
+                "live": exc.live_score,
+                "source": exc.source,
+            }
             return open_result
         try:
             stake_info = session.get("stake") if isinstance(session.get("stake"), dict) else None
@@ -9526,6 +9737,7 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
             betfair_driver = None
             try:
                 betfair_driver = connect_to_browser(browser_info, profile_label)
+                bring_profile_window_to_front(betfair_driver, profile_label)
                 login_betfair(betfair_driver, profile_label)
             except Exception as bf_exc:
                 print(
@@ -9567,6 +9779,7 @@ def run_profile(profile_id: str, profile_label: str, login_enabled: bool = True)
         time.sleep(4)
 
         driver = connect_to_browser(browser_info, profile_label)
+        bring_profile_window_to_front(driver, profile_label)
         if not _ensure_black_session_ready(driver, profile_label):
             open_login_tab(driver, profile_label)
             close_driver_bridge(driver)

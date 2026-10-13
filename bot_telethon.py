@@ -21,6 +21,7 @@ from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 
 from login import (
     BlackSelectionMissingError,
+    MatchScoreChangedError,
     check_black_order_by_id,
     ensure_betfair_session_authorized,
     ensure_black_session_authorized,
@@ -398,6 +399,15 @@ async def main():
                                         "Asia: Place был нажат, но новый order ID не подтверждён. "
                                         "Автоповтор отключён, чтобы не создать дубликат; проверьте Orders."
                                     )
+                            except MatchScoreChangedError as exc:
+                                # A goal after the alert invalidates it on both exchanges.
+                                black_state = "score_changed"
+                                betfair_state = "score_changed"
+                                print(f"Black skipped: {exc}", flush=True)
+                                await event.reply(
+                                    f"Asia/Betfair: после сигнала счёт изменился "
+                                    f"({exc.signal_score} → {exc.live_score}) — ставку не делаю."
+                                )
                             except BlackSelectionMissingError as exc:
                                 black_state = "missing"
                                 print(
@@ -469,19 +479,42 @@ async def main():
                                         if result_error:
                                             message = f"{message} Причина: {result_error}"
                                         await event.reply(message)
+                                    elif result.get("score_changed"):
+                                        changed = result["score_changed"]
+                                        betfair_state = "score_changed"
+                                        if black_state == "missing":
+                                            # Stop Asia retries too: the alert is stale.
+                                            black_state = "score_changed"
+                                        await event.reply(
+                                            f"Betfair: после сигнала счёт изменился "
+                                            f"({changed.get('signal')} → {changed.get('live')}) — ставку не делаю."
+                                        )
                                     elif result.get("selection_error"):
                                         selection_error = str(result.get("selection_error") or "")
                                         deterministic_gate_error = (
                                             "OPENAI_API_KEY missing" in selection_error
                                             or "OpenAI place gate недоступен" in selection_error
                                         )
-                                        betfair_state = "error" if deterministic_gate_error else "missing"
+                                        # Gate saw a different match (search followed a wrong
+                                        # fixture): retrying would just reopen the same one.
+                                        wrong_match_error = bool(
+                                            "OpenAI place gate отклонил" in selection_error
+                                            and re.search(r"команд|матч", selection_error, re.IGNORECASE)
+                                        )
+                                        betfair_state = (
+                                            "error" if deterministic_gate_error or wrong_match_error else "missing"
+                                        )
                                         print(
                                             f"Betfair attempt {round_index}/{max_rounds} for "
                                             f"{signal_teams} did not find the line: {selection_error}",
                                             flush=True,
                                         )
-                                        if deterministic_gate_error:
+                                        if wrong_match_error:
+                                            await event.reply(
+                                                f"Betfair: открылся не тот матч ({result.get('label') or '?'}), "
+                                                f"ставку не делаю."
+                                            )
+                                        elif deterministic_gate_error:
                                             await event.reply(
                                                 f"Betfair: ставка заблокирована настройкой OpenAI — {selection_error}"
                                             )

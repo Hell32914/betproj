@@ -179,7 +179,8 @@ def ask_vision(
         f"{json.dumps(payload, ensure_ascii=False)}"
     )
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    # SDK default is 600s x 3 attempts; live odds and the held bet lock can't wait that long.
+    client = OpenAI(api_key=OPENAI_API_KEY, timeout=30.0, max_retries=1)
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
         temperature=0,
@@ -332,6 +333,57 @@ def assist_pick_market(
         return result
     except Exception as exc:
         print(f"[{profile_label}] OpenAI market assist failed (soft fallback): {exc}", flush=True)
+        return None
+
+
+def assist_read_score(
+    driver: Any,
+    signal: Any,
+    *,
+    profile_label: str = "Profile",
+    exchange: str = "unknown",
+) -> str | None:
+    """Soft: read the current live score of the opened match as "home-away".
+
+    Returns None when assist is off, the score is not visible or confidence is low.
+    """
+    _report_status_once(profile_label)
+    if not is_openai_assist_enabled():
+        return None
+    brief = signal_brief(signal)
+    try:
+        image = screenshot_b64(driver)
+        result = ask_vision(
+            task=(
+                "Read the CURRENT live score of the opened match (home goals and away goals) "
+                "from the match header/scoreboard. Ignore half-time (HT) scores, related "
+                "events, bet history and odds. If the score is not clearly visible, return "
+                "null values. Return JSON: "
+                '{"home": <int or null>, "away": <int or null>, "confidence": <0..1>, '
+                '"reason": "<short>"}'
+            ),
+            brief=brief,
+            image_b64=image,
+            candidates=None,
+            extra={"exchange": exchange, "profile": profile_label},
+        )
+        confidence = float(result.get("confidence") or 0)
+        home, away = result.get("home"), result.get("away")
+        if confidence < GATE_MIN_CONFIDENCE or home is None or away is None:
+            print(
+                f"[{profile_label}] OpenAI score read: not reliable "
+                f"(home={home!r}, away={away!r}, confidence={confidence:.2f}).",
+                flush=True,
+            )
+            return None
+        score = f"{int(home)}-{int(away)}"
+        print(
+            f"[{profile_label}] OpenAI score read: {score} confidence={confidence:.2f}",
+            flush=True,
+        )
+        return score
+    except Exception as exc:
+        print(f"[{profile_label}] OpenAI score read failed (soft fallback): {exc}", flush=True)
         return None
 
 
