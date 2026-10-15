@@ -32,6 +32,7 @@ from login import (
     run_all_profiles,
     update_betfair_default_stake,
 )
+from openai_assist import _report_status_once as report_openai_status
 from signals import parse_betting_signal
 
 load_dotenv()
@@ -40,6 +41,37 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+class _TeeStream:
+    """Mirror console output into bot.log (UTF-8) without PowerShell pipes."""
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log_file = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        try:
+            self._log_file.write(data)
+            self._log_file.flush()
+        except Exception:
+            pass
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+BOT_LOG_PATH = os.getenv("BOT_LOG_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log"))
+if BOT_LOG_PATH:
+    _log_file = open(BOT_LOG_PATH, "a", encoding="utf-8", errors="replace")
+    _log_file.write(f"\n===== bot started {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+    sys.stdout = _TeeStream(sys.stdout, _log_file)
+    sys.stderr = _TeeStream(sys.stderr, _log_file)
 
 API_ID = int(os.getenv("TG_API_ID"))
 API_HASH = os.getenv("TG_API_HASH")
@@ -180,6 +212,8 @@ async def keep_sessions_authorized(state: RuntimeState) -> None:
 
 async def start_adspower_after_listener_ready(state: RuntimeState) -> None:
     print("Telegram listener is ready. Starting or connecting AdsPower profiles...", flush=True)
+    # Surface a missing openai package / key at startup, not on the first bet.
+    report_openai_status("startup")
     loop = asyncio.get_running_loop()
     state.sessions = await loop.run_in_executor(
         None,

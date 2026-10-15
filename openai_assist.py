@@ -72,6 +72,14 @@ def _report_status_once(profile_label: str) -> None:
         detail = f"unavailable: OPENAI_API_KEY missing ({env_detail})"
     else:
         detail = f"enabled, model={OPENAI_MODEL}"
+        try:
+            import openai  # noqa: F401
+        except ImportError:
+            import sys
+            detail = (
+                f"BROKEN: 'openai' package is not installed for {sys.executable} — "
+                f"every Place will be rejected. Run: \"{sys.executable}\" -m pip install -r requirements.txt"
+            )
     print(f"[{profile_label}] OpenAI assist: {detail}.", flush=True)
 
 

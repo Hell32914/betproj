@@ -16,7 +16,7 @@ import socket
 import subprocess
 import unicodedata
 import requests
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from dotenv import load_dotenv
 from openai_assist import (
@@ -2241,7 +2241,10 @@ def _read_black_live_score(driver: webdriver.Remote) -> str | None:
                     return r.y < window.innerHeight * 0.6 && r.x < window.innerWidth * 0.82;
                 })
                 .map((el) => (el.innerText || '').replace(/\s+/g, ' ').trim())
-                .filter((t) => t.length <= 400 && /(1st|2nd|ht|et)\s*\|/i.test(t))
+                // Require timer AND score: the shortest match would otherwise be
+                // the bare "2nd | 77:04" timer chip without the score.
+                .filter((t) => t.length <= 400
+                    && /(1st|2nd|ht|et)\s*\|\s*\d{1,3}:\d{2}\s+\d{1,2}\s*:\s*\d{1,2}/i.test(t))
                 .sort((a, b) => a.length - b.length)[0] || '';
             """
         ) or ""
@@ -3149,10 +3152,13 @@ def _black_trusted_search_result_open(driver: webdriver.Remote) -> bool:
     def event_identity(value: str | None) -> tuple[str, str, str]:
         try:
             parts = urlsplit(value or "")
+            # Black sometimes re-encodes the event key ("%2C" for ",") and
+            # appends "#cheque=..." while a ticket is open; the hash is
+            # already dropped by urlsplit, the encoding is undone here.
             return (
                 (parts.scheme or "").lower(),
                 (parts.netloc or "").lower(),
-                (parts.path or "").rstrip("/").lower(),
+                unquote(parts.path or "").rstrip("/").lower(),
             )
         except ValueError:
             return ("", "", "")
@@ -3941,7 +3947,10 @@ def _verify_black_betslip_target(
         time.sleep(0.6)
     except Exception:
         pass
-    if _black_match_context_matches(driver, home_team or "", away_team):
+    if (
+        _black_match_context_matches(driver, home_team or "", away_team)
+        or _black_trusted_search_result_open(driver)
+    ):
         print(
             f"[{profile_label}] Black betslip verified by selection/line after scrolling match header back into view."
         )
