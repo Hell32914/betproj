@@ -43,6 +43,32 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
+def _disable_console_quick_edit() -> None:
+    """Windows console QuickEdit freezes the whole bot while text is selected.
+
+    Selecting log text to copy it pauses every write to the console, so the
+    first print() blocks and signals are silently ignored until Esc is pressed.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        kernel32.SetConsoleMode(handle, (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
+    except Exception:
+        pass
+
+
+_disable_console_quick_edit()
+
+
 class _TeeStream:
     """Mirror console output into bot.log (UTF-8) without PowerShell pipes."""
 
