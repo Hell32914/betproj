@@ -394,11 +394,8 @@ async def main():
             if signal is None:
                 no_odds = describe_alert_without_odds(text)
                 if no_odds:
+                    # Alerts without "Odds:" are not traded; log only, no group reply.
                     print(f"[SIGNAL] skipped: alert without Odds ({no_odds}).", flush=True)
-                    await event.reply(
-                        f"Пропускаю сигнал {no_odds}: в нём нет коэффициента (Odds), "
-                        f"не по чему выставить цену."
-                    )
                 return
 
             await event.reply(_format_signal_work_message(signal))
