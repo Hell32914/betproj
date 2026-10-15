@@ -107,6 +107,26 @@ def _detect_market(title_tail: str) -> str:
     return "FULL TIME OVER/UNDER"
 
 
+ALERT_WITHOUT_ODDS_RE = re.compile(
+    r"🔔[^\r\n]*?\b(?P<selection>Over|Under)\s+(?P<line>\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def describe_alert_without_odds(text: str) -> str | None:
+    """Return e.g. "Under 2.5" for an InPlayGuru alert that has no "Odds:" price.
+
+    Such alerts cannot be placed (the odds are the limit price), but they must
+    not be ignored silently either.
+    """
+    if not text or ODDS_RE.search(text):
+        return None
+    match = ALERT_WITHOUT_ODDS_RE.search(text)
+    if not match:
+        return None
+    return f"{match.group('selection').title()} {match.group('line').replace(',', '.')}"
+
+
 def parse_betting_signal(text: str) -> BettingSignal | None:
     """Return a parsed betting signal, or None when a message is not actionable."""
     odds_match = ODDS_RE.search(text)

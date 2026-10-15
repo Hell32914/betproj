@@ -33,7 +33,7 @@ from login import (
     update_betfair_default_stake,
 )
 from openai_assist import _report_status_once as report_openai_status
-from signals import parse_betting_signal
+from signals import describe_alert_without_odds, parse_betting_signal
 
 load_dotenv()
 
@@ -392,6 +392,13 @@ async def main():
 
             signal = parse_betting_signal(text)
             if signal is None:
+                no_odds = describe_alert_without_odds(text)
+                if no_odds:
+                    print(f"[SIGNAL] skipped: alert without Odds ({no_odds}).", flush=True)
+                    await event.reply(
+                        f"Пропускаю сигнал {no_odds}: в нём нет коэффициента (Odds), "
+                        f"не по чему выставить цену."
+                    )
                 return
 
             await event.reply(_format_signal_work_message(signal))
