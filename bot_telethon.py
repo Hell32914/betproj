@@ -265,7 +265,7 @@ async def handle_signal(state: RuntimeState, text: str) -> None:
 
     print(
         f"[SIGNAL] {signal.teams or 'unknown match'} | {signal.market} | "
-        f"{signal.selection_label} | odds {signal.odds} | expiry {signal.expiry}"
+        f"{signal.selection_label} | odds {signal.odds_label} | expiry {signal.expiry}"
         f"{f' | matched £{signal.matched_amount}' if signal.matched_amount is not None else ''}",
         flush=True,
     )
@@ -314,7 +314,7 @@ def _describe_exception(exc: BaseException) -> str:
 def _format_signal_work_message(signal) -> str:
     return (
         f"Asia: Принял в работу: {signal.teams or 'unknown match'} | "
-        f"{signal.selection_label} | odds {signal.odds}"
+        f"{signal.selection_label} | odds {signal.odds_label}"
     )
 
 
@@ -394,7 +394,7 @@ async def main():
             if signal is None:
                 no_odds = describe_alert_without_odds(text)
                 if no_odds:
-                    # Alerts without "Odds:" are not traded; log only, no group reply.
+                    # Only Under alerts are market-priced; others without "Odds:" are skipped.
                     print(f"[SIGNAL] skipped: alert without Odds ({no_odds}).", flush=True)
                 return
 
@@ -420,7 +420,9 @@ async def main():
                 signal_teams = signal.teams or "unknown match"
                 signal_label = signal.selection_label
 
-                max_rounds = 3
+                # Market-priced (Under) alerts lose value every minute: one fast
+                # pass only, no 90-second retry rounds.
+                max_rounds = 1 if signal.market_priced else 3
                 round_pause = 90  # seconds between alternating retry rounds
                 deferred_check_delay = 5 * 60  # final Black status check delay
 
@@ -479,14 +481,19 @@ async def main():
                                     f"gave up on missing line: {exc}",
                                     flush=True,
                                 )
-                                if round_index == 1:
+                                if signal.market_priced:
+                                    await event.reply(
+                                        f"Asia: Under не поставлен — "
+                                        f"{_sanitize_telegram_detail(str(exc), limit=160)}"
+                                    )
+                                elif round_index == 1:
                                     await event.reply(
                                         "Asia: матч открыт, но нужной линии сейчас нет; "
-                                        "проверю ещё 2 раза."
+                                        f"проверю ещё {max_rounds - 1} раза."
                                     )
                                 elif is_last_round:
                                     await event.reply(
-                                        "Asia: Ставка проверена 3 раза, нужная линия так и не появилась на сайте."
+                                        f"Asia: Ставка проверена {max_rounds} раза, нужная линия так и не появилась на сайте."
                                     )
                             except Exception as exc:
                                 black_state = "error"
@@ -582,9 +589,14 @@ async def main():
                                             await event.reply(
                                                 f"Betfair: ставка заблокирована настройкой OpenAI — {selection_error}"
                                             )
+                                        elif signal.market_priced:
+                                            await event.reply(
+                                                f"Betfair: Under не поставлен — "
+                                                f"{_sanitize_telegram_detail(selection_error, limit=160)}"
+                                            )
                                         elif is_last_round:
                                             await event.reply(
-                                                "Betfair: 3 раза проверено, нужная ставка так и не появилась на сайте."
+                                                f"Betfair: {max_rounds} раза проверено, нужная ставка так и не появилась на сайте."
                                             )
                                     else:
                                         betfair_state = "placed"

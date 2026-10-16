@@ -61,6 +61,10 @@ BETFAIR_PASSWORD = (os.getenv("BETFAIR_PASSWORD") or "").strip()
 BETFAIR_LOGIN_URL = "https://www.betfair.com/exchange/plus/"
 BETFAIR_URL_PART = "betfair.com"
 STAKE_PERCENT = Decimal(os.getenv("STAKE_PERCENT", "5"))
+# Alerts without "Odds:" (Under strategy) are priced from the live market:
+# limit = current odds - discount, so a quickly falling price still fills.
+MARKET_PRICE_DISCOUNT = Decimal(os.getenv("MARKET_PRICE_DISCOUNT", "0.10"))
+MARKET_PRICE_MIN_ODDS = Decimal(os.getenv("MARKET_PRICE_MIN_ODDS", "1.50"))
 # Keep both AdsPower windows maximized (Black's narrow layout hides the Orders tab).
 BROWSER_MAXIMIZE = (os.getenv("BROWSER_MAXIMIZE") or "1").strip().lower() in {"1", "true", "yes", "on"}
 EURO_SYMBOL = "\u20ac"
@@ -2206,6 +2210,55 @@ class BlackSelectionMissingError(RuntimeError):
     """Raised when the requested Asian Total Goals selection never shows up on the match page after retries."""
 
 
+def _betfair_round_down_to_tick(price: Decimal) -> Decimal:
+    """Round down to a valid Betfair price increment."""
+    ladder = [
+        (Decimal("2"), Decimal("0.01")),
+        (Decimal("3"), Decimal("0.02")),
+        (Decimal("4"), Decimal("0.05")),
+        (Decimal("6"), Decimal("0.1")),
+        (Decimal("10"), Decimal("0.2")),
+        (Decimal("20"), Decimal("0.5")),
+        (Decimal("30"), Decimal("1")),
+        (Decimal("50"), Decimal("2")),
+        (Decimal("100"), Decimal("5")),
+        (Decimal("1000"), Decimal("10")),
+    ]
+    for upper, step in ladder:
+        if price < upper:
+            return ((price / step).to_integral_value(rounding=ROUND_DOWN) * step).quantize(step)
+    return Decimal("1000")
+
+
+def market_priced_limit(signal, market_odds: Decimal | None, exchange: str) -> Decimal:
+    """Limit price for an alert without "Odds:": live odds minus MARKET_PRICE_DISCOUNT.
+
+    Raises BlackSelectionMissingError when the live price is unreadable or the
+    discounted limit would fall below MARKET_PRICE_MIN_ODDS (not worth betting).
+    """
+    if market_odds is None or market_odds <= 1:
+        raise BlackSelectionMissingError(
+            f"{exchange}: live odds for {getattr(signal, 'selection_label', '?')} not readable; "
+            f"market-priced alert skipped."
+        )
+    limit = market_odds - MARKET_PRICE_DISCOUNT
+    if exchange.lower() == "betfair":
+        limit = _betfair_round_down_to_tick(limit)
+    else:
+        limit = limit.quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+    if limit < MARKET_PRICE_MIN_ODDS:
+        raise BlackSelectionMissingError(
+            f"{exchange}: live odds {market_odds} -> limit {limit} is below the minimum "
+            f"{MARKET_PRICE_MIN_ODDS}; market-priced alert skipped."
+        )
+    print(
+        f"[{exchange}] Market-priced alert: live {market_odds} -> limit {limit} "
+        f"(discount {MARKET_PRICE_DISCOUNT}).",
+        flush=True,
+    )
+    return limit
+
+
 class MatchScoreChangedError(RuntimeError):
     """Raised when the live score differs from the signal score: a goal went in, the alert is stale."""
 
@@ -4082,7 +4135,8 @@ def _select_black_asian_total_goals(
     profile_label: str,
     market_headers: list[str] | None = None,
     prefer_left: bool = False,
-) -> None:
+) -> Decimal | None:
+    """Click the requested Over/Under line; return the clicked price if readable."""
     line_variants = _decimal_variants(line)
     target_headers = market_headers or ["asian total goals"]
     result = driver.execute_script(
@@ -4110,6 +4164,9 @@ def _select_black_asian_total_goals(
         const descendants = (root, selector) => Array.from(root.querySelectorAll(selector)).filter(isVisible);
         const clickElement = (element) => {
             const clickable = element.closest('button,[role="button"]') || element;
+            // Remember the clicked price: market-priced (Under) alerts derive
+            // their limit price from it.
+            window.__betbotClickedOddsText = (element.innerText || element.textContent || '').trim();
             clickable.scrollIntoView({ block: 'center', inline: 'center' });
             for (const name of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
                 const EventCtor = name.startsWith('pointer') ? PointerEvent : MouseEvent;
@@ -4506,8 +4563,20 @@ def _select_black_asian_total_goals(
     )
     if not result or not result.get("ok"):
         raise RuntimeError(f"Could not select {target_headers} {selection} {line}. Details: {result!r}")
+    clicked_odds = None
+    try:
+        clicked_text = driver.execute_script("return window.__betbotClickedOddsText || '';") or ""
+        match = re.search(r"\d+(?:[.,]\d+)?", clicked_text)
+        if match:
+            clicked_odds = Decimal(match.group(0).replace(",", "."))
+    except Exception:
+        clicked_odds = None
     time.sleep(0.8)
-    print(f"[{profile_label}] Selected Black market {result.get('sectionText')}: {selection} {line}.")
+    print(
+        f"[{profile_label}] Selected Black market {result.get('sectionText')}: {selection} {line}"
+        f"{f' @ {clicked_odds}' if clicked_odds else ''}."
+    )
+    return clicked_odds
 
 
 def _set_black_betslip_price_and_place(
@@ -5396,6 +5465,9 @@ def place_black_bet(session: dict, signal) -> dict:
     stake_value = stake_info.get("stake") if stake_info else None
     if not team_name:
         raise RuntimeError("Signal does not contain a first team name for Black search.")
+    # Alerts without "Odds:" (Under strategy) lose value every minute: price
+    # from the live market and skip the human-like pauses.
+    fast = bool(getattr(signal, "market_priced", False))
 
     driver = None
     try:
@@ -5450,7 +5522,8 @@ def place_black_bet(session: dict, signal) -> dict:
                     except Exception:
                         pass
                 print(f"[{profile_label}] Searching Black by normalized team: {search_team}")
-                _human_delay()
+                if not fast:
+                    _human_delay()
                 _open_black_search(driver, profile_label)
                 alternate_names = [
                     name for name in (team_name, opponent_name)
@@ -5497,7 +5570,7 @@ def place_black_bet(session: dict, signal) -> dict:
                 f"[{profile_label}] Required Black match context not reached for {team_name} vs {opponent_name or '?'}; aborting before bet selection."
             )
         _wait_document_ready(driver)
-        time.sleep(2)
+        time.sleep(0.8 if fast else 2)
         # A goal right after the alert makes the signal stale: stop here instead
         # of hunting for the line (and retrying for minutes like a robot).
         ensure_signal_score_unchanged(
@@ -5521,14 +5594,15 @@ def place_black_bet(session: dict, signal) -> dict:
             WebDriverWait(driver, 20).until(
                 lambda browser: any(header in _visible_text_lower(browser) for header in market_headers)
             )
-            _human_delay()
+            if not fast:
+                _human_delay()
             # Deterministically open only the Asian Total Goals block. Low-odds
             # lines (e.g. Over 1.5 at 1.2) are hidden until "Show all lines" is
             # pressed inside that block; Asian Handicap must stay untouched.
             _expand_black_total_goals_market(driver, market_headers, profile_label)
             _ensure_black_betslip_safe_to_use(driver, profile_label)
             try:
-                _select_black_asian_total_goals(
+                clicked_odds = _select_black_asian_total_goals(
                     driver,
                     signal.selection,
                     signal.line,
@@ -5546,7 +5620,7 @@ def place_black_bet(session: dict, signal) -> dict:
                 )
                 time.sleep(1.0)
                 _expand_black_total_goals_market(driver, market_headers, profile_label)
-                _select_black_asian_total_goals(
+                clicked_odds = _select_black_asian_total_goals(
                     driver,
                     signal.selection,
                     signal.line,
@@ -5565,9 +5639,13 @@ def place_black_bet(session: dict, signal) -> dict:
             ensure_signal_score_unchanged(
                 driver, signal, profile_label, "Black", dom_score=ticket_score, use_vision=False
             )
-        _human_delay()
+        if fast:
+            limit_odds = market_priced_limit(signal, clicked_odds, "Black")
+        else:
+            limit_odds = signal.odds
+            _human_delay()
         _set_black_betslip_price_and_place(
-            driver, signal.odds, profile_label, stake=stake_value, signal=signal
+            driver, limit_odds, profile_label, stake=stake_value, signal=signal
         )
         # Just remember the new order id. Order ids are monotonic and only one bet is
         # placed at a time under the bet lock, so the new max id is unambiguously ours.
@@ -5585,7 +5663,7 @@ def place_black_bet(session: dict, signal) -> dict:
             "order_id": new_order_id,
             "teams": getattr(signal, "teams", None) or team_name,
             "selection": getattr(signal, "selection_label", f"{signal.selection} {signal.line}"),
-            "odds": str(signal.odds),
+            "odds": str(limit_odds),
         }
     finally:
         close_driver_bridge(driver)
@@ -7796,7 +7874,9 @@ def _select_betfair_overunder_back(
     if line_value is None:
         raise RuntimeError("Signal has no line value for Betfair Over/Under.")
     line_str = format(Decimal(str(line_value)).normalize(), "f")
-    target_odds = format(Decimal(str(getattr(signal, "odds"))).normalize(), "f")
+    market_priced = bool(getattr(signal, "market_priced", False))
+    # Market-priced (Under) alerts get their target after the live price is read.
+    target_odds = "" if market_priced else format(Decimal(str(getattr(signal, "odds"))).normalize(), "f")
     label_text = f"{selection} {line_str} goals"
     market_texts = _betfair_market_texts(signal, line_str)
     market_label = _signal_market_label(signal)
@@ -8632,13 +8712,19 @@ def _select_betfair_overunder_back(
             f"{line_str} Goals in {market_label}: {info!r}"
         )
     odds_text = info.get("priceText", "")
+    if market_priced:
+        # priceText looks like "1.48\n€3745": the first number is the best Back price.
+        live_match = re.search(r"\d+(?:[.,]\d+)?", odds_text or "")
+        live_odds = Decimal(live_match.group(0).replace(",", ".")) if live_match else None
+        target_odds = format(market_priced_limit(signal, live_odds, "Betfair").normalize(), "f")
     print(
         f"[{profile_label}] Betfair Back selected: {market_label} {selection.title()} {line_str} "
         f"Goals at available odds {odds_text}; target odds {target_odds}"
     )
 
     # 3) Fill in stake and place the bet.
-    _human_delay()
+    if not market_priced:
+        _human_delay()
     stake_str = None
     bet_placed = False
     accepted_odds_text = target_odds

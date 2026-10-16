@@ -8,7 +8,8 @@ import re
 @dataclass(frozen=True)
 class BettingSignal:
     raw_text: str
-    odds: Decimal
+    # None for alerts without "Odds:" (Under strategy): priced from the live market.
+    odds: Decimal | None
     selection: str
     line: Decimal
     market: str
@@ -48,6 +49,15 @@ class BettingSignal:
     def has_exchange_match(self) -> bool:
         return self.matched_amount is not None
 
+    @property
+    def market_priced(self) -> bool:
+        """True when the alert carries no price and the bet uses live odds minus a margin."""
+        return self.odds is None
+
+    @property
+    def odds_label(self) -> str:
+        return "по рынку" if self.odds is None else str(self.odds)
+
 
 ODDS_RE = re.compile(
     r"Odds:\s*(?P<odds>\d+(?:[.,]\d+)?)\s+"
@@ -55,8 +65,10 @@ ODDS_RE = re.compile(
     r"(?P<line>\d+(?:[.,]\d+)?)(?P<title>[^\r\n]*)",
     re.IGNORECASE,
 )
+# Matched against text with Markdown stripped: the alert writes "**Goals**: 0 - **2**".
 TIMER_RE = re.compile(r"Timer:\s*(?P<minute>\d+)'")
-GOALS_RE = re.compile(r"Goals:\s*(?P<home>\d+)\s*-\s*(?P<away>\d+)")
+GOALS_RE = re.compile(r"(?<![A-Za-z ])Goals:\s*(?P<home>\d+)\s*-\s*(?P<away>\d+)")
+TITLE_SCORE_RE = re.compile(r"(?P<home>\d{1,2})\s*:\s*(?P<away>\d{1,2})\s*\**\s*$")
 MATCHED_RE = re.compile(r"Matched\*\*:\s*[£$€]?(?P<amount>\d[\d,]*(?:[.]\d+)?)", re.IGNORECASE)
 RANKING_RE = re.compile(r"\s*\([^)]*\bvs\b[^)]*\)", re.IGNORECASE)
 
@@ -114,11 +126,7 @@ ALERT_WITHOUT_ODDS_RE = re.compile(
 
 
 def describe_alert_without_odds(text: str) -> str | None:
-    """Return e.g. "Under 2.5" for an InPlayGuru alert that has no "Odds:" price.
-
-    Such alerts cannot be placed (the odds are the limit price), but they must
-    not be ignored silently either.
-    """
+    """Return e.g. "Under 2.5" for an InPlayGuru alert that has no "Odds:" price."""
     if not text or ODDS_RE.search(text):
         return None
     match = ALERT_WITHOUT_ODDS_RE.search(text)
@@ -128,10 +136,29 @@ def describe_alert_without_odds(text: str) -> str | None:
 
 
 def parse_betting_signal(text: str) -> BettingSignal | None:
-    """Return a parsed betting signal, or None when a message is not actionable."""
+    """Return a parsed betting signal, or None when a message is not actionable.
+
+    Two formats are accepted:
+    - "🔔 **Odds: 1.76 Over 2.5 SH Goals ...**": the alert price is the limit;
+    - "🔔 **Under 2.5 SH Goals ... 0:2**": no price, odds=None -> market-priced.
+    """
+    plain = re.sub(r"[*_`~]+", "", text or "")
     odds_match = ODDS_RE.search(text)
-    if not odds_match:
-        return None
+    odds_value: Decimal | None = None
+    if odds_match:
+        odds_value = Decimal(odds_match.group("odds").replace(",", "."))
+        selection_text = odds_match.group("selection")
+        line_text = odds_match.group("line")
+        title_tail = odds_match.group("title") or ""
+    else:
+        title_match = ALERT_WITHOUT_ODDS_RE.search(text or "")
+        # Only the Under strategy is priced from the market; an Over alert
+        # without a price is not a known format and is skipped.
+        if not title_match or title_match.group("selection").lower() != "under":
+            return None
+        selection_text = title_match.group("selection")
+        line_text = title_match.group("line")
+        title_tail = (text[title_match.end():].splitlines() or [""])[0]
 
     league_line = None
     teams = None
@@ -151,17 +178,23 @@ def parse_betting_signal(text: str) -> BettingSignal | None:
 
     country, league = _split_country_league(league_line)
 
-    timer_match = TIMER_RE.search(text)
-    goals_match = GOALS_RE.search(text)
+    timer_match = TIMER_RE.search(plain)
+    goals_match = GOALS_RE.search(plain)
     matched_match = MATCHED_RE.search(text)
+    score = f"{goals_match.group('home')}-{goals_match.group('away')}" if goals_match else None
+    if score is None:
+        # The title ends with the score, e.g. "... before 70` 0:2**".
+        title_score = TITLE_SCORE_RE.search(re.sub(r"[*_`~]+", "", title_tail).strip())
+        if title_score:
+            score = f"{int(title_score.group('home'))}-{int(title_score.group('away'))}"
 
-    market = _detect_market(odds_match.group("title") or "")
+    market = _detect_market(title_tail)
 
     return BettingSignal(
         raw_text=text,
-        odds=Decimal(odds_match.group("odds").replace(",", ".")),
-        selection=odds_match.group("selection").title(),
-        line=Decimal(odds_match.group("line").replace(",", ".")),
+        odds=odds_value,
+        selection=selection_text.title(),
+        line=Decimal(line_text.replace(",", ".")),
         market=market,
         expiry="30 min",
         league=league,
@@ -169,6 +202,6 @@ def parse_betting_signal(text: str) -> BettingSignal | None:
         league_line=league_line,
         teams=teams,
         timer_minute=int(timer_match.group("minute")) if timer_match else None,
-        score=f"{goals_match.group('home')}-{goals_match.group('away')}" if goals_match else None,
+        score=score,
         matched_amount=Decimal(matched_match.group("amount").replace(",", "")) if matched_match else None,
     )
