@@ -2379,7 +2379,8 @@ def _read_black_orders_max_id(driver: webdriver.Remote, profile_label: str) -> i
                     && lower.includes('status')
                     && (lower.includes('stake') || lower.includes('profit/loss') || lower.includes('price'));
             };
-            const statusRegex = /\b(Partially Matched|Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced)\b/i;
+            // Word boundaries are double-escaped: this JS lives in a normal (non-raw) Python string.
+            const statusRegex = /\\b(Partially Matched|Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced|Full Void|Void)\\b/i;
 
             const containers = Array.from(document.querySelectorAll('table,div,section,main,article'))
                 .filter(isVisible)
@@ -2739,12 +2740,40 @@ def _read_black_order_by_id(
             };
             const textOf = (element) => (element.innerText || element.textContent || '').trim();
             const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+            // Exact read from the Orders table: header cells name the columns
+            // (order id, placed at, market, event, selection, status, price, stake, ...).
+            const table = document.querySelector('#ordersTable table');
+            if (table) {
+                const headers = Array.from(table.querySelectorAll('thead th'))
+                    .map((th) => normalize(textOf(th)).toLowerCase());
+                const col = (name) => headers.indexOf(name);
+                for (const tr of Array.from(table.querySelectorAll('tbody tr'))) {
+                    const cells = Array.from(tr.children);
+                    if (!cells.length || normalize(textOf(cells[0])) !== targetId) continue;
+                    const cellText = (name) => {
+                        const index = col(name);
+                        return index >= 0 && cells[index] ? normalize(textOf(cells[index])) : '';
+                    };
+                    const status = cellText('status');
+                    if (status) {
+                        return {
+                            ok: true,
+                            status,
+                            stake: cellText('stake') || '?',
+                            price: cellText('price'),
+                            selection: cellText('selection'),
+                            rowText: normalize(textOf(tr)).slice(0, 500),
+                        };
+                    }
+                }
+            }
             const tables = Array.from(document.querySelectorAll('table,div,section,main'))
                 .filter(isVisible)
                 .map((element) => ({ element, rect: element.getBoundingClientRect(), text: normalize(textOf(element)).toLowerCase() }))
                 .filter((item) => item.text.includes('selection') && item.text.includes('status') && item.text.includes('stake'))
                 .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-            const statusRegex = /\b(Partially Matched|Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced)\b/i;
+            // Word boundaries are double-escaped: this JS lives in a normal (non-raw) Python string.
+            const statusRegex = /\\b(Partially Matched|Open|Active|Failed|Reconciled|Cancelled|Canceled|Rejected|Pending|Processing|Accepted|Matched|Confirmed|Done|Success|Completed|Settled|Won|Lost|Unplaced|Full Void|Void)\\b/i;
             const roots = tables.length
                 ? tables.slice(0, 3).map((item) => item.element)
                 : [document.querySelector('main') || document.body].filter(Boolean);
@@ -2818,6 +2847,7 @@ def _read_black_order_by_id(
         }
 
     raw_status = row_data.get("status") or "Unknown"
+    raw_status = raw_status[:1].upper() + raw_status[1:]
     stake = row_data.get("stake") or "?"
     normalized_status = _normalize_black_order_status(raw_status)
     print(
