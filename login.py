@@ -7217,7 +7217,42 @@ def _betfair_search_and_open(driver: webdriver.Remote, signal, profile_label: st
 
         print(f"[{profile_label}] Betfair search: typing query '{search_query}'")
         _human_delay()
-        search_el.send_keys(search_query)
+        try:
+            search_el.send_keys(search_query)
+        except StaleElementReferenceException:
+            # Betfair re-rendered the header (e.g. after a previous query or a
+            # session refresh); look the box up again instead of crashing.
+            fresh_el = None
+            try:
+                fresh_el = _find_betfair_search_input(driver)
+            except Exception:
+                fresh_el = None
+            if fresh_el is None:
+                print(
+                    f"[{profile_label}] Betfair search box went stale; opening search results URL "
+                    f"for '{search_query}'.",
+                    flush=True,
+                )
+                _navigate_betfair_search_results(driver, search_query)
+                followed = _follow_betfair_search_results(
+                    driver, team_norms, opponent_norms, profile_label, signal=signal
+                )
+                if followed and _betfair_page_matches_target_event(driver, team_norms, opponent_norms):
+                    return {
+                        "profile_label": profile_label,
+                        "team": team_name,
+                        "opponent": opponent_name,
+                        "opened": True,
+                        "label": followed,
+                        "url": driver.current_url,
+                    }
+                continue
+            search_el = fresh_el
+            try:
+                search_el.clear()
+            except Exception:
+                pass
+            search_el.send_keys(search_query)
 
         end = time.time() + 8
         clicked_label = None
