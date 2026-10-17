@@ -94,6 +94,17 @@ class _TeeStream:
 
 BOT_LOG_PATH = os.getenv("BOT_LOG_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log"))
 if BOT_LOG_PATH:
+    # An old bot.log written by PowerShell Tee-Object is UTF-16; appending UTF-8
+    # to it produces unreadable text. Move it aside and start a clean file.
+    try:
+        with open(BOT_LOG_PATH, "rb") as _probe:
+            if _probe.read(2) in (b"\xff\xfe", b"\xfe\xff"):
+                _probe.close()
+                os.replace(BOT_LOG_PATH, os.path.splitext(BOT_LOG_PATH)[0] + ".old.log")
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
     _log_file = open(BOT_LOG_PATH, "a", encoding="utf-8", errors="replace")
     _log_file.write(f"\n===== bot started {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
     sys.stdout = _TeeStream(sys.stdout, _log_file)
