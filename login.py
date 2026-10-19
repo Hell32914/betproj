@@ -63,7 +63,7 @@ BETFAIR_URL_PART = "betfair.com"
 STAKE_PERCENT = Decimal(os.getenv("STAKE_PERCENT", "5"))
 # Alerts without "Odds:" (Under strategy) are priced from the live market:
 # limit = current odds - discount, so a quickly falling price still fills.
-MARKET_PRICE_DISCOUNT = Decimal(os.getenv("MARKET_PRICE_DISCOUNT", "0.10"))
+MARKET_PRICE_DISCOUNT = Decimal(os.getenv("MARKET_PRICE_DISCOUNT", "0.20"))
 MARKET_PRICE_MIN_ODDS = Decimal(os.getenv("MARKET_PRICE_MIN_ODDS", "1.50"))
 # Keep both AdsPower windows maximized (Black's narrow layout hides the Orders tab).
 BROWSER_MAXIMIZE = (os.getenv("BROWSER_MAXIMIZE") or "1").strip().lower() in {"1", "true", "yes", "on"}
