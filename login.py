@@ -65,6 +65,8 @@ STAKE_PERCENT = Decimal(os.getenv("STAKE_PERCENT", "5"))
 # limit = current odds - discount, so a quickly falling price still fills.
 MARKET_PRICE_DISCOUNT = Decimal(os.getenv("MARKET_PRICE_DISCOUNT", "0.20"))
 MARKET_PRICE_MIN_ODDS = Decimal(os.getenv("MARKET_PRICE_MIN_ODDS", "1.50"))
+# Hard ceiling for any single stake: protects against a misread balance.
+MAX_STAKE_EUR = Decimal(os.getenv("MAX_STAKE_EUR", "5"))
 # Keep both AdsPower windows maximized (Black's narrow layout hides the Orders tab).
 BROWSER_MAXIMIZE = (os.getenv("BROWSER_MAXIMIZE") or "1").strip().lower() in {"1", "true", "yes", "on"}
 EURO_SYMBOL = "\u20ac"
@@ -1088,7 +1090,14 @@ def _human_delay(min_seconds: float = 1.0, max_seconds: float = 3.0) -> None:
 
 
 def _calculate_stake_from_balance(balance: Decimal) -> Decimal:
-    return balance * STAKE_PERCENT / Decimal("100")
+    stake = balance * STAKE_PERCENT / Decimal("100")
+    if stake > MAX_STAKE_EUR:
+        print(
+            f"Stake {stake} from balance {balance} exceeds MAX_STAKE_EUR={MAX_STAKE_EUR}; capping.",
+            flush=True,
+        )
+        stake = MAX_STAKE_EUR
+    return stake
 
 
 def _open_black_account_menu(driver: webdriver.Remote, profile_label: str) -> None:
@@ -2208,6 +2217,40 @@ def _normalize_black_order_status(raw_status: str) -> str:
 
 class BlackSelectionMissingError(RuntimeError):
     """Raised when the requested Asian Total Goals selection never shows up on the match page after retries."""
+
+
+def _guard_stake_amount(
+    stake_amount: Decimal,
+    cached_stake,
+    profile_label: str,
+    exchange: str,
+    balance=None,
+) -> Decimal:
+    """Never let a misread balance blow up the stake.
+
+    Falls back to the cached (startup / daily) stake when the fresh one is more
+    than 3x it, and never exceeds MAX_STAKE_EUR.
+    """
+    cached = None
+    try:
+        cached = Decimal(str(cached_stake)) if cached_stake not in (None, "") else None
+    except Exception:
+        cached = None
+    guarded = stake_amount
+    if cached and cached > 0 and stake_amount > cached * 3:
+        print(
+            f"[{profile_label}] {exchange}: stake {stake_amount} from balance {balance} is >3x the "
+            f"cached stake {cached}; balance looks misread, using {cached}.",
+            flush=True,
+        )
+        guarded = cached
+    if guarded > MAX_STAKE_EUR:
+        print(
+            f"[{profile_label}] {exchange}: stake {guarded} capped at MAX_STAKE_EUR={MAX_STAKE_EUR}.",
+            flush=True,
+        )
+        guarded = MAX_STAKE_EUR
+    return guarded
 
 
 def _betfair_round_down_to_tick(price: Decimal) -> Decimal:
@@ -8797,6 +8840,7 @@ def _select_betfair_overunder_back(
     try:
         balance = _read_betfair_balance(driver, profile_label)
         stake_amount = _calculate_stake_from_balance(balance)
+        stake_amount = _guard_stake_amount(stake_amount, fallback_stake, profile_label, "Betfair", balance)
         stake_str = _format_stake_amount(stake_amount)
         print(f"[{profile_label}] Betfair stake: {stake_str} (balance {balance})")
     except Exception as exc:
@@ -9537,12 +9581,9 @@ def _read_betfair_balance(driver: webdriver.Remote, profile_label: str) -> Decim
             const mainMatch = collapsed.match(/\bmain\b\s*[€£$]\s*\d[\d.,]*/i);
             if (mainMatch) return mainMatch[0];
         }
-        for (const item of topNodes) {
-            const collapsed = item.text.replace(/\s+/g, ' ');
-            if (/bonus/i.test(collapsed) && !/\bmain\b/i.test(collapsed)) continue;
-            const moneyMatch = collapsed.match(/[€£$]\s*\d[\d.,]*/);
-            if (moneyMatch) return moneyMatch[0];
-        }
+        // No generic "first € amount near the top" fallback: when the session
+        // has expired that picks up matched volume (e.g. "€5,583") and turned
+        // a 1 EUR stake into 279 EUR.
         return null;
         """
     )
