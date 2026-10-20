@@ -6174,13 +6174,38 @@ def _login_betinasia_portal(driver: webdriver.Remote, profile_label: str) -> Non
 
     if _has_visible_password_input(driver):
         _fill_login_form(driver, BETINASIA_EMAIL, BETINASIA_PASSWORD, profile_label, "BetInAsia")
-        time.sleep(2)
+
+        def _page_snippet() -> str:
+            try:
+                text = _visible_page_text(driver)
+            except Exception:
+                text = ""
+            return " | ".join(line.strip() for line in (text or "").splitlines() if line.strip())[:400]
+
+        # Let the login request finish before navigating: leaving after a fixed
+        # 2s aborted a slow login (e.g. right after a server restart).
+        try:
+            WebDriverWait(driver, 25).until(
+                lambda browser: "account/login" not in browser.current_url.lower()
+                or not _has_visible_password_input(browser)
+            )
+        except TimeoutException:
+            raise RuntimeError(
+                f"BetInAsia login did not complete within 25s (still on {driver.current_url}). "
+                f"Page says: {_page_snippet()}"
+            )
         driver.get(PORTAL_URL)
         _wait_document_ready(driver)
-        WebDriverWait(driver, 30).until(
-            lambda browser: "portal.betinasia.com/dashboard/products" in browser.current_url.lower()
-            or "products" in _visible_text_lower(browser)
-        )
+        try:
+            WebDriverWait(driver, 30).until(
+                lambda browser: "portal.betinasia.com/dashboard/products" in browser.current_url.lower()
+                or "products" in _visible_text_lower(browser)
+            )
+        except TimeoutException:
+            raise RuntimeError(
+                f"BetInAsia products page did not open after login (url {driver.current_url}). "
+                f"Page says: {_page_snippet()}"
+            )
         if "account/login" in driver.current_url.lower() and _has_visible_password_input(driver):
             raise RuntimeError("BetInAsia login did not complete; still on login page after submitting credentials.")
         print(f"[{profile_label}] BetInAsia portal login complete: {driver.current_url}")
