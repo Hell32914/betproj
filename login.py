@@ -6214,16 +6214,24 @@ def _login_betinasia_portal(driver: webdriver.Remote, profile_label: str) -> Non
 
         # Let the login request finish before navigating: leaving after a fixed
         # 2s aborted a slow login (e.g. right after a server restart).
+        # Wait for the URL itself to leave the login page: the password field
+        # hides for a moment during submit, which is not a finished login.
+        login_error_markers = (
+            "invalid", "incorrect", "wrong", "locked", "captcha", "verification",
+            "too many", "not recognised", "not recognized", "failed",
+        )
         try:
-            WebDriverWait(driver, 25).until(
+            WebDriverWait(driver, 30).until(
                 lambda browser: "account/login" not in browser.current_url.lower()
-                or not _has_visible_password_input(browser)
+                or any(marker in _visible_text_lower(browser) for marker in login_error_markers)
             )
         except TimeoutException:
             raise RuntimeError(
-                f"BetInAsia login did not complete within 25s (still on {driver.current_url}). "
+                f"BetInAsia login did not complete within 30s (still on {driver.current_url}). "
                 f"Page says: {_page_snippet()}"
             )
+        if "account/login" in driver.current_url.lower():
+            raise RuntimeError(f"BetInAsia rejected the login. Page says: {_page_snippet()}")
         driver.get(PORTAL_URL)
         _wait_document_ready(driver)
         try:
