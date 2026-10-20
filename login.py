@@ -5975,9 +5975,39 @@ def _has_visible_password_input(driver: webdriver.Remote) -> bool:
     ))
 
 
+def _black_is_demo_mode(driver: webdriver.Remote) -> bool:
+    """Black serves /sportsbook to logged-out visitors as a demo.
+
+    Signs: the yellow "You are currently using the demo version" bar or a
+    visible "Log In" button in the header.
+    """
+    try:
+        return bool(driver.execute_script(
+            """
+            const text = (document.body?.innerText || '').toLowerCase();
+            if (text.includes('demo version')) return true;
+            const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const cs = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+            };
+            return Array.from(document.querySelectorAll('button,a,[role="button"]'))
+                .filter(isVisible)
+                .some((el) => {
+                    const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                    return (t === 'log in' || t === 'login') && el.getBoundingClientRect().top < 160;
+                });
+            """
+        ))
+    except Exception:
+        return False
+
+
 def _black_appears_logged_in(driver: webdriver.Remote) -> bool:
     current_url = driver.current_url.lower()
     if BLACK_URL_PART not in current_url:
+        return False
+    if "/login" in current_url or _black_is_demo_mode(driver):
         return False
     if any(path in current_url for path in ("/sportsbook", "/trade", "/orders")):
         return True
@@ -6231,6 +6261,19 @@ def _login_black(driver: webdriver.Remote, profile_label: str) -> None:
         driver.get(BLACK_URL)
     _wait_document_ready(driver)
     time.sleep(2)
+
+    if not _has_visible_password_input(driver) and _black_is_demo_mode(driver):
+        # Logged-out Black shows a demo sportsbook without a password field;
+        # open the real login page instead of treating the demo as a session.
+        print(f"[{profile_label}] Black is in demo mode; opening the Black login page.", flush=True)
+        driver.get(f"{BLACK_URL}/login?next=%2Fsportsbook")
+        _wait_document_ready(driver)
+        try:
+            WebDriverWait(driver, 15).until(lambda browser: _has_visible_password_input(browser))
+        except TimeoutException:
+            raise RuntimeError(
+                f"Black login form did not appear (url {driver.current_url}); still in demo mode."
+            )
 
     if _black_appears_logged_in(driver) or not _has_visible_password_input(driver):
         print(f"[{profile_label}] Black already appears to be logged in: {driver.current_url}")
