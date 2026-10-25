@@ -88,6 +88,10 @@ TEAM_SEARCH_ALIASES = {
     "dc utd": ["dc united"],
     "new york red bulls": ["new york rb"],
     "carlos manucci": ["carlos mannucci"],
+    # Serbian clubs: InPlayGuru uses local names, Black uses English/long ones.
+    "ofk beograd": ["omladinski fk beograd", "omladinski"],
+    "crvena zvezda": ["red star belgrade", "red star"],
+    "partizan belgrade": ["partizan beograd", "partizan"],
 }
 
 
@@ -5550,22 +5554,41 @@ def place_black_bet(session: dict, signal) -> dict:
         # row must have a strictly greater id, which prevents picking a leftover top row
         # for the same team while the freshly placed row is still rendering.
         pre_bet_max_order_id = _snapshot_black_max_order_id(driver, profile_label)
+        # The Orders page can render a stale list; never go below the last id
+        # this bot captured, or the previous bet could be mistaken for the new one.
+        last_known_order_id = session.get("last_order_id")
+        if last_known_order_id and (pre_bet_max_order_id is None or pre_bet_max_order_id < last_known_order_id):
+            print(
+                f"[{profile_label}] Orders snapshot {pre_bet_max_order_id} is behind the last captured "
+                f"order {last_known_order_id}; using {last_known_order_id}.",
+                flush=True,
+            )
+            pre_bet_max_order_id = last_known_order_id
         current_url = (driver.current_url or "").lower()
         if "/sportsbook" not in current_url:
             driver.get(BLACK_SPORTSBOOK_URL)
             _wait_document_ready(driver)
             time.sleep(2)
-        if not stake_value:
-            try:
-                balance = _read_black_balance(driver, profile_label)
-                stake_value = _format_stake_amount(_calculate_stake_from_balance(balance))
-                session["stake"] = {"balance": str(balance), "stake": stake_value, "percent": str(STAKE_PERCENT)}
+        # Recompute 5% from the live balance before every bet: the cached stake
+        # is only refreshed at startup and 04:00, so a deposit or a run of
+        # results during the day left the stake stale until a restart.
+        try:
+            balance = _read_black_balance(driver, profile_label)
+            fresh_stake = _format_stake_amount(_calculate_stake_from_balance(balance))
+            if fresh_stake != stake_value:
                 print(
-                    f"[{profile_label}] Using calculated Black stake EUR {stake_value} "
-                    f"from balance EUR {balance} because no default stake was cached."
+                    f"[{profile_label}] Black stake updated from live balance EUR {balance}: "
+                    f"{stake_value or '-'} -> {fresh_stake}.",
+                    flush=True,
                 )
-            except Exception as exc:
-                print(f"[{profile_label}] Could not calculate fallback Black stake: {exc}", flush=True)
+            stake_value = fresh_stake
+            session["stake"] = {"balance": str(balance), "stake": stake_value, "percent": str(STAKE_PERCENT)}
+        except Exception as exc:
+            print(
+                f"[{profile_label}] Could not read Black balance before bet ({exc}); "
+                f"using cached stake {stake_value or '-'}.",
+                flush=True,
+            )
         try:
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
@@ -5725,6 +5748,8 @@ def place_black_bet(session: dict, signal) -> dict:
         # The actual status/price are intentionally NOT read here — the Telegram layer
         # waits ~5 minutes and then looks up this exact order id.
         new_order_id = _capture_new_black_order_id(driver, profile_label, pre_bet_max_order_id)
+        if new_order_id:
+            session["last_order_id"] = new_order_id
         return {
             "profile_label": profile_label,
             "status": "submitted" if new_order_id else "pending",
