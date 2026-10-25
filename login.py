@@ -2394,6 +2394,17 @@ def ensure_signal_score_unchanged(
     if not live_score:
         print(f"[{profile_label}] {exchange} live score not readable; signal score {signal_score}.", flush=True)
         return None
+    live_home, live_away = (int(part) for part in live_score.split("-"))
+    signal_home, signal_away = (int(part) for part in signal_score.split("-"))
+    if live_home < signal_home or live_away < signal_away:
+        # Fewer goals than the alert: a VAR-cancelled goal or a misread (half-time
+        # score, stale ticket). Not a goal after the signal, so the bet stays valid.
+        print(
+            f"[{profile_label}] {exchange} live score {live_score} ({source}) is lower than signal "
+            f"{signal_score}; not treated as a new goal.",
+            flush=True,
+        )
+        return live_score
     if live_score != signal_score:
         print(
             f"[{profile_label}] {exchange} score changed: signal {signal_score}, live {live_score} ({source}).",
@@ -5729,7 +5740,36 @@ def place_black_bet(session: dict, signal) -> dict:
                 f"{market_label} {signal.selection} {signal.line} not available for "
                 f"{team_name} vs {opponent_name or '?'}: {exc}"
             ) from exc
-        _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
+        try:
+            _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
+        except RuntimeError as verify_exc:
+            # The price can re-render under the cursor (2.5 -> 2.355) and swallow the
+            # click, so no ticket opens at all. Click the line once more in that case;
+            # an open ticket that failed verification is a real mismatch and not retried.
+            page_lower = _visible_text_lower(driver)
+            if "stake" in page_lower and "place" in page_lower:
+                raise
+            print(
+                f"[{profile_label}] Black ticket did not open after the click ({str(verify_exc)[:120]}); "
+                f"clicking the line again.",
+                flush=True,
+            )
+            time.sleep(0.8)
+            try:
+                clicked_odds = _select_black_asian_total_goals(
+                    driver,
+                    signal.selection,
+                    signal.line,
+                    profile_label,
+                    market_headers=market_headers,
+                    prefer_left=prefer_left,
+                )
+            except Exception as exc:
+                raise BlackSelectionMissingError(
+                    f"{market_label} {signal.selection} {signal.line} not available for "
+                    f"{team_name} vs {opponent_name or '?'}: {exc}"
+                ) from exc
+            _verify_black_betslip_target(driver, signal.selection, signal.line, team_name, opponent_name, profile_label)
         ticket_score = _read_black_ticket_score(driver)
         if ticket_score:
             ensure_signal_score_unchanged(

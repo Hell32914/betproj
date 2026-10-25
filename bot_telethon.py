@@ -390,15 +390,23 @@ async def main():
     async with TelegramClient("betproj_session", API_ID, API_HASH) as client:
         print(f"Listening to group {GROUP_ID} ...")
 
+        handled_message_ids: set[int] = set()
+
         @client.on(events.NewMessage(chats=GROUP_ID))
         async def on_message(event):
+            # The same message can arrive from the live update stream and from the
+            # missed-update poll below; process it once. Checked before any await.
+            if event.id in handled_message_ids:
+                return
+            handled_message_ids.add(event.id)
             sender = await event.get_sender()
             if sender:
                 name = getattr(sender, "username", None) or getattr(sender, "first_name", None) or str(sender.id)
                 name = f"@{name}" if getattr(sender, "username", None) else name
             else:
                 name = "unknown"
-            text = event.message.text or "<non-text message>"
+            # event is a NewMessage.Event or (from the poll) a Message; both expose .text.
+            text = event.text or "<non-text message>"
             print(f"[MSG] {name}: {text}", flush=True)
 
             signal = parse_betting_signal(text)
@@ -684,6 +692,55 @@ async def main():
         adspower_task.add_done_callback(report_adspower_task_result)
         asyncio.create_task(refresh_stakes_daily(state))
         asyncio.create_task(keep_sessions_authorized(state))
+
+        async def poll_missed_messages() -> None:
+            """Safety net for a silent update stream.
+
+            After "Server closed the connection / WinError 5" reconnects Telethon can
+            stay connected but stop delivering updates, so signals are lost until a
+            restart. Read the last group messages every minute and hand any message
+            the live handler never saw to it.
+            """
+            last_seen_id = None
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    if not client.is_connected():
+                        continue
+                    messages = await client.get_messages(GROUP_ID, limit=10)
+                except Exception as exc:
+                    print(f"[watchdog] Telegram poll failed: {exc!r}", flush=True)
+                    continue
+                if not messages:
+                    continue
+                if last_seen_id is None:
+                    # First poll: only set the baseline, never replay old history.
+                    last_seen_id = max(message.id for message in messages)
+                    handled_message_ids.update(message.id for message in messages)
+                    continue
+                for message in sorted(messages, key=lambda item: item.id):
+                    if message.id <= last_seen_id or message.id in handled_message_ids:
+                        continue
+                    if message.out:
+                        # The bot's own replies in the group are not signals.
+                        handled_message_ids.add(message.id)
+                        continue
+                    age = datetime.now(message.date.tzinfo) - message.date
+                    if age > timedelta(minutes=10):
+                        handled_message_ids.add(message.id)
+                        print(
+                            f"[watchdog] Missed Telegram message {message.id} is {age} old; too late to bet, skipped.",
+                            flush=True,
+                        )
+                        continue
+                    print(
+                        f"[watchdog] Telegram update for message {message.id} was not delivered; processing it now.",
+                        flush=True,
+                    )
+                    asyncio.create_task(on_message(message))
+                last_seen_id = max(last_seen_id, max(message.id for message in messages))
+
+        asyncio.create_task(poll_missed_messages())
 
         # Telethon can crash on TypeNotFoundError when Telegram introduces a new TL
         # object the installed Telethon doesn't know yet (the stored difference contains
