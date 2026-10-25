@@ -10,3 +10,7 @@ __pycache__/
 
 # Runtime logs
 *.log
+
+*.session
+*.session-journal
+*.session.old
