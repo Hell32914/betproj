@@ -664,6 +664,9 @@ def _team_search_queries(team_name: str | None) -> list[str]:
     add(normalized)
     for alias in TEAM_SEARCH_ALIASES.get(normalized, []):
         add(alias)
+    # InPlayGuru abbreviates "United" ("Boston Utd"); Black search only knows the full word.
+    if "utd" in raw_parts:
+        add(" ".join("united" if part == "utd" else part for part in raw_parts))
     add(team_name)
 
     if team_name:
@@ -5746,8 +5749,9 @@ def place_black_bet(session: dict, signal) -> dict:
             # The price can re-render under the cursor (2.5 -> 2.355) and swallow the
             # click, so no ticket opens at all. Click the line once more in that case;
             # an open ticket that failed verification is a real mismatch and not retried.
+            # "stake"/"place" are not usable markers: menus and order history contain them.
             page_lower = _visible_text_lower(driver)
-            if "stake" in page_lower and "place" in page_lower:
+            if "betslip is empty" not in page_lower:
                 raise
             print(
                 f"[{profile_label}] Black ticket did not open after the click ({str(verify_exc)[:120]}); "
