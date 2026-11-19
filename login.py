@@ -3515,15 +3515,45 @@ def _find_black_live_match_candidate(
                 if (rect.y < 45) score -= 80;
                 return { score, teamHits, opponentHits, exactTeam, exactOpponent, hasVs, normalizedText };
             };
+            const signalScore = arguments[2] || '';
+            const signalMinute = Number(arguments[3] || 0);
             const rowMatchesTeams = (metrics) => {
-                const hasTeam = metrics.exactTeam
+                const teamStrong = metrics.exactTeam
                     || metrics.teamHits >= Math.max(1, Math.min(teamWords.length || 1, 2));
-                if (!hasTeam) return false;
-                if (!opponentWords.length && !opponentVariants.length) return true;
-                // Never accept a same-home-team fixture against another opponent.
-                // The previous team-only fallback opened Houston v Austin for a
-                // Houston v DC United signal.
-                return metrics.exactOpponent || metrics.opponentHits >= 1;
+                const teamAny = metrics.exactTeam || metrics.teamHits >= 1;
+                if (!opponentWords.length && !opponentVariants.length) return teamStrong;
+                const opponentStrong = metrics.exactOpponent
+                    || metrics.opponentHits >= Math.max(1, Math.min(opponentWords.length || 1, 2));
+                const opponentAny = metrics.exactOpponent || metrics.opponentHits >= 1;
+                // Never accept a same-home-team fixture against another opponent
+                // (Houston v Austin for a Houston v DC United signal): one side must
+                // match fully and the other at least partly. Symmetric, because the
+                // retry searches by the opponent and Black may spell the home side
+                // differently ("Boston United" for "Boston Utd").
+                return (teamStrong && opponentAny) || (opponentStrong && teamAny);
+            };
+            // Black search rows end with the live score on two lines ("74'" ... "0" "1").
+            const rowLiveScore = (text) => {
+                const numbers = text.split('\\n').map((line) => line.trim()).filter((line) => /^\\d{1,2}$/.test(line));
+                if (numbers.length < 2) return null;
+                return `${Number(numbers[numbers.length - 2])}-${Number(numbers[numbers.length - 1])}`;
+            };
+            const rowMinute = (text) => {
+                const match = text.match(/(?:^|\\s)(\\d{1,3})['’]/);
+                return match ? Number(match[1]) : null;
+            };
+            // Fallback when Black names a team completely differently ("Omladinski FK
+            // Beograd" for "OFK Beograd"): a live row that names one of the teams and
+            // shows the signal's score at a plausible minute.
+            const rowMatchesLiveSignal = (metrics, text) => {
+                if (!signalScore) return false;
+                const anyTeam = metrics.exactTeam || metrics.teamHits >= 1
+                    || metrics.exactOpponent || metrics.opponentHits >= 1;
+                if (!anyTeam) return false;
+                const minute = rowMinute(text);
+                if (minute === null) return false;
+                if (signalMinute && (minute < signalMinute - 3 || minute > signalMinute + 25)) return false;
+                return rowLiveScore(text) === signalScore;
             };
 
             const rootCandidates = Array.from(document.querySelectorAll('aside,section,div,main'))
@@ -3540,6 +3570,7 @@ def _find_black_live_match_candidate(
 
             const seen = new Set();
             const candidates = [];
+            const liveSignalRows = [];
             const elements = Array.from(root.querySelectorAll('li,a,button,[role="button"],[role="option"],[role="listitem"],article,div'));
             for (const element of elements) {
                 if (!isVisible(element)) continue;
@@ -3551,11 +3582,25 @@ def _find_black_live_match_candidate(
                 if (!text || text.length < 2 || text.length > 500) continue;
                 if (rect.width < 45 || rect.height < 12 || rect.height > Math.min(340, window.innerHeight * 0.7)) continue;
                 const metrics = scoreFor(text, rect);
-                if (!rowMatchesTeams(metrics)) continue;
                 if (metrics.score < 45) continue;
-                candidates.push({ row, rect, text, metrics, area: rect.width * rect.height });
+                if (rowMatchesTeams(metrics)) {
+                    candidates.push({ row, rect, text, metrics, area: rect.width * rect.height });
+                } else if (rowMatchesLiveSignal(metrics, text)) {
+                    liveSignalRows.push({ row, rect, text, metrics, area: rect.width * rect.height });
+                }
             }
             candidates.sort((a, b) => b.metrics.score - a.metrics.score || a.area - b.area || a.rect.y - b.rect.y);
+            let reasonOverride = null;
+            if (!candidates.length && liveSignalRows.length) {
+                // Accept only one fixture: every qualifying row must be the smallest
+                // row itself or a container around it.
+                liveSignalRows.sort((a, b) => a.area - b.area);
+                const smallest = liveSignalRows[0];
+                if (liveSignalRows.every((item) => item.text.includes(smallest.text))) {
+                    candidates.push(smallest);
+                    reasonOverride = 'live-score-match';
+                }
+            }
             const pick = candidates[0] || null;
             const clickTarget = pick ? (
                 (pick.row.matches?.('a[href*="/sportsbook/football/"]') ? pick.row : null)
@@ -3567,7 +3612,7 @@ def _find_black_live_match_candidate(
             return {
                 ok: !!pick,
                 candidate: clickTarget,
-                reason: pick ? 'candidate-found' : (noResults ? 'no-results' : 'no-candidate'),
+                reason: pick ? (reasonOverride || 'candidate-found') : (noResults ? 'no-results' : 'no-candidate'),
                 noResults,
                 rootText: rootText.split('\\n').map((line) => line.trim()).filter(Boolean).slice(0, 12).join(' | ').slice(0, 700),
                 candidates: candidates.slice(0, 8).map((item) => ({
@@ -3586,6 +3631,8 @@ def _find_black_live_match_candidate(
             """,
             team_variants,
             opponent_variants,
+            _normalize_score(getattr(signal, "score", None)) or "",
+            getattr(signal, "timer_minute", None) or 0,
         ) or {}
         last_state = dict(state)
         candidate = last_state.pop("candidate", None)
@@ -3599,6 +3646,12 @@ def _find_black_live_match_candidate(
             f"Search state: {last_state!r}"
         ) from exc
 
+    if last_state.get("reason") == "live-score-match":
+        print(
+            f"[{profile_label}] Black search row names only one team; accepted by live score "
+            f"{getattr(signal, 'score', None)} and minute: {str((last_state.get('candidates') or [{}])[0].get('text', ''))[:120]!r}",
+            flush=True,
+        )
     candidates_meta = last_state.get("candidates") or []
     if signal is not None and candidates_meta:
         picked_index = assist_pick_match(
@@ -3710,6 +3763,13 @@ def _open_black_live_match(
                 signal=signal,
                 profile_label=profile_label,
             )
+        except RuntimeError:
+            # No matching row after the 18s wait. Trying the other click methods
+            # would only repeat the same wait three more times (~1 minute of
+            # "standing" on the page), so go straight to the fallbacks below.
+            print(f"[{profile_label}] No Black search row matched {team_name} vs {opponent_name or '?'}.", flush=True)
+            break
+        try:
             before_url = driver.current_url
             attempt(candidate)
             open_reason = WebDriverWait(driver, 10).until(lambda browser: (
