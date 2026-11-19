@@ -618,7 +618,13 @@ def _normalize_team_text(value: str | None) -> str:
     return " ".join(trimmed or parts)
 
 
-def _team_search_queries(team_name: str | None) -> list[str]:
+def _team_search_queries(team_name: str | None, include_single_word: bool = False) -> list[str]:
+    """Name variants for searching and matching a team.
+
+    include_single_word adds one distinctive word as a last search query; it is
+    only for typing into a search box, never for matching rows (a lone "boston"
+    would match Boston River).
+    """
     queries: list[str] = []
     seen: set[str] = set()
 
@@ -694,6 +700,19 @@ def _team_search_queries(team_name: str | None) -> list[str]:
         add(" ".join(normalized_core_parts[:2]))
     if len(raw_parts) >= 2:
         add(" ".join(raw_parts[:2]))
+    # Last resort: the most distinctive single word ("Aliaga Futbol AS" -> "aliaga",
+    # "Aguilas de la U" -> "aguilas"). Generic club words would list half the
+    # sportsbook, so they are skipped; the row matcher still checks both teams.
+    generic_words = {
+        "club", "united", "city", "real", "sporting", "athletic", "atletico", "deportivo",
+        "futbol", "football", "fc", "fk", "sc", "ac", "cf", "cd", "ca", "sv", "if", "bk",
+        "town", "county", "rovers", "wanderers", "women", "reserves", "youth", "academy",
+        "union", "dynamo", "dinamo", "olympic", "racing", "sport", "sports",
+    }
+    if include_single_word and len(raw_parts) >= 2:
+        distinctive = [part for part in raw_parts if len(part) >= 4 and part not in generic_words and not part.isdigit()]
+        if distinctive:
+            add(distinctive[0])
     return queries
 
 
@@ -2046,7 +2065,7 @@ def _search_black_live_events(
     seen_queries: set[str] = set()
 
     def add_queries(name: str | None) -> None:
-        for query in _team_search_queries(name):
+        for query in _team_search_queries(name, include_single_word=True):
             key = query.strip().lower()
             if not key or key in seen_queries:
                 continue
@@ -2057,6 +2076,7 @@ def _search_black_live_events(
     for alternate_name in alternate_team_names or []:
         add_queries(alternate_name)
 
+    last_typed_query = None
     for query in queries:
         try:
             # A failed/empty Black search can dismiss its Ctrl+F dialog.  Do not
@@ -2065,13 +2085,67 @@ def _search_black_live_events(
             if not _black_search_dialog_open(driver):
                 _open_black_search(driver, profile_label)
             _fill_black_search(driver, query, profile_label)
-            time.sleep(5)
-            return query
+            last_typed_query = query
         except Exception as exc:
             last_error = exc
+            continue
+        # Typing a query is not finding the match: only stop on a query whose
+        # results mention it. Previously the first query was always used, so
+        # aliases like "boston united" or "red star belgrade" were never tried.
+        if _wait_black_search_results(driver, query):
+            return query
+        print(f"[{profile_label}] Black search '{query}' found nothing relevant; trying the next name.", flush=True)
+    if last_typed_query is not None:
+        # Nothing matched clearly; let the row matcher look at the last results.
+        return last_typed_query
     if last_error is not None:
         raise last_error
     raise RuntimeError(f"No usable Black search query for team: {team_name}")
+
+
+def _wait_black_search_results(driver: webdriver.Remote, query: str, timeout: float = 5.0) -> bool:
+    """True once the Black search results mention a significant word of the query."""
+    words = [word for word in re.sub(r"[^a-z0-9]+", " ", _strip_diacritics(query).lower()).split() if len(word) >= 4]
+    if not words:
+        words = [" ".join(re.sub(r"[^a-z0-9]+", " ", _strip_diacritics(query).lower()).split())]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            state = driver.execute_script(
+                """
+                const words = arguments[0] || [];
+                const normalize = (value) => (value || '')
+                    .toLowerCase()
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '')
+                    .replace(/[^a-z0-9]+/g, ' ')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                const isVisible = (element) => {
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                        && rect.width > 240 && rect.height > 80;
+                };
+                const roots = Array.from(document.querySelectorAll('aside,section,div,main'))
+                    .filter(isVisible)
+                    .map((element) => ({ element, text: (element.innerText || '').toLowerCase() }))
+                    .filter((item) => item.text.includes('live events') || item.text.includes('use ctrl'));
+                if (!roots.length) return 'no-dialog';
+                const texts = roots.map((item) => normalize(item.text));
+                if (texts.some((text) => text.includes('no results found') || text.includes('no events found'))) return 'empty';
+                return texts.some((text) => words.some((word) => text.includes(word))) ? 'found' : 'pending';
+                """,
+                words,
+            )
+        except Exception:
+            state = "pending"
+        if state == "found":
+            return True
+        if state in ("empty", "no-dialog"):
+            return False
+        time.sleep(0.5)
+    return False
 
 
 def _confirm_black_place_order(driver: webdriver.Remote, profile_label: str) -> None:
